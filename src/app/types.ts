@@ -1,0 +1,252 @@
+export type SearchDirection = "next" | "prev";
+
+export interface ThemeConfig {
+  background: string;
+  foreground: string;
+  cursor: string;
+  selection: string;
+  black: string;
+  red: string;
+  green: string;
+  yellow: string;
+  blue: string;
+  magenta: string;
+  cyan: string;
+  white: string;
+}
+
+export interface AppearanceConfig {
+  font_family: string;
+  font_size: number;
+  line_height: number;
+  cursor_style: string;
+  cursor_blink: boolean;
+  theme: ThemeConfig;
+}
+
+export interface GeneralConfig {
+  default_shell: string;
+  default_directory: string;
+  confirm_close_with_running_process: boolean;
+}
+
+export interface UiConfig {
+  sidebar_width: number;
+  show_tags_by_default: boolean;
+}
+
+export interface ConfigPreset {
+  id: string;
+  name: string;
+  directory?: string;
+  command?: string;
+  tags: string[];
+  footer?: boolean;
+  worktree?: boolean;
+}
+
+export interface TagsConfig {
+  list: string[];
+}
+
+export interface PresetsConfig {
+  items: ConfigPreset[];
+}
+
+export interface AppConfig {
+  version: number;
+  general: GeneralConfig;
+  appearance: AppearanceConfig;
+  ui: UiConfig;
+  presets: PresetsConfig;
+  tags: TagsConfig;
+}
+
+export interface WebSession {
+  id: string;
+  title: string;
+  createdAt: number;
+  directory?: string;
+  command?: string;
+}
+
+export type WorkspaceFileTabKind = "text_file" | "image_file";
+
+interface WorkspaceFileTabBase {
+  id: string;
+  ownerSessionId: string;
+  path: string;
+  displayName: string;
+  loading: boolean;
+  error: string | null;
+}
+
+export interface WorkspaceTextFileTab extends WorkspaceFileTabBase {
+  kind: "text_file";
+  content: string;
+  savedContent: string;
+  dirty: boolean;
+}
+
+export interface WorkspaceImageFileTab extends WorkspaceFileTabBase {
+  kind: "image_file";
+  imageUrl: string | null;
+  dirty: false;
+}
+
+export type WorkspaceFileTab = WorkspaceTextFileTab | WorkspaceImageFileTab;
+
+export interface BrowserBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserSessionState {
+  sessionId: string;
+  open: boolean;
+  visible: boolean;
+  loading: boolean;
+  url: string;
+  title: string;
+  profilePath?: string | null;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  bounds?: BrowserBounds | null;
+  lastError?: string | null;
+}
+
+export interface DbSession {
+  id: string;
+  title: string;
+  directory: string | null;
+  command: string | null;
+  created_at: number;
+  last_accessed_at: number | null;
+  is_closed: boolean;
+  closed_at: number | null;
+}
+
+export interface DbScrollback {
+  session_id: string;
+  content: string;
+  updated_at: number;
+}
+
+export interface TerminalPreset {
+  id: string;
+  name: string;
+  directory?: string;
+  command?: string;
+  tags?: string[];
+  footer?: boolean;
+  worktree?: boolean;
+}
+
+export interface FileBrowserEntry {
+  name: string;
+  path: string;
+  relative_path: string;
+  is_dir: boolean;
+  is_hidden: boolean;
+  size: number | null;
+}
+
+export type RecorderState = "idle" | "recording" | "processing" | "error";
+
+export interface RecordingTranscriptionResult {
+  videoPath: string;
+  transcriptPath: string;
+  transcriptJsonPath: string;
+  transcriptText: string;
+  model: string;
+}
+
+export interface RecordingClipboardEvent {
+  timestampMs: number;
+  text: string;
+}
+
+export interface ClipboardHistoryEntry {
+  id: number;
+  kind: "text" | "image";
+  text: string | null;
+  imagePath: string | null;
+  sourceApp: string | null;
+  byteLen: number;
+  contentHash: string;
+  createdAt: number;
+}
+
+export type PasteQueueItemKind = "image" | "recording";
+
+export interface PasteQueueItem {
+  kind: PasteQueueItemKind;
+  path: string;
+  url: string;
+  filename: string;
+}
+
+export type AppView = "terminal" | "canvas";
+export type CanvasTool = "select" | "pen";
+export type CanvasFileKind = "text" | "image" | "binary";
+
+export interface CanvasPoint {
+  x: number;
+  y: number;
+}
+
+export interface CanvasStroke {
+  tool: "pen";
+  points: CanvasPoint[];
+}
+
+interface CanvasObjectBase {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  z: number;
+}
+
+export interface CanvasTextObject extends CanvasObjectBase {
+  type: "text";
+  text: string;
+}
+
+export interface CanvasImageObject extends CanvasObjectBase {
+  type: "image";
+  path: string;
+  name: string;
+}
+
+export interface CanvasTerminalObject extends CanvasObjectBase {
+  type: "terminal";
+  sessionId: string;
+}
+
+export interface CanvasFileObject extends CanvasObjectBase {
+  type: "file";
+  path: string;
+  name: string;
+  fileKind: CanvasFileKind;
+  textContent?: string;
+  error?: string;
+}
+
+export type CanvasObject =
+  | CanvasTextObject
+  | CanvasImageObject
+  | CanvasTerminalObject
+  | CanvasFileObject;
+
+export interface CanvasBoard {
+  objects: CanvasObject[];
+  strokes: CanvasStroke[];
+  activeTool: CanvasTool;
+  selectedObjectId: string | null;
+  selectedObjectIds: string[];
+  zoom: number;
+}

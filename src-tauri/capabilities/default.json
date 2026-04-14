@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schemas.tauri.app/capabilities/2",
+  "identifier": "default",
+  "description": "Default capabilities for the app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [{ "name": "open", "cmd": "open", "args": true }]
+    },
+    "global-shortcut:default",
+    "clipboard-manager:allow-read-image",
+    "clipboard-manager:allow-read-text",
+    "notification:default",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:webview:allow-print"
+  ]
+}
