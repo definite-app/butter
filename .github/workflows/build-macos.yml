@@ -1,0 +1,50 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Butter.app
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: src-tauri
+        run: cargo tauri build --bundles app
+
+      - name: Upload Butter.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Butter-macos-arm64
+          path: src-tauri/target/release/bundle/macos/Butter.app
+          if-no-files-found: error
