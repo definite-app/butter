@@ -42,9 +42,13 @@ jobs:
         working-directory: src-tauri
         run: cargo tauri build --bundles app
 
+      - name: Zip .app bundle
+        working-directory: src-tauri/target/release/bundle/macos
+        run: ditto -c -k --sequesterRsrc --keepParent Butter.app Butter.app.zip
+
       - name: Upload Butter.app
         uses: actions/upload-artifact@v4
         with:
           name: Butter-macos-arm64
-          path: src-tauri/target/release/bundle/macos/Butter.app
+          path: src-tauri/target/release/bundle/macos/Butter.app.zip
           if-no-files-found: error
