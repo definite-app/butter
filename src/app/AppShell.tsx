@@ -1,6 +1,6 @@
 import "@xterm/xterm/css/xterm.css";
 import "../App.css";
-import { Show } from "solid-js";
+import { Show, createSignal, onCleanup } from "solid-js";
 import { useAppContext } from "./context/AppContext";
 import { Sidebar } from "../features/sidebar/Sidebar";
 import { TerminalArea } from "../features/terminal/TerminalArea";
@@ -17,6 +17,24 @@ import { ImageEditorModal } from "../features/overlays/ImageEditorModal";
 
 export function AppShell() {
   const app = useAppContext();
+  const [sidebarPeeking, setSidebarPeeking] = createSignal(false);
+  let peekTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const startPeekTimer = () => {
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(() => setSidebarPeeking(true), 1000);
+  };
+
+  const cancelPeekTimer = () => {
+    clearTimeout(peekTimer);
+  };
+
+  const closePeek = () => {
+    clearTimeout(peekTimer);
+    setSidebarPeeking(false);
+  };
+
+  onCleanup(() => clearTimeout(peekTimer));
 
   return (
     <div class="butter-web-shell">
@@ -36,28 +54,40 @@ export function AppShell() {
           </>
         </Show>
         <Show when={app.sidebarHidden() && !app.quickInputActive()}>
-          <button
-            class="sidebar-reopen-btn"
-            onClick={() => app.showSidebar()}
-            title="Show Sidebar"
-            aria-label="Show Sidebar"
+          <div
+            class={`sidebar-peek-zone ${sidebarPeeking() ? "peeking" : ""}`}
+            onMouseLeave={closePeek}
           >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
+            <button
+              class="sidebar-reopen-btn"
+              onClick={() => { closePeek(); app.showSidebar(); }}
+              onMouseEnter={startPeekTimer}
+              onMouseLeave={cancelPeekTimer}
+              title="Show Sidebar"
+              aria-label="Show Sidebar"
             >
-              <rect width="18" height="18" x="3" y="3" rx="2" />
-              <path d="M9 3v18" />
-              <path d="m14 9 3 3-3 3" />
-            </svg>
-          </button>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <rect width="18" height="18" x="3" y="3" rx="2" />
+                <path d="M9 3v18" />
+                <path d="m14 9 3 3-3 3" />
+              </svg>
+            </button>
+            <Show when={sidebarPeeking()}>
+              <div class="sidebar-peek-container">
+                <Sidebar />
+              </div>
+            </Show>
+          </div>
         </Show>
         <Show when={app.appView() === "terminal"} fallback={<CanvasView />}>
           <TerminalArea />

@@ -1,11 +1,26 @@
-import { Show, createEffect, createMemo, onCleanup, onMount, untrack } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-// Side-effect imports that register editor contributions (actions, widgets).
-// Without these, editor.api gives you a core editor with no Find, Command
-// Palette, Go-to-Line, etc. `actions.find` is what Cmd+F triggers.
+import { invoke } from "@tauri-apps/api/core";
+import { extractImageFromClipboard } from "../../utils/clipboard";
+// Side-effect imports that register editor contributions (actions, widgets,
+// keybindings). Without these, editor.api gives you a bare-bones editor —
+// undo/redo (cursorUndo), word-level caret/selection, multi-cursor, comment
+// toggle, copy-line, smart-select, etc. all live in these modules.
 import "monaco-editor/esm/vs/editor/contrib/find/browser/findController";
+import "monaco-editor/esm/vs/editor/contrib/wordOperations/browser/wordOperations";
+import "monaco-editor/esm/vs/editor/contrib/wordPartOperations/browser/wordPartOperations";
+import "monaco-editor/esm/vs/editor/contrib/smartSelect/browser/smartSelect";
+import "monaco-editor/esm/vs/editor/contrib/linesOperations/browser/linesOperations";
+import "monaco-editor/esm/vs/editor/contrib/lineSelection/browser/lineSelection";
+import "monaco-editor/esm/vs/editor/contrib/multicursor/browser/multicursor";
+import "monaco-editor/esm/vs/editor/contrib/comment/browser/comment";
+import "monaco-editor/esm/vs/editor/contrib/clipboard/browser/clipboard";
+import "monaco-editor/esm/vs/editor/contrib/indentation/browser/indentation";
+import "monaco-editor/esm/vs/editor/contrib/cursorUndo/browser/cursorUndo";
+import "monaco-editor/esm/vs/editor/contrib/caretOperations/browser/caretOperations";
+import "monaco-editor/esm/vs/editor/contrib/bracketMatching/browser/bracketMatching";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
@@ -82,14 +97,19 @@ const languageIdForPath = (path: string) => {
   return "plaintext";
 };
 
+const MD_IMAGE_LINK_RE = /!?\[[^\]]*\]\(([^)\s]+)\)/g;
+
 export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
   const app = useAppContext();
   const imageTab = () => (props.tab.kind === "image_file" ? props.tab : null);
-  let editorHost: HTMLDivElement | undefined;
+  const [editorHost, setEditorHost] = createSignal<HTMLDivElement | undefined>(undefined);
   let editor: monaco.editor.IStandaloneCodeEditor | undefined;
   let model: monaco.editor.ITextModel | undefined;
   let changeDisposable: monaco.IDisposable | undefined;
+  let pasteDisposable: (() => void) | undefined;
+  let mouseDisposable: monaco.IDisposable | undefined;
   let boundTabId: string | undefined;
+  let boundHost: HTMLDivElement | undefined;
 
   // Markdown preview state derived from app context + tab.
   const isMarkdown = createMemo(() => app.isMarkdownTab(props.tab));
@@ -110,6 +130,74 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
       `inmemory://butter/${tab.id}/${encodeURIComponent(tab.path)}`
     );
     return monaco.editor.createModel(tab.content, languageIdForPath(tab.path), uri);
+  };
+
+  const handleMarkdownPaste = async (event: ClipboardEvent) => {
+    if (props.tab.kind !== "text_file") return;
+    if (!isMarkdown()) return;
+    if (!editor || !model) return;
+    const clipboardData = event.clipboardData;
+    if (!clipboardData) return;
+    const hasImageItem = Array.from(clipboardData.items).some((item) =>
+      item.type.startsWith("image/")
+    );
+    const image = extractImageFromClipboard(clipboardData);
+    if (!hasImageItem && !image) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    try {
+      const path = await invoke<string>("save_clipboard_image");
+      const basename = path.split("/").pop() || path;
+      const snippet = `![${basename}](${path})`;
+      const selection = editor.getSelection();
+      if (!selection) return;
+      editor.executeEdits("butter-md-paste-image", [
+        { range: selection, text: snippet, forceMoveMarkers: true },
+      ]);
+      editor.focus();
+    } catch (err) {
+      console.warn("[md-paste] save_clipboard_image failed", err);
+    }
+  };
+
+  const bindPasteListener = () => {
+    pasteDisposable?.();
+    pasteDisposable = undefined;
+    if (!editor) return;
+    const domNode = editor.getDomNode();
+    if (!domNode) return;
+    const listener = (e: ClipboardEvent) => {
+      void handleMarkdownPaste(e);
+    };
+    domNode.addEventListener("paste", listener, true);
+    pasteDisposable = () => domNode.removeEventListener("paste", listener, true);
+  };
+
+  const bindMouseListener = () => {
+    mouseDisposable?.dispose();
+    mouseDisposable = undefined;
+    if (!editor) return;
+    mouseDisposable = editor.onMouseUp((e) => {
+      if (props.tab.kind !== "text_file") return;
+      if (!isMarkdown()) return;
+      if (!e.event.metaKey && !e.event.ctrlKey) return;
+      const pos = e.target.position;
+      if (!pos || !model) return;
+      const line = model.getLineContent(pos.lineNumber);
+      MD_IMAGE_LINK_RE.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = MD_IMAGE_LINK_RE.exec(line)) !== null) {
+        const startCol = match.index + 1;
+        const endCol = match.index + match[0].length + 1;
+        if (pos.column >= startCol && pos.column <= endCol) {
+          e.event.preventDefault();
+          e.event.stopPropagation();
+          void app.openFileInButter(match[1]);
+          return;
+        }
+      }
+    });
   };
 
   const bindChangeListener = () => {
@@ -164,15 +252,41 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
     requestAnimationFrame(() => editor?.focus());
   };
 
-  onMount(() => {
-    if (props.tab.kind !== "text_file" || !editorHost) return;
-    ensureMonacoEnvironment();
+  const disposeEditor = () => {
+    changeDisposable?.dispose();
+    changeDisposable = undefined;
+    pasteDisposable?.();
+    pasteDisposable = undefined;
+    mouseDisposable?.dispose();
+    mouseDisposable = undefined;
+    if (boundTabId) app.registerFileTabFindHandler(boundTabId, undefined);
+    editor?.dispose();
+    model?.dispose();
+    editor = undefined;
+    model = undefined;
+    boundTabId = undefined;
+    boundHost = undefined;
+  };
 
-    // Read props.tab reactively-but-without-tracking for initial setup —
-    // the tab-switch effect below owns all subsequent reactivity.
+  // Editor lifecycle: (re)create whenever the host div re-mounts (e.g. after
+  // switching to an image tab and back flips the <Show> subtree).
+  createEffect(() => {
+    const host = editorHost();
+    if (!host) {
+      disposeEditor();
+      return;
+    }
+    if (props.tab.kind !== "text_file") {
+      disposeEditor();
+      return;
+    }
+    if (editor && boundHost === host) return;
+    if (editor) disposeEditor();
+
+    ensureMonacoEnvironment();
     const initialTab = untrack(() => props.tab as WorkspaceTextFileTab);
     model = createModelForTab(initialTab);
-    editor = monaco.editor.create(editorHost, {
+    editor = monaco.editor.create(host, {
       model,
       theme: "vs-dark",
       automaticLayout: true,
@@ -184,8 +298,11 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
       readOnly: initialTab.loading,
     });
     boundTabId = initialTab.id;
+    boundHost = host;
 
     bindChangeListener();
+    bindPasteListener();
+    bindMouseListener();
 
     app.registerFileTabFindHandler(initialTab.id, () => {
       editor?.focus();
@@ -193,17 +310,9 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
     });
 
     requestAnimationFrame(() => editor?.focus());
-
-    onCleanup(() => {
-      changeDisposable?.dispose();
-      if (boundTabId) app.registerFileTabFindHandler(boundTabId, undefined);
-      editor?.dispose();
-      model?.dispose();
-      editor = undefined;
-      model = undefined;
-      boundTabId = undefined;
-    });
   });
+
+  onCleanup(disposeEditor);
 
   // Tab switch: rebuild model when the underlying tab id changes.
   createEffect(() => {
@@ -260,7 +369,7 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
           </Show>
           <div
             class="butter-file-editor"
-            ref={(el) => (editorHost = el)}
+            ref={(el) => setEditorHost(el)}
             style={{ display: markdownViewMode() === "preview" ? "none" : "" }}
           />
           <Show when={isMarkdown() && markdownViewMode() === "preview"}>

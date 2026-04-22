@@ -53,6 +53,13 @@ const GlobeIcon = () => (
   </svg>
 );
 
+const ClipboardIcon = () => (
+  <svg viewBox="0 0 14 14">
+    <rect x="3.5" y="2.75" width="7" height="9" rx="0.75" />
+    <rect x="5.25" y="1.75" width="3.5" height="2" rx="0.5" />
+  </svg>
+);
+
 const PowerIcon = () => (
   <svg viewBox="0 0 14 14">
     <path d="M4.25 4 Q1.75 6 2.5 9 Q3.75 12 7 12 Q10.25 12 11.5 9 Q12.25 6 9.75 4" />
@@ -150,6 +157,13 @@ export function HeaderActionMenu() {
             void app.openBrowserForSession(sessionId);
           }
         },
+      });
+      items.push({
+        kind: "action",
+        id: "copy-terminal-output",
+        label: "Copy terminal output",
+        icon: ClipboardIcon,
+        onSelect: () => void app.copyTerminalOutputToClipboard(sessionId),
       });
       items.push({ kind: "divider", id: "terminal-divider" });
       items.push({

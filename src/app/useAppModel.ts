@@ -1732,6 +1732,17 @@ export function useAppModel() {
         },
       },
       {
+        id: "copy-terminal-output",
+        label: "Copy Terminal Output",
+        description: "Copy full scrollback of active terminal to clipboard",
+        action: () => {
+          const active = activeSessionId();
+          if (active) {
+            void copyTerminalOutputToClipboard(active);
+          }
+        },
+      },
+      {
         id: "close-terminal",
         label: "Close Terminal",
         description: "Close the active terminal session",
@@ -3040,8 +3051,6 @@ export function useAppModel() {
   };
 
   const fileBrowserActions = (entry: FileBrowserEntry) => [
-    { id: "copy-path", label: "Copy Path", icon: "⎘", action: () => void copyFileBrowserEntry(entry) },
-    { id: "copy-dir", label: "Copy Directory Path", icon: "⎘", action: () => void copyFileBrowserDirectory(entry) },
     ...(entry.is_dir || !canOpenPathInButter(entry.path)
       ? []
       : [{
@@ -3054,6 +3063,8 @@ export function useAppModel() {
             setFileBrowserActionEntry(null);
           },
         }]),
+    { id: "copy-path", label: "Copy Path", icon: "⎘", action: () => void copyFileBrowserEntry(entry) },
+    { id: "copy-dir", label: "Copy Directory Path", icon: "⎘", action: () => void copyFileBrowserDirectory(entry) },
     { id: "open-default", label: "Open File", icon: "↗", action: () => void openFileBrowserEntry(entry) },
     { id: "open-vscode", label: "Open in VS Code", icon: "◇", action: () => {
       void Command.create("code", [entry.path]).execute();
@@ -5244,6 +5255,13 @@ export function useAppModel() {
     return "";
   };
 
+  async function copyTerminalOutputToClipboard(sessionId: string) {
+    const content = await getScrollbackForSession(sessionId);
+    if (!content) return false;
+    await navigator.clipboard.writeText(content);
+    return true;
+  }
+
   async function forkSession(sourceId: string) {
     const source = sessions.find((entry) => entry.id === sourceId);
     if (!source) return;
@@ -6898,6 +6916,7 @@ export function useAppModel() {
     sendFooterInput,
     launchPresetSession,
     forkSession,
+    copyTerminalOutputToClipboard,
     createSession,
     toggleFolderCollapse,
     setSidebarSessionViewMode,

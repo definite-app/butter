@@ -100,6 +100,49 @@
   background: var(--surface-hover);
 }
 
+/* --- Sidebar Peek (hover-to-reveal overlay) --- */
+.sidebar-peek-zone {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 26;
+}
+
+.sidebar-peek-zone.peeking {
+  bottom: 0;
+}
+
+.sidebar-peek-zone .sidebar-reopen-btn {
+  position: relative;
+  top: 10px;
+  left: 10px;
+}
+
+.sidebar-peek-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  display: flex;
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.35);
+  animation: sidebarPeekIn var(--duration-normal) var(--ease-out);
+}
+
+.sidebar-peek-container .butter-web-sidebar {
+  border-right: 1px solid var(--border-subtle);
+}
+
+@keyframes sidebarPeekIn {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 /* When sidebar is collapsed, offset bar contents so the reopen icon doesn't
    overlap the first workspace tab. */
 .butter-web-layout.sidebar-collapsed .butter-web-bar {
