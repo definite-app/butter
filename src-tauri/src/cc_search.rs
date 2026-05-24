@@ -243,7 +243,11 @@ pub fn cc_last_assistant_turn(agent_session_id: String) -> Result<Option<LastAss
     let Some(path) = find_session_jsonl(&agent_session_id) else {
         return Ok(None);
     };
-    let data = fs::read_to_string(&path).map_err(|e| format!("read transcript: {e}"))?;
+    // read_to_string fails on any invalid UTF-8 anywhere in the file; use the
+    // byte form + lossy convert so a single bad sequence in a tool-use payload
+    // doesn't blank the entire transcript preview.
+    let bytes = fs::read(&path).map_err(|e| format!("read transcript: {e}"))?;
+    let data = String::from_utf8_lossy(&bytes);
     // Walk lines in reverse to find the last assistant turn with non-empty text.
     for line in data.lines().rev() {
         let line = line.trim();
@@ -325,13 +329,17 @@ fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<Pat
 }
 
 fn codex_session_cwd(path: &std::path::Path) -> Option<String> {
-    use std::io::Read;
-    let mut f = fs::File::open(path).ok()?;
-    let mut buf = [0u8; 8192];
-    let n = f.read(&mut buf).ok()?;
-    let chunk = std::str::from_utf8(&buf[..n]).ok()?;
-    let first_line = chunk.lines().next()?;
-    let v: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    // Read the first line only, but do it as UTF-8 lines (not a raw byte
+    // window) — a fixed-size read frequently splits a multi-byte char that
+    // appears later in the file, making the whole chunk invalid UTF-8.
+    let f = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(f);
+    let mut first_line = String::new();
+    let n = reader.read_line(&mut first_line).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(first_line.trim()).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
@@ -373,7 +381,8 @@ pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn
     for path in candidates {
         match codex_session_cwd(&path) {
             Some(c) if c == cwd => {
-                let data = fs::read_to_string(&path).map_err(|e| format!("read codex rollout: {e}"))?;
+                let bytes = fs::read(&path).map_err(|e| format!("read codex rollout: {e}"))?;
+                let data = String::from_utf8_lossy(&bytes);
                 for line in data.lines().rev() {
                     let line = line.trim();
                     if line.is_empty() {
