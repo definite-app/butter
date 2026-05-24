@@ -49,6 +49,27 @@ function classifyPreviewLine(line: string): "error" | "success" | "muted" | "nor
   return "normal";
 }
 
+/**
+ * Detect which CLI agent is running in a terminal session. The command string
+ * is the primary signal — if the user is running `claude ...` it's Claude
+ * Code regardless of which hook tables have entries. Activity-state tables
+ * (claudeState / codexState) are only consulted as a fallback for sessions
+ * where the command field is empty (e.g. user started a bare shell and then
+ * launched the agent manually).
+ */
+function detectAgentKind(
+  command: string | null | undefined,
+  hasClaudeId: boolean,
+  hasCodexState: boolean
+): "claude" | "codex" | null {
+  const cmd = (command ?? "").toLowerCase();
+  if (/(^|\s|\/)claude(\s|$)/.test(cmd)) return "claude";
+  if (/(^|\s|\/)codex(\s|$)/.test(cmd)) return "codex";
+  if (hasClaudeId) return "claude";
+  if (hasCodexState) return "codex";
+  return null;
+}
+
 export function TerminalSwitcher() {
   const app = useAppContext();
   const [filter, setFilter] = createSignal<FilterTab>("all");
@@ -83,13 +104,11 @@ export function TerminalSwitcher() {
     const transcripts = app.lastAgentTurn();
     return app.sessions.map((s) => {
       const state = app.getSessionState(s.id);
-      const claudeTagged = Boolean(claudeIds[s.id]);
-      const codexTagged = Boolean(codex[s.id]);
-      const agentKind: TileData["agentKind"] = claudeTagged
-        ? "claude"
-        : codexTagged
-        ? "codex"
-        : null;
+      const agentKind = detectAgentKind(
+        s.command,
+        Boolean(claudeIds[s.id]),
+        Boolean(codex[s.id])
+      );
       const fullAgentId = claudeIds[s.id] ?? null;
       const agentSessionShort =
         fullAgentId && fullAgentId.length > 0

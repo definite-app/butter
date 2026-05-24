@@ -466,20 +466,54 @@ export function useAppModel() {
 
   async function refreshLastAgentTurnsForActiveSessions() {
     const agentIds = agentSessionIdBySession();
-    const entries = Object.entries(agentIds);
-    if (entries.length === 0) return;
-    const results = await Promise.all(
-      entries.map(async ([sessionId, agentSessionId]) => {
-        try {
-          const turn = await invoke<LastAssistantTurn | null>("cc_last_assistant_turn", {
-            agentSessionId,
-          });
-          return turn ? ([sessionId, turn] as const) : null;
-        } catch {
-          return null;
-        }
-      })
-    );
+    const codexStateMap = codexState();
+    const claudeJobs: Promise<readonly [string, LastAssistantTurn] | null>[] = [];
+    const codexJobs: Promise<readonly [string, LastAssistantTurn] | null>[] = [];
+
+    // Claude Code: look up by hook-captured agent session id.
+    for (const [sessionId, agentSessionId] of Object.entries(agentIds)) {
+      claudeJobs.push(
+        (async () => {
+          try {
+            const turn = await invoke<LastAssistantTurn | null>("cc_last_assistant_turn", {
+              agentSessionId,
+            });
+            return turn ? ([sessionId, turn] as const) : null;
+          } catch {
+            return null;
+          }
+        })()
+      );
+    }
+
+    // Codex: we don't track the codex session id, so match by cwd. Only
+    // attempt sessions that look like codex (command contains codex, OR the
+    // codex notify hook has fired for this session). Skip ones already
+    // resolved as Claude to avoid double-fetching.
+    for (const s of sessions) {
+      if (agentIds[s.id]) continue;
+      const cmd = (s.command ?? "").toLowerCase();
+      const looksLikeCodex =
+        /(^|\s|\/)codex(\s|$)/.test(cmd) || Boolean(codexStateMap[s.id]);
+      if (!looksLikeCodex) continue;
+      const cwd = s.directory;
+      if (!cwd) continue;
+      codexJobs.push(
+        (async () => {
+          try {
+            const turn = await invoke<LastAssistantTurn | null>("codex_last_assistant_turn", {
+              cwd,
+            });
+            return turn ? ([s.id, turn] as const) : null;
+          } catch {
+            return null;
+          }
+        })()
+      );
+    }
+
+    if (claudeJobs.length === 0 && codexJobs.length === 0) return;
+    const results = await Promise.all([...claudeJobs, ...codexJobs]);
     setLastAgentTurn((prev) => {
       const next = { ...prev };
       for (const r of results) {

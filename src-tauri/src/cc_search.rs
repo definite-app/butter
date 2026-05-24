@@ -276,6 +276,145 @@ pub fn cc_last_assistant_turn(agent_session_id: String) -> Result<Option<LastAss
     Ok(None)
 }
 
+/// Latest assistant turn from a Codex CLI session whose working directory
+/// matches `cwd`. Codex stores rollouts at
+/// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`; line 1 is a
+/// `session_meta` entry whose payload includes the `cwd`. We scan
+/// newest-first by year/month/day so a cold scan is bounded.
+fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<PathBuf> {
+    fn sorted_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+        out.sort_by(|a, b| b.file_name().cmp(&a.file_name())); // desc
+        out
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for year in sorted_subdirs(root) {
+        for month in sorted_subdirs(&year) {
+            for day in sorted_subdirs(&month) {
+                let Ok(files) = fs::read_dir(&day) else { continue };
+                let mut day_files: Vec<(PathBuf, std::time::SystemTime)> = files
+                    .flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                            return None;
+                        }
+                        let mtime = e
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .ok()?;
+                        Some((p, mtime))
+                    })
+                    .collect();
+                day_files.sort_by(|a, b| b.1.cmp(&a.1)); // newest first within the day
+                for (p, _) in day_files {
+                    out.push(p);
+                    if out.len() >= cap {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn codex_session_cwd(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let chunk = std::str::from_utf8(&buf[..n]).ok()?;
+    let first_line = chunk.lines().next()?;
+    let v: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    v.get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(String::from)
+}
+
+fn codex_extract_output_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                    item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+#[tauri::command]
+pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn>, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
+    };
+    let root = home.join(".codex").join("sessions");
+    if !root.exists() {
+        return Ok(None);
+    }
+    // Look at up to the most recent ~200 rollout files; for each, check cwd
+    // matches before paying to read the full file.
+    let candidates = list_codex_jsonls_newest_first(&root, 200);
+    for path in candidates {
+        match codex_session_cwd(&path) {
+            Some(c) if c == cwd => {
+                let data = fs::read_to_string(&path).map_err(|e| format!("read codex rollout: {e}"))?;
+                for line in data.lines().rev() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(v): Result<serde_json::Value, _> = serde_json::from_str(line) else {
+                        continue;
+                    };
+                    if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+                        continue;
+                    }
+                    let Some(payload) = v.get("payload") else { continue };
+                    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+                        continue;
+                    }
+                    if payload.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let text = payload
+                        .get("content")
+                        .map(codex_extract_output_text)
+                        .unwrap_or_default();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(LastAssistantTurn {
+                        text,
+                        timestamp: v.get("timestamp").and_then(|t| t.as_str()).map(String::from),
+                        model: None,
+                    }));
+                }
+                // Found the file but no assistant content — stop scanning,
+                // newer rollouts in the same cwd shouldn't exist.
+                return Ok(None);
+            }
+            _ => continue,
+        }
+    }
+    Ok(None)
+}
+
 /// Copy a session's raw `.jsonl` into a temp file and return that path, so it
 /// can be opened in Butter's file viewer without touching the live transcript.
 #[tauri::command]
