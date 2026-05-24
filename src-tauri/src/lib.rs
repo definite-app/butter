@@ -1666,6 +1666,7 @@ pub fn run() {
             cc_search::cc_search,
             cc_search::cc_fetch,
             cc_search::cc_export_session,
+            cc_search::cc_last_assistant_turn,
         ])
         .setup(|app| {
             // Initialize the agent database

@@ -12,12 +12,15 @@ interface TileData {
   state: "working" | "idle" | "unknown";
   seenAt: number | null;
   previewLines: string[];
+  previewSource: "transcript" | "scrollback" | "empty";
   isActive: boolean;
   agentKind: "claude" | "codex" | null;
   agentSessionShort: string | null;
+  agentModel: string | null;
 }
 
 const TILE_PREVIEW_LINES = 5;
+const TRANSCRIPT_PREVIEW_LINES = 18;
 
 function formatAgo(ms: number | null | undefined): string {
   if (!ms) return "—";
@@ -48,13 +51,14 @@ export function TerminalSwitcher() {
   const [filter, setFilter] = createSignal<FilterTab>("all");
   let inputRef: HTMLInputElement | undefined;
 
-  // Focus input + reset state whenever the switcher opens
+  // Focus input + reset state + refresh agent transcripts whenever the switcher opens
   createEffect(() => {
     if (app.showCommandPalette() && app.commandPaletteMode() === "switcher") {
       requestAnimationFrame(() => inputRef?.focus());
       app.setCommandQuery("");
       app.setSwitcherIndex(0);
       setFilter("all");
+      void app.refreshLastAgentTurnsForActiveSessions();
     }
   });
 
@@ -73,6 +77,7 @@ export function TerminalSwitcher() {
     const claudeIds = app.agentSessionIdBySession();
     const codex = app.codexState();
     const activeId = app.activeSessionId();
+    const transcripts = app.lastAgentTurn();
     return app.sessions.map((s) => {
       const state = app.getSessionState(s.id);
       const claudeTagged = Boolean(claudeIds[s.id]);
@@ -87,6 +92,21 @@ export function TerminalSwitcher() {
         fullAgentId && fullAgentId.length > 0
           ? fullAgentId.replace(/-/g, "").slice(-6)
           : null;
+
+      const transcript = transcripts[s.id];
+      let previewLines: string[];
+      let previewSource: TileData["previewSource"];
+      if (transcript && transcript.text.trim().length > 0) {
+        previewLines = transcript.text
+          .split("\n")
+          .slice(-TRANSCRIPT_PREVIEW_LINES);
+        previewSource = "transcript";
+      } else {
+        const tail = (previews[s.id] ?? []).slice(-TILE_PREVIEW_LINES);
+        previewLines = tail;
+        previewSource = tail.length > 0 ? "scrollback" : "empty";
+      }
+
       return {
         id: s.id,
         title: s.title,
@@ -95,10 +115,12 @@ export function TerminalSwitcher() {
         tags: tags[s.id] ?? [],
         state,
         seenAt: seenAt[s.id] ?? s.createdAt,
-        previewLines: (previews[s.id] ?? []).slice(-TILE_PREVIEW_LINES),
+        previewLines,
+        previewSource,
         isActive: s.id === activeId,
         agentKind,
         agentSessionShort,
+        agentModel: transcript?.model ?? null,
       };
     });
   });
@@ -531,6 +553,10 @@ function SessionTile(props: {
           </span>
           <span class="switcher-tile-agent-name">
             {props.tile.agentKind === "claude" ? "Claude Code" : "Codex"}
+            <Show when={props.tile.agentModel}>
+              <span class="switcher-tile-agent-sep"> · </span>
+              <span class="switcher-tile-agent-id">{props.tile.agentModel}</span>
+            </Show>
             <Show when={props.tile.agentSessionShort}>
               <span class="switcher-tile-agent-sep"> · </span>
               <span class="switcher-tile-agent-id">
@@ -555,20 +581,33 @@ function SessionTile(props: {
         </div>
       </Show>
 
-      {/* Output preview */}
-      <div class="switcher-tile-preview">
-        <Show
-          when={props.tile.previewLines.length > 0}
-          fallback={<div class="switcher-tile-preview-empty">no recent output</div>}
-        >
-          <For each={props.tile.previewLines}>
-            {(line) => (
-              <div class={`switcher-tile-preview-line line-${classifyPreviewLine(line)}`}>
-                {line || " "}
-              </div>
-            )}
-          </For>
-        </Show>
+      {/* Output preview — agent transcript when available, scrollback otherwise */}
+      <div class={`switcher-tile-preview source-${props.tile.previewSource}`}>
+        <div class="switcher-tile-preview-label">
+          {props.tile.previewSource === "transcript"
+            ? "Last reply"
+            : props.tile.previewSource === "scrollback"
+            ? "Terminal tail"
+            : ""}
+        </div>
+        <div class="switcher-tile-preview-body">
+          <Show
+            when={props.tile.previewLines.length > 0}
+            fallback={<div class="switcher-tile-preview-empty">no recent output</div>}
+          >
+            <For each={props.tile.previewLines}>
+              {(line) => (
+                <div
+                  class={`switcher-tile-preview-line line-${classifyPreviewLine(line)} ${
+                    props.tile.previewSource === "transcript" ? "is-transcript" : ""
+                  }`}
+                >
+                  {line || " "}
+                </div>
+              )}
+            </For>
+          </Show>
+        </div>
       </div>
 
       {/* Footer: updated time + sparkline stub + duration */}

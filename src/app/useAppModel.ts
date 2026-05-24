@@ -456,6 +456,38 @@ export function useAppModel() {
   const [sessionPreview, setSessionPreview] = createSignal<Record<string, string[]>>({});
   const [sessionInputDraft, setSessionInputDraft] = createSignal<Record<string, string>>({});
   const [agentSessionIdBySession, setAgentSessionIdBySession] = createSignal<Record<string, string>>({});
+
+  interface LastAssistantTurn {
+    text: string;
+    timestamp: string | null;
+    model: string | null;
+  }
+  const [lastAgentTurn, setLastAgentTurn] = createSignal<Record<string, LastAssistantTurn>>({});
+
+  async function refreshLastAgentTurnsForActiveSessions() {
+    const agentIds = agentSessionIdBySession();
+    const entries = Object.entries(agentIds);
+    if (entries.length === 0) return;
+    const results = await Promise.all(
+      entries.map(async ([sessionId, agentSessionId]) => {
+        try {
+          const turn = await invoke<LastAssistantTurn | null>("cc_last_assistant_turn", {
+            agentSessionId,
+          });
+          return turn ? ([sessionId, turn] as const) : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    setLastAgentTurn((prev) => {
+      const next = { ...prev };
+      for (const r of results) {
+        if (r) next[r[0]] = r[1];
+      }
+      return next;
+    });
+  }
   const [claudeState, setClaudeState] = createSignal<Record<string, string>>({});
   const [codexState, setCodexState] = createSignal<Record<string, string>>({});
   let prevClaudeState: Record<string, string> = {};
@@ -6803,6 +6835,8 @@ export function useAppModel() {
     sessionInputDraft,
     setSessionInputDraft,
     agentSessionIdBySession,
+    lastAgentTurn,
+    refreshLastAgentTurnsForActiveSessions,
     claudeState,
     setClaudeState,
     codexState,

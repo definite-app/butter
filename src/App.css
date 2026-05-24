@@ -6866,21 +6866,17 @@ body.butter-printing-markdown .butter-print-content hr {
 
 .switcher-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+  gap: 16px;
   align-items: stretch;
 }
 
-@media (min-width: 1100px) {
+@media (min-width: 900px) {
+  .switcher-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (min-width: 1500px) {
   .switcher-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
-
-@media (min-width: 1400px) {
-  .switcher-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-}
-
-@media (min-width: 1700px) {
-  .switcher-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 
 .switcher-empty {
@@ -6896,17 +6892,17 @@ body.butter-printing-markdown .butter-print-content hr {
 .switcher-tile {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 14px;
+  gap: 10px;
+  padding: 18px 20px;
   background: rgba(255, 255, 255, 0.018);
   border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 10px;
+  border-radius: 12px;
   text-align: left;
   cursor: pointer;
   color: var(--text-primary);
   transition: border-color 120ms var(--ease-out), background 120ms var(--ease-out),
     transform 120ms var(--ease-out), box-shadow 120ms var(--ease-out);
-  min-height: 220px;
+  min-height: 420px;
   /* Critical: grid items default to min-width:auto, allowing long preview lines
      to push the tile past its track and ghost across neighbors. Clip everything
      that escapes. */
@@ -7099,37 +7095,74 @@ body.butter-printing-markdown .butter-print-content hr {
   flex: 1;
   display: flex;
   flex-direction: column;
+  margin-top: 6px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  overflow: hidden;
+  min-height: 220px;
+  min-width: 0;
+  position: relative;
+}
+
+.switcher-tile-preview.source-transcript {
+  background: rgba(245, 215, 110, 0.025);
+  border-color: rgba(245, 215, 110, 0.08);
+}
+
+.switcher-tile-preview-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+}
+
+.switcher-tile-preview.source-transcript .switcher-tile-preview-label {
+  color: var(--accent-primary);
+  opacity: 0.55;
+}
+
+.switcher-tile-preview-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
   justify-content: flex-end;
   gap: 1px;
-  margin-top: 4px;
-  padding: 8px 10px;
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.03);
-  border-radius: 6px;
   overflow: hidden;
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  line-height: 1.45;
-  /* Always reserve preview space so every tile in a row matches height,
-     even when there is no recent output. */
-  min-height: 92px;
-  min-width: 0;
-  /* Soft fade across the top ~20% so all five visible lines stay legible
-     while still hinting at scrollback above. */
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6) 0%, #000 20%, #000 100%);
-  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6) 0%, #000 20%, #000 100%);
+  font-size: 11px;
+  line-height: 1.5;
+  /* Soft fade across the top ~25% so the most recent content stays prominent. */
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5) 0%, #000 25%, #000 100%);
+  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5) 0%, #000 25%, #000 100%);
 }
 
 .switcher-tile-preview-line {
-  /* Single-line tails: use nowrap (not pre) so ellipsis can engage.
-     min-width:0 + max-width:100% prevent the line from pushing the column
-     wider than the tile track. */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
   max-width: 100%;
   color: var(--text-secondary);
+}
+
+/* Transcript lines: render in a softer, more readable typography since they
+   are real prose (not terminal chrome). Allow word-wrap so a single long
+   sentence doesn't get truncated mid-thought. */
+.switcher-tile-preview-line.is-transcript {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  opacity: 0.92;
+  white-space: normal;
+  word-break: break-word;
+  text-overflow: clip;
+  padding: 1px 0;
 }
 
 .switcher-tile-preview-line.line-error { color: #f87171; }
@@ -7140,8 +7173,6 @@ body.butter-printing-markdown .butter-print-content hr {
   font-style: italic;
   color: var(--text-muted);
   opacity: 0.6;
-  /* Fill the whole preview area so the footer still pins to the bottom
-     of the tile when there is no recent output. */
   flex: 1;
   display: flex;
   align-items: center;
