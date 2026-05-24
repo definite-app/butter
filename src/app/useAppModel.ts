@@ -493,8 +493,12 @@ export function useAppModel() {
     for (const s of sessions) {
       if (agentIds[s.id]) continue;
       const cmd = (s.command ?? "").toLowerCase();
-      const looksLikeCodex =
-        /(^|\s|\/)codex(\s|$)/.test(cmd) || Boolean(codexStateMap[s.id]);
+      // Treat hook-state strings as a live-codex signal ONLY when they
+      // are "working" or "idle". The poller writes "unknown" for sessions
+      // with no live agent (truthy → false positive otherwise).
+      const codexLive =
+        codexStateMap[s.id] === "working" || codexStateMap[s.id] === "idle";
+      const looksLikeCodex = /(^|\s|\/)codex(\s|$)/.test(cmd) || codexLive;
       if (!looksLikeCodex) continue;
       const cwd = s.directory;
       if (!cwd) continue;

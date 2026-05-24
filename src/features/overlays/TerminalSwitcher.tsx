@@ -50,23 +50,36 @@ function classifyPreviewLine(line: string): "error" | "success" | "muted" | "nor
 }
 
 /**
- * Detect which CLI agent is running in a terminal session. The command string
- * is the primary signal — if the user is running `claude ...` it's Claude
- * Code regardless of which hook tables have entries. Activity-state tables
- * (claudeState / codexState) are only consulted as a fallback for sessions
- * where the command field is empty (e.g. user started a bare shell and then
- * launched the agent manually).
+ * Detect which CLI agent is running in a terminal session.
+ *
+ * Priority order, strongest signal first:
+ *  1. Live process — backend pgrep + recent hook event ("working"/"idle").
+ *     Any other state value ("unknown" or empty) means nothing is running.
+ *  2. Command intent — if the user explicitly launched `claude` or `codex`,
+ *     show that even when the process is currently between turns.
+ *  3. Historical Claude session id — useful for tiles whose transcript is
+ *     still relevant after the agent exited.
+ *
+ * The signal-vs-truthiness distinction matters: claudeState/codexState are
+ * frequently set to the literal string "unknown" by the poller, which is
+ * truthy and would otherwise trigger false positives.
  */
+function isLiveAgentState(value: string | undefined): boolean {
+  return value === "working" || value === "idle";
+}
+
 function detectAgentKind(
   command: string | null | undefined,
-  hasClaudeId: boolean,
-  hasCodexState: boolean
+  claudeStateValue: string | undefined,
+  codexStateValue: string | undefined,
+  hasClaudeId: boolean
 ): "claude" | "codex" | null {
+  if (isLiveAgentState(claudeStateValue)) return "claude";
+  if (isLiveAgentState(codexStateValue)) return "codex";
   const cmd = (command ?? "").toLowerCase();
   if (/(^|\s|\/)claude(\s|$)/.test(cmd)) return "claude";
   if (/(^|\s|\/)codex(\s|$)/.test(cmd)) return "codex";
   if (hasClaudeId) return "claude";
-  if (hasCodexState) return "codex";
   return null;
 }
 
@@ -102,12 +115,14 @@ export function TerminalSwitcher() {
     const codex = app.codexState();
     const activeId = app.activeSessionId();
     const transcripts = app.lastAgentTurn();
+    const claudeStates = app.claudeState();
     return app.sessions.map((s) => {
       const state = app.getSessionState(s.id);
       const agentKind = detectAgentKind(
         s.command,
-        Boolean(claudeIds[s.id]),
-        Boolean(codex[s.id])
+        claudeStates[s.id],
+        codex[s.id],
+        Boolean(claudeIds[s.id])
       );
       const fullAgentId = claudeIds[s.id] ?? null;
       const agentSessionShort =
