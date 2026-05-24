@@ -1,9 +1,8 @@
 import { Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
-import { marked } from "marked";
-import DOMPurify from "dompurify";
 import { invoke } from "@tauri-apps/api/core";
 import { extractImageFromClipboard } from "../../utils/clipboard";
+import { renderMarkdownToSafeHtml } from "../../utils/markdown";
 // Side-effect imports that register editor contributions (actions, widgets,
 // keybindings). Without these, editor.api gives you a bare-bones editor —
 // undo/redo (cursorUndo), word-level caret/selection, multi-cursor, comment
@@ -62,18 +61,6 @@ const ensureMonacoEnvironment = () => {
   monacoConfigured = true;
 };
 
-// Configure marked once: GFM tables, autolink, line breaks → <br>.
-marked.setOptions({
-  gfm: true,
-  breaks: true,
-});
-
-const renderMarkdownToSafeHtml = (source: string): string => {
-  const raw = marked.parse(source, { async: false }) as string;
-  return DOMPurify.sanitize(raw, {
-    ADD_ATTR: ["target"],
-  });
-};
 
 const languageIdForPath = (path: string) => {
   const lower = path.toLowerCase();

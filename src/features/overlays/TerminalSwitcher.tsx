@@ -1,5 +1,8 @@
 import { For, Show, createMemo, createSignal, createEffect, onCleanup } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
+import { renderMarkdownToSafeHtml } from "../../utils/markdown";
+
+const TRANSCRIPT_PREVIEW_CHARS = 2400;
 
 type FilterTab = "all" | "active" | "attention" | "recent";
 
@@ -12,6 +15,7 @@ interface TileData {
   state: "working" | "idle" | "unknown";
   seenAt: number | null;
   previewLines: string[];
+  previewMarkdown: string | null;
   previewSource: "transcript" | "scrollback" | "empty";
   isActive: boolean;
   agentKind: "claude" | "codex" | null;
@@ -20,7 +24,6 @@ interface TileData {
 }
 
 const TILE_PREVIEW_LINES = 5;
-const TRANSCRIPT_PREVIEW_LINES = 18;
 
 function formatAgo(ms: number | null | undefined): string {
   if (!ms) return "—";
@@ -94,12 +97,18 @@ export function TerminalSwitcher() {
           : null;
 
       const transcript = transcripts[s.id];
-      let previewLines: string[];
+      let previewLines: string[] = [];
+      let previewMarkdown: string | null = null;
       let previewSource: TileData["previewSource"];
       if (transcript && transcript.text.trim().length > 0) {
-        previewLines = transcript.text
-          .split("\n")
-          .slice(-TRANSCRIPT_PREVIEW_LINES);
+        // Tail-cap by character count: marked needs whole markdown blocks to
+        // parse correctly, so we slice on chars (preserving block structure)
+        // rather than lines. CSS clips visually.
+        const text = transcript.text;
+        previewMarkdown =
+          text.length > TRANSCRIPT_PREVIEW_CHARS
+            ? text.slice(text.length - TRANSCRIPT_PREVIEW_CHARS)
+            : text;
         previewSource = "transcript";
       } else {
         const tail = (previews[s.id] ?? []).slice(-TILE_PREVIEW_LINES);
@@ -116,6 +125,7 @@ export function TerminalSwitcher() {
         state,
         seenAt: seenAt[s.id] ?? s.createdAt,
         previewLines,
+        previewMarkdown,
         previewSource,
         isActive: s.id === activeId,
         agentKind,
@@ -163,6 +173,7 @@ export function TerminalSwitcher() {
         t.command ?? "",
         t.tags.join(" "),
         t.previewLines.join(" "),
+        t.previewMarkdown ?? "",
       ]
         .join(" ")
         .toLowerCase();
@@ -590,24 +601,34 @@ function SessionTile(props: {
             ? "Terminal tail"
             : ""}
         </div>
-        <div class="switcher-tile-preview-body">
-          <Show
-            when={props.tile.previewLines.length > 0}
-            fallback={<div class="switcher-tile-preview-empty">no recent output</div>}
-          >
-            <For each={props.tile.previewLines}>
-              {(line) => (
-                <div
-                  class={`switcher-tile-preview-line line-${classifyPreviewLine(line)} ${
-                    props.tile.previewSource === "transcript" ? "is-transcript" : ""
-                  }`}
-                >
-                  {line || " "}
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
+        <Show
+          when={props.tile.previewSource === "transcript" && props.tile.previewMarkdown}
+          fallback={
+            <div class="switcher-tile-preview-body">
+              <Show
+                when={props.tile.previewLines.length > 0}
+                fallback={
+                  <div class="switcher-tile-preview-empty">no recent output</div>
+                }
+              >
+                <For each={props.tile.previewLines}>
+                  {(line) => (
+                    <div
+                      class={`switcher-tile-preview-line line-${classifyPreviewLine(line)}`}
+                    >
+                      {line || " "}
+                    </div>
+                  )}
+                </For>
+              </Show>
+            </div>
+          }
+        >
+          <div
+            class="switcher-tile-preview-body switcher-tile-preview-markdown"
+            innerHTML={renderMarkdownToSafeHtml(props.tile.previewMarkdown!)}
+          />
+        </Show>
       </div>
 
       {/* Footer: updated time + sparkline stub + duration */}
