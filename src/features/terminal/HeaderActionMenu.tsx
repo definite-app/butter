@@ -60,6 +60,14 @@ const ClipboardIcon = () => (
   </svg>
 );
 
+const EraserIcon = () => (
+  <svg viewBox="0 0 14 14">
+    <path d="M9.25 2.25 L11.75 4.75 L6.5 10 L4 7.5 Z" />
+    <path d="M4 7.5 L2.25 9.25 L4.75 11.75 L6.5 10" />
+    <path d="M5.5 11.75 H11.75" />
+  </svg>
+);
+
 const PowerIcon = () => (
   <svg viewBox="0 0 14 14">
     <path d="M4.25 4 Q1.75 6 2.5 9 Q3.75 12 7 12 Q10.25 12 11.5 9 Q12.25 6 9.75 4" />
@@ -164,6 +172,13 @@ export function HeaderActionMenu() {
         label: "Copy terminal output",
         icon: ClipboardIcon,
         onSelect: () => void app.copyTerminalOutputToClipboard(sessionId),
+      });
+      items.push({
+        kind: "action",
+        id: "clear-terminal",
+        label: "Clear terminal",
+        icon: EraserIcon,
+        onSelect: () => app.clearTerminalForSession(sessionId),
       });
       items.push({ kind: "divider", id: "terminal-divider" });
       items.push({

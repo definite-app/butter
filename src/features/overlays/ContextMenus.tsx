@@ -1,5 +1,50 @@
-import { For, Show } from "solid-js";
+import { For, Show, createSignal, onMount, type JSX } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
+
+function ContextMenu(props: {
+  x: number;
+  y: number;
+  onClose: () => void;
+  children: JSX.Element;
+}) {
+  let menuRef: HTMLDivElement | undefined;
+  const [pos, setPos] = createSignal({ x: props.x, y: props.y });
+
+  onMount(() => {
+    if (!menuRef) return;
+    const rect = menuRef.getBoundingClientRect();
+    const margin = 8;
+    let x = props.x;
+    let y = props.y;
+    if (x + rect.width + margin > window.innerWidth) {
+      x = Math.max(margin, window.innerWidth - rect.width - margin);
+    }
+    if (y + rect.height + margin > window.innerHeight) {
+      y = Math.max(margin, window.innerHeight - rect.height - margin);
+    }
+    setPos({ x, y });
+  });
+
+  return (
+    <div
+      class="context-menu-overlay"
+      onClick={props.onClose}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        props.onClose();
+      }}
+    >
+      <div
+        ref={menuRef}
+        class="context-menu"
+        style={{ left: `${pos().x}px`, top: `${pos().y}px` }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {props.children}
+      </div>
+    </div>
+  );
+}
 
 export function ContextMenus() {
   const app = useAppContext();
@@ -8,22 +53,11 @@ export function ContextMenus() {
     <>
       <Show when={app.contextMenuFor()}>
         {(menu) => (
-          <div
-            class="context-menu-overlay"
-            onClick={() => app.setContextMenuFor(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              app.setContextMenuFor(null);
-            }}
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => app.setContextMenuFor(null)}
           >
-            <div
-              class="context-menu"
-              style={{
-                left: `${menu().x}px`,
-                top: `${menu().y}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
               <button
                 class="context-menu-item"
                 onClick={() => {
@@ -115,29 +149,17 @@ export function ContextMenus() {
                   </Show>
                 </div>
               </div>
-            </div>
-          </div>
+          </ContextMenu>
         )}
       </Show>
 
       <Show when={app.sidebarContextMenu()}>
         {(menu) => (
-          <div
-            class="context-menu-overlay"
-            onClick={() => app.setSidebarContextMenu(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              app.setSidebarContextMenu(null);
-            }}
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => app.setSidebarContextMenu(null)}
           >
-            <div
-              class="context-menu"
-              style={{
-                left: `${menu().x}px`,
-                top: `${menu().y}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
               <button
                 class="context-menu-item"
                 onClick={() => {
@@ -192,29 +214,17 @@ export function ContextMenus() {
                   )}
                 </For>
               </Show>
-            </div>
-          </div>
+          </ContextMenu>
         )}
       </Show>
 
       <Show when={app.canvasContextMenu()}>
         {(menu) => (
-          <div
-            class="context-menu-overlay"
-            onClick={() => app.setCanvasContextMenu(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              app.setCanvasContextMenu(null);
-            }}
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => app.setCanvasContextMenu(null)}
           >
-            <div
-              class="context-menu"
-              style={{
-                left: `${menu().x}px`,
-                top: `${menu().y}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
               <button
                 class="context-menu-item"
                 onClick={() => {
@@ -298,29 +308,17 @@ export function ContextMenus() {
                 <span class="context-menu-icon">⌫</span>
                 Clear Drawing
               </button>
-            </div>
-          </div>
+          </ContextMenu>
         )}
       </Show>
 
       <Show when={app.folderContextMenu()}>
         {(menu) => (
-          <div
-            class="context-menu-overlay"
-            onClick={() => app.setFolderContextMenu(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              app.setFolderContextMenu(null);
-            }}
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => app.setFolderContextMenu(null)}
           >
-            <div
-              class="context-menu"
-              style={{
-                left: `${menu().x}px`,
-                top: `${menu().y}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
               <button
                 class="context-menu-item"
                 onClick={() => {
@@ -348,8 +346,7 @@ export function ContextMenus() {
                 </span>
                 {app.collapsedFolders().has(menu().tag) ? "Expand" : "Collapse"}
               </button>
-            </div>
-          </div>
+          </ContextMenu>
         )}
       </Show>
 
@@ -357,22 +354,11 @@ export function ContextMenus() {
         {(menu) => {
           const fileName = () => menu().path.split("/").pop() || menu().path;
           return (
-            <div
-              class="context-menu-overlay"
-              onClick={() => app.setFilePathContextMenu(null)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                app.setFilePathContextMenu(null);
-              }}
+            <ContextMenu
+              x={menu().x}
+              y={menu().y}
+              onClose={() => app.setFilePathContextMenu(null)}
             >
-              <div
-                class="context-menu"
-                style={{
-                  left: `${menu().x}px`,
-                  top: `${menu().y}px`,
-                }}
-                onClick={(e) => e.stopPropagation()}
-              >
                 <Show
                   when={app.canOpenPathInButter(menu().path)}
                   fallback={<div class="context-menu-header">{fileName()}</div>}
@@ -445,30 +431,18 @@ export function ContextMenus() {
                   </span>
                   Browse in File Browser
                 </button>
-              </div>
-            </div>
+            </ContextMenu>
           );
         }}
       </Show>
 
       <Show when={app.fileTabContextMenu()}>
         {(menu) => (
-          <div
-            class="context-menu-overlay"
-            onClick={() => app.setFileTabContextMenu(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              app.setFileTabContextMenu(null);
-            }}
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => app.setFileTabContextMenu(null)}
           >
-            <div
-              class="context-menu"
-              style={{
-                left: `${menu().x}px`,
-                top: `${menu().y}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
               <div class="context-menu-header">{menu().displayName}</div>
               <div class="context-menu-divider" />
               <button
@@ -537,8 +511,7 @@ export function ContextMenus() {
                 <span class="context-menu-icon">▦</span>
                 Browse in File Browser
               </button>
-            </div>
-          </div>
+          </ContextMenu>
         )}
       </Show>
 
@@ -553,22 +526,11 @@ export function ContextMenus() {
             }
           };
           return (
-            <div
-              class="context-menu-overlay"
-              onClick={() => app.setUrlContextMenu(null)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                app.setUrlContextMenu(null);
-              }}
+            <ContextMenu
+              x={menu().x}
+              y={menu().y}
+              onClose={() => app.setUrlContextMenu(null)}
             >
-              <div
-                class="context-menu"
-                style={{
-                  left: `${menu().x}px`,
-                  top: `${menu().y}px`,
-                }}
-                onClick={(e) => e.stopPropagation()}
-              >
                 <div class="context-menu-header">{displayUrl()}</div>
                 <div class="context-menu-divider" />
                 <button
@@ -585,8 +547,7 @@ export function ContextMenus() {
                   <span class="context-menu-icon">⎘</span>
                   Copy URL
                 </button>
-              </div>
-            </div>
+            </ContextMenu>
           );
         }}
       </Show>

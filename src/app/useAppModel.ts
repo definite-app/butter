@@ -34,6 +34,9 @@ import type {
   CanvasPoint,
   CanvasStroke,
   CanvasTool,
+  CcFetchResponse,
+  CcSearchResponse,
+  CcSearchResult,
   ClipboardHistoryEntry,
   ConfigPreset,
   DbScrollback,
@@ -478,6 +481,10 @@ export function useAppModel() {
     localStorage.getItem(APP_VIEW_STORAGE_KEY) === "canvas" ? "canvas" : "terminal"
   );
   const [showCommandPalette, setShowCommandPalette] = createSignal(false);
+  const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher">(
+    "commands"
+  );
+  const [switcherIndex, setSwitcherIndex] = createSignal(0);
   const [showClipboardDrawer, setShowClipboardDrawer] = createSignal(false);
   const [clipboardHistory, setClipboardHistory] = createSignal<ClipboardHistoryEntry[]>([]);
   const [clipboardHistoryQuery, setClipboardHistoryQuery] = createSignal("");
@@ -563,6 +570,21 @@ export function useAppModel() {
   const [showHiddenFiles, setShowHiddenFiles] = createSignal(false);
   const [fileBrowserActionEntry, setFileBrowserActionEntry] = createSignal<FileBrowserEntry | null>(null);
   const [fileBrowserActionIndex, setFileBrowserActionIndex] = createSignal(0);
+
+  // ===== Conversation history search (cc-search) =====
+  const [showCcSearch, setShowCcSearch] = createSignal(false);
+  const [ccSearchQuery, setCcSearchQuery] = createSignal("");
+  const [ccSearchResults, setCcSearchResults] = createSignal<CcSearchResult[]>([]);
+  const [ccSearchIndex, setCcSearchIndex] = createSignal(0);
+  const [ccSearchLoading, setCcSearchLoading] = createSignal(false);
+  const [ccSearchError, setCcSearchError] = createSignal<string | null>(null);
+  const [ccSearchMeta, setCcSearchMeta] = createSignal<{
+    elapsed_ms: number;
+    db_age_min: number | null;
+  } | null>(null);
+  let ccSearchTimer: ReturnType<typeof setTimeout> | undefined;
+  let ccSearchSeq = 0;
+  let ccSearchInputRef: HTMLInputElement | undefined;
   const [recordingState, setRecordingState] = createSignal<RecorderState>("idle");
   const [recordingStartedAt, setRecordingStartedAt] = createSignal<number | null>(null);
   const [recordingError, setRecordingError] = createSignal<string | null>(null);
@@ -1797,6 +1819,12 @@ export function useAppModel() {
         action: () => void openFileBrowser(),
       },
       {
+        id: "cc-search",
+        label: "Search Conversation History",
+        description: "Full-text search past Claude Code sessions (Cmd+Shift+H)",
+        action: () => openCcSearch(),
+      },
+      {
         id: "quick-input",
         label: "Quick Input View",
         description: "Send commands to any terminal at a glance",
@@ -2006,6 +2034,132 @@ export function useAppModel() {
     }
     setFileBrowserSearching(true);
     fileBrowserSearchTimer = setTimeout(() => void searchDirectory(query), 300);
+  };
+
+  // ===== Conversation history search (cc-search) =====
+
+  const setCcSearchInputRef = (el: HTMLInputElement | undefined) => {
+    ccSearchInputRef = el;
+  };
+
+  const runCcSearch = (raw: string) => {
+    const query = raw.trim();
+    if (ccSearchTimer) clearTimeout(ccSearchTimer);
+    const mySeq = ++ccSearchSeq;
+    if (query.length < 2) {
+      setCcSearchResults([]);
+      setCcSearchLoading(false);
+      setCcSearchError(null);
+      setCcSearchMeta(null);
+      setCcSearchIndex(0);
+      return;
+    }
+    setCcSearchLoading(true);
+    ccSearchTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          const resp = await invoke<CcSearchResponse>("cc_search", {
+            query,
+            limit: 30,
+          });
+          if (mySeq !== ccSearchSeq) return; // a newer keystroke won
+          if (resp.error) {
+            setCcSearchError(resp.error);
+            setCcSearchResults([]);
+            setCcSearchMeta(null);
+          } else {
+            setCcSearchError(null);
+            setCcSearchResults(resp.results ?? []);
+            setCcSearchMeta({
+              elapsed_ms: resp.elapsed_ms ?? 0,
+              db_age_min: resp.db_age_min ?? null,
+            });
+          }
+          setCcSearchIndex(0);
+        } catch (err) {
+          if (mySeq !== ccSearchSeq) return;
+          setCcSearchError(String(err));
+          setCcSearchResults([]);
+          setCcSearchMeta(null);
+        } finally {
+          if (mySeq === ccSearchSeq) setCcSearchLoading(false);
+        }
+      })();
+    }, 150);
+  };
+
+  const openCcSearch = () => {
+    setShowCcSearch(true);
+    setCcSearchIndex(0);
+    setCcSearchError(null);
+    if (ccSearchQuery().trim().length >= 2) runCcSearch(ccSearchQuery());
+    queueMicrotask(() => ccSearchInputRef?.focus());
+  };
+
+  const closeCcSearch = () => {
+    if (ccSearchTimer) clearTimeout(ccSearchTimer);
+    ccSearchSeq++;
+    setShowCcSearch(false);
+    setCcSearchLoading(false);
+  };
+
+  const updateCcSearchQuery = (value: string) => {
+    setCcSearchQuery(value);
+    runCcSearch(value);
+  };
+
+  const resumeCcSearchResult = (result: CcSearchResult) => {
+    const shortId = result.session_id.slice(0, 8);
+    const title = result.title?.trim() || `Resume ${shortId}`;
+    const directory = result.cwd?.trim() || undefined;
+    createSession(undefined, `claude --resume ${result.session_id}`, directory, title);
+    closeCcSearch();
+  };
+
+  const copyCcResumeCommand = async (result: CcSearchResult) => {
+    try {
+      await navigator.clipboard.writeText(`claude --resume ${result.session_id}`);
+    } catch (err) {
+      console.error("Failed to copy resume command:", err);
+    }
+  };
+
+  const copyCcText = async (result: CcSearchResult, mode: "match" | "thread") => {
+    try {
+      const resp = await invoke<CcFetchResponse>("cc_fetch", {
+        sessionId: result.session_id,
+        mode,
+        query: mode === "match" ? ccSearchQuery().trim() : null,
+      });
+      if (resp.error) {
+        setCcSearchError(resp.error);
+        return;
+      }
+      await navigator.clipboard.writeText(resp.text ?? "");
+    } catch (err) {
+      console.error(`Failed to copy ${mode} text:`, err);
+      setCcSearchError(String(err));
+    }
+  };
+
+  const copyCcMatch = (result: CcSearchResult) => copyCcText(result, "match");
+  const copyCcThread = (result: CcSearchResult) => copyCcText(result, "thread");
+
+  const openCcSessionFile = async (result: CcSearchResult) => {
+    if (!result.file_path) {
+      setCcSearchError("No transcript file recorded for this session.");
+      return;
+    }
+    try {
+      const tmpPath = await invoke<string>("cc_export_session", {
+        filePath: result.file_path,
+      });
+      closeCcSearch();
+      await openFileInButter(tmpPath);
+    } catch (err) {
+      console.error("Failed to open session file:", err);
+      setCcSearchError(String(err));
+    }
   };
 
   // ===== Clipboard history =====
@@ -3863,6 +4017,11 @@ export function useAppModel() {
     setRenameValue("");
   }
 
+  function clearTerminalForSession(id: string) {
+    const instance = terminalInstances.get(id);
+    instance?.term.clear();
+  }
+
   async function closeSession(
     id: string,
     options?: {
@@ -5611,14 +5770,22 @@ export function useAppModel() {
     }, 400);
 
     const handlePaletteShortcut = (event: KeyboardEvent) => {
-      const isCmdShiftK =
-        (event.key === "k" || event.key === "K") && event.metaKey && event.shiftKey;
-      if (!isCmdShiftK) return;
+      const isK = event.key === "k" || event.key === "K";
+      if (!isK || !event.metaKey) return;
+      const requestedMode: "commands" | "switcher" = event.shiftKey ? "commands" : "switcher";
       event.preventDefault();
       event.stopPropagation();
-      setShowCommandPalette((prev) => !prev);
+      const isOpen = showCommandPalette();
+      const sameMode = commandPaletteMode() === requestedMode;
+      if (isOpen && sameMode) {
+        setShowCommandPalette(false);
+        return;
+      }
+      setCommandPaletteMode(requestedMode);
+      setShowCommandPalette(true);
       setCommandQuery("");
       setCommandIndex(0);
+      setSwitcherIndex(0);
     };
     window.addEventListener("keydown", handlePaletteShortcut, true); // capture phase
 
@@ -5685,6 +5852,20 @@ export function useAppModel() {
       }
     };
     window.addEventListener("keydown", handleFileBrowserShortcut, true);
+
+    const handleCcSearchShortcut = (event: KeyboardEvent) => {
+      const isCmdShiftH =
+        (event.key === "h" || event.key === "H") && event.metaKey && event.shiftKey;
+      if (!isCmdShiftH) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (showCcSearch()) {
+        closeCcSearch();
+      } else {
+        openCcSearch();
+      }
+    };
+    window.addEventListener("keydown", handleCcSearchShortcut, true);
 
     const handleSearchShortcut = (event: KeyboardEvent) => {
       const isFind =
@@ -5774,23 +5955,10 @@ export function useAppModel() {
     };
     window.addEventListener("keydown", handleCmdBackspace, true); // capture phase
 
-    const handleClearTerminal = (event: KeyboardEvent) => {
-      // Cmd+K to clear terminal output
-      const isCmdK = (event.key === "k" || event.key === "K") && event.metaKey && !event.shiftKey;
-      if (!isCmdK) return;
-      if (activeWorkspaceTabKind() !== "terminal") return;
-      if (isEditableTarget(event.target)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const sessionId = activeSessionId();
-      if (sessionId) {
-        const instance = terminalInstances.get(sessionId);
-        if (instance) {
-          instance.term.clear();
-        }
-      }
-    };
-    window.addEventListener("keydown", handleClearTerminal, true); // capture phase
+    // Note: Cmd+K previously cleared the terminal; it is now globally bound to
+    // open the switcher palette (see handlePaletteShortcut above). Use the
+    // command palette ("Clear Terminal Output") or the terminal's own escape
+    // sequence if you need clearing.
 
     const handleCanvasZoomShortcut = (event: KeyboardEvent) => {
       if (!event.metaKey || appView() !== "canvas") return;
@@ -6509,13 +6677,13 @@ export function useAppModel() {
       window.removeEventListener("keydown", handleClipboardHistoryShortcut, true);
       window.removeEventListener("keydown", handleClipboardDrawerKeys, true);
       window.removeEventListener("keydown", handleFileBrowserShortcut, true);
+      window.removeEventListener("keydown", handleCcSearchShortcut, true);
       window.removeEventListener("keydown", handleSearchShortcut, true);
       window.removeEventListener("keydown", handleSaveShortcut, true);
       window.removeEventListener("keydown", handleNewTerminalShortcut);
       window.removeEventListener("keydown", handleCloseTerminalShortcut);
       window.removeEventListener("keydown", handleReopenTerminalShortcut, true);
       window.removeEventListener("keydown", handleCmdBackspace, true);
-      window.removeEventListener("keydown", handleClearTerminal, true);
       window.removeEventListener("keydown", handleCanvasZoomShortcut, true);
       window.removeEventListener("keydown", handleCanvasDeleteShortcut, true);
       window.removeEventListener("keydown", handlePasteShortcut, true);
@@ -6637,6 +6805,8 @@ export function useAppModel() {
     agentSessionIdBySession,
     claudeState,
     setClaudeState,
+    codexState,
+    setCodexState,
     idleTick,
     setIdleTick,
     presets,
@@ -6669,6 +6839,10 @@ export function useAppModel() {
     setAppView: setAppViewMode,
     showCommandPalette,
     setShowCommandPalette,
+    commandPaletteMode,
+    setCommandPaletteMode,
+    switcherIndex,
+    setSwitcherIndex,
     showClipboardDrawer,
     setShowClipboardDrawer,
     clipboardHistory,
@@ -6794,6 +6968,25 @@ export function useAppModel() {
     fileBrowserActionIndex,
     setFileBrowserActionIndex,
     fileBrowserActions,
+    showCcSearch,
+    setShowCcSearch,
+    ccSearchQuery,
+    ccSearchResults,
+    ccSearchIndex,
+    setCcSearchIndex,
+    ccSearchLoading,
+    ccSearchError,
+    ccSearchMeta,
+    setCcSearchInputRef,
+    updateCcSearchQuery,
+    openCcSearch,
+    closeCcSearch,
+    runCcSearch,
+    resumeCcSearchResult,
+    copyCcResumeCommand,
+    copyCcMatch,
+    copyCcThread,
+    openCcSessionFile,
     activeFilterCount,
     footerPresets,
     shouldShowFooterPresetMenu,
@@ -6847,6 +7040,7 @@ export function useAppModel() {
     reorderSessions,
     beginPointerDrag,
     closeRename,
+    clearTerminalForSession,
     closeSession,
     confirmDialog,
     askConfirm,

@@ -250,3 +250,39 @@ export interface CanvasBoard {
   selectedObjectIds: string[];
   zoom: number;
 }
+
+// ===== Conversation history search (cc-search) =====
+
+export interface CcSearchSnippet {
+  role: string;
+  ts: string | null;
+  text: string;
+}
+
+export interface CcSearchResult {
+  session_id: string;
+  project_dir: string | null;
+  cwd: string | null;
+  git_branch: string | null;
+  file_path: string | null;
+  title: string | null;
+  latest_match: string | null;
+  match_count: number;
+  snippets: CcSearchSnippet[];
+}
+
+export interface CcFetchResponse {
+  session_id: string;
+  mode: string;
+  count?: number;
+  text?: string;
+  error?: string;
+}
+
+export interface CcSearchResponse {
+  query: string;
+  results?: CcSearchResult[];
+  elapsed_ms?: number;
+  db_age_min?: number | null;
+  error?: string;
+}

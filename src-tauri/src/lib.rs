@@ -1,5 +1,6 @@
 mod agent_types;
 mod browser;
+mod cc_search;
 mod clipboard_history;
 mod config;
 mod database;
@@ -1515,6 +1516,82 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .menu(|app_handle| {
+            use tauri::menu::{AboutMetadata, Menu, PredefinedMenuItem, Submenu};
+
+            let pkg_info = app_handle.package_info();
+            let config = app_handle.config();
+            let about_metadata = AboutMetadata {
+                name: Some(pkg_info.name.clone()),
+                version: Some(pkg_info.version.to_string()),
+                copyright: config.bundle.copyright.clone(),
+                authors: config.bundle.publisher.clone().map(|p| vec![p]),
+                ..Default::default()
+            };
+
+            Menu::with_items(
+                app_handle,
+                &[
+                    #[cfg(target_os = "macos")]
+                    &Submenu::with_items(
+                        app_handle,
+                        pkg_info.name.clone(),
+                        true,
+                        &[
+                            &PredefinedMenuItem::about(app_handle, None, Some(about_metadata))?,
+                            &PredefinedMenuItem::separator(app_handle)?,
+                            &PredefinedMenuItem::services(app_handle, None)?,
+                            &PredefinedMenuItem::separator(app_handle)?,
+                            &PredefinedMenuItem::hide(app_handle, None)?,
+                            &PredefinedMenuItem::hide_others(app_handle, None)?,
+                            &PredefinedMenuItem::separator(app_handle)?,
+                            &PredefinedMenuItem::quit(app_handle, None)?,
+                        ],
+                    )?,
+                    &Submenu::with_items(
+                        app_handle,
+                        "File",
+                        true,
+                        &[&PredefinedMenuItem::close_window(app_handle, None)?],
+                    )?,
+                    &Submenu::with_items(
+                        app_handle,
+                        "Edit",
+                        true,
+                        &[
+                            &PredefinedMenuItem::undo(app_handle, None)?,
+                            &PredefinedMenuItem::redo(app_handle, None)?,
+                            &PredefinedMenuItem::separator(app_handle)?,
+                            &PredefinedMenuItem::cut(app_handle, None)?,
+                            &PredefinedMenuItem::copy(app_handle, None)?,
+                            &PredefinedMenuItem::paste(app_handle, None)?,
+                            // Intentionally omit select_all: otherwise macOS
+                            // swallows Cmd+A at the menu level before the
+                            // webview (Monaco, xterm, inputs) can handle it.
+                        ],
+                    )?,
+                    #[cfg(target_os = "macos")]
+                    &Submenu::with_items(
+                        app_handle,
+                        "View",
+                        true,
+                        &[&PredefinedMenuItem::fullscreen(app_handle, None)?],
+                    )?,
+                    &Submenu::with_items(
+                        app_handle,
+                        "Window",
+                        true,
+                        &[
+                            &PredefinedMenuItem::minimize(app_handle, None)?,
+                            &PredefinedMenuItem::maximize(app_handle, None)?,
+                            #[cfg(target_os = "macos")]
+                            &PredefinedMenuItem::separator(app_handle)?,
+                            &PredefinedMenuItem::close_window(app_handle, None)?,
+                        ],
+                    )?,
+                ],
+            )
+        })
         .invoke_handler(tauri::generate_handler![
             focus_manager_window,
             set_window_width,
@@ -1586,6 +1663,9 @@ pub fn run() {
             clipboard_history_delete,
             clipboard_history_clear,
             clipboard_history_compose,
+            cc_search::cc_search,
+            cc_search::cc_fetch,
+            cc_search::cc_export_session,
         ])
         .setup(|app| {
             // Initialize the agent database
@@ -1593,6 +1673,7 @@ pub fn run() {
             app.manage(db.clone());
             clipboard_history::spawn_watcher(app.handle().clone(), db);
             app.manage(PtyManager::new(app.handle().clone()));
+            app.manage(Arc::new(cc_search::CcSearch::default()));
             let browser_manager = Arc::new(BrowserManager::new(app.handle().clone()));
             let http_listener =
                 bind_agent_api_listener().expect("Failed to reserve local agent API port");

@@ -304,6 +304,11 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
     bindPasteListener();
     bindMouseListener();
 
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA, () => {
+      if (!editor || !model) return;
+      editor.setSelection(model.getFullModelRange());
+    });
+
     app.registerFileTabFindHandler(initialTab.id, () => {
       editor?.focus();
       void editor?.getAction("actions.find")?.run();

@@ -7,7 +7,9 @@ import { TerminalArea } from "../features/terminal/TerminalArea";
 import { CanvasView } from "../features/canvas/CanvasView";
 import { FooterBar } from "../features/footer/FooterBar";
 import { CommandPalette } from "../features/overlays/CommandPalette";
+import { TerminalSwitcher } from "../features/overlays/TerminalSwitcher";
 import { FileBrowser } from "../features/overlays/FileBrowser";
+import { CcSearch } from "../features/overlays/CcSearch";
 import { ContextMenus } from "../features/overlays/ContextMenus";
 import { ConfirmModal } from "../features/overlays/ConfirmModal";
 import { RestorePrompt } from "../features/overlays/RestorePrompt";
@@ -95,7 +97,9 @@ export function AppShell() {
       </div>
       <FooterBar />
       <CommandPalette />
+      <TerminalSwitcher />
       <FileBrowser />
+      <CcSearch />
       <ContextMenus />
       <RestorePrompt />
       <PresetEditor />

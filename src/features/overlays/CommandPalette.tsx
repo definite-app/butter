@@ -5,7 +5,7 @@ export function CommandPalette() {
   const app = useAppContext();
 
   return (
-    <Show when={app.showCommandPalette()}>
+    <Show when={app.showCommandPalette() && app.commandPaletteMode() === "commands"}>
       <div
         class="command-palette-overlay"
         onClick={() => app.setShowCommandPalette(false)}
