@@ -6872,6 +6872,7 @@ body.butter-printing-markdown .butter-print-content hr {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  align-items: stretch;
 }
 
 @media (min-width: 1100px) {
@@ -6910,6 +6911,11 @@ body.butter-printing-markdown .butter-print-content hr {
   transition: border-color 120ms var(--ease-out), background 120ms var(--ease-out),
     transform 120ms var(--ease-out), box-shadow 120ms var(--ease-out);
   min-height: 220px;
+  /* Critical: grid items default to min-width:auto, allowing long preview lines
+     to push the tile past its track and ghost across neighbors. Clip everything
+     that escapes. */
+  min-width: 0;
+  overflow: hidden;
 }
 
 .switcher-tile:hover,
@@ -6944,6 +6950,7 @@ body.butter-printing-markdown .butter-print-content hr {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
 
 .switcher-tile-title {
@@ -6954,6 +6961,8 @@ body.butter-printing-markdown .butter-print-content hr {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
 }
 
 .switcher-tile-pill {
@@ -7004,6 +7013,8 @@ body.butter-printing-markdown .butter-print-content hr {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .switcher-tile-agent {
@@ -7069,6 +7080,8 @@ body.butter-printing-markdown .butter-print-content hr {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .switcher-tile-dir {
@@ -7095,9 +7108,14 @@ body.butter-printing-markdown .butter-print-content hr {
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.45;
-  max-height: 92px;
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.25) 0%, #000 35%, #000 100%);
-  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.25) 0%, #000 35%, #000 100%);
+  /* Always reserve preview space so every tile in a row matches height,
+     even when there is no recent output. */
+  min-height: 92px;
+  min-width: 0;
+  /* Soft fade across the top ~20% so all five visible lines stay legible
+     while still hinting at scrollback above. */
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6) 0%, #000 20%, #000 100%);
+  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6) 0%, #000 20%, #000 100%);
 }
 
 .switcher-tile-preview-line {
