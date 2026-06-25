@@ -385,15 +385,20 @@ impl<R: Runtime> BrowserManager<R> {
         fs::create_dir_all(&bin_dir).map_err(|e| format!("Failed to create CLI dir: {e}"))?;
         let cli_path = bin_dir.join("butter-browser");
         fs::write(&cli_path, cli_script()).map_err(|e| format!("Failed to write CLI shim: {e}"))?;
+        let team_cli_path = bin_dir.join("butter-cli");
+        fs::write(&team_cli_path, team_cli_script())
+            .map_err(|e| format!("Failed to write butter-cli shim: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&cli_path)
-                .map_err(|e| format!("Failed to read CLI shim metadata: {e}"))?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&cli_path, perms)
-                .map_err(|e| format!("Failed to mark CLI shim executable: {e}"))?;
+            for path in [&cli_path, &team_cli_path] {
+                let mut perms = fs::metadata(path)
+                    .map_err(|e| format!("Failed to read CLI shim metadata: {e}"))?
+                    .permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(path, perms)
+                    .map_err(|e| format!("Failed to mark CLI shim executable: {e}"))?;
+            }
         }
         Ok(bin_dir)
     }
@@ -405,8 +410,11 @@ impl<R: Runtime> BrowserManager<R> {
         Ok(vec![
             ("BUTTER_SESSION_ID".to_string(), session_id.to_string()),
             ("BUTTER_BROWSER_ENDPOINT".to_string(), self.endpoint_url()),
-            ("BUTTER_BROWSER_TOKEN".to_string(), token),
+            ("BUTTER_BROWSER_TOKEN".to_string(), token.clone()),
+            ("BUTTER_TEAM_ENDPOINT".to_string(), self.endpoint_url()),
+            ("BUTTER_TEAM_TOKEN".to_string(), token),
             ("BUTTER_BROWSER_BIN".to_string(), path_prefix.clone()),
+            ("BUTTER_CLI_BIN".to_string(), path_prefix.clone()),
             (
                 "PATH".to_string(),
                 match std::env::var("PATH") {
@@ -1614,6 +1622,286 @@ case "$command" in
         usage 1
         ;;
     esac
+    ;;
+  *)
+    usage 1
+    ;;
+esac
+"#
+}
+
+fn team_cli_script() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+
+usage() {
+  code="${1:-0}"
+  if [ "$code" -eq 0 ]; then
+    cat <<'EOF'
+Usage:
+  butter-cli team send --channel <name> <message>
+  butter-cli team send --to <username> <message>
+  butter-cli team reply <message-id> <message>
+  butter-cli team inbox
+  butter-cli team read --channel <name>
+  butter-cli team mark-read <message-id>
+  butter-cli team mark-unread <message-id>
+  butter-cli team user list
+  butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
+  butter-cli team channel list
+  butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
+  butter-cli help
+EOF
+  else
+    cat >&2 <<'EOF'
+Usage:
+  butter-cli team send --channel <name> <message>
+  butter-cli team send --to <username> <message>
+  butter-cli team reply <message-id> <message>
+  butter-cli team inbox
+  butter-cli team read --channel <name>
+  butter-cli team mark-read <message-id>
+  butter-cli team mark-unread <message-id>
+  butter-cli team user list
+  butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
+  butter-cli team channel list
+  butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
+  butter-cli help
+EOF
+  fi
+  exit "$code"
+}
+
+need_env() {
+  name="$1"
+  eval "value=\${$name:-}"
+  if [ -z "$value" ]; then
+    echo "butter-cli: missing $name" >&2
+    exit 1
+  fi
+}
+
+join_args() {
+  out=""
+  for item in "$@"; do
+    if [ -z "$out" ]; then
+      out="$item"
+    else
+      out="$out $item"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+
+root="${1:-}"
+[ -n "$root" ] || usage 1
+shift || true
+
+case "$root" in
+  help|-h|--help)
+    usage 0
+    ;;
+  team)
+    ;;
+  *)
+    usage 1
+    ;;
+esac
+
+need_env BUTTER_SESSION_ID
+need_env BUTTER_TEAM_ENDPOINT
+need_env BUTTER_TEAM_TOKEN
+
+sid="$BUTTER_SESSION_ID"
+endpoint="$BUTTER_TEAM_ENDPOINT"
+token="$BUTTER_TEAM_TOKEN"
+actor="${BUTTER_TEAM_USER_ID:-}"
+
+post_form() {
+  route="$1"
+  shift || true
+  curl -fsS -X POST --data-urlencode "token=$token" --data-urlencode "actor_user_id=$actor" "$@" "$endpoint/team/$sid/$route"
+}
+
+get_query() {
+  route="$1"
+  shift || true
+  curl -fsS -G --data-urlencode "token=$token" "$@" "$endpoint/team/$sid/$route"
+}
+
+value_arg() {
+  opt="$1"
+  value="${2:-}"
+  if [ -z "$value" ]; then
+    echo "butter-cli: missing value for $opt" >&2
+    exit 1
+  fi
+  printf '%s\n' "$value"
+}
+
+command="${1:-}"
+[ -n "$command" ] || usage 1
+shift || true
+
+case "$command" in
+  send)
+    target_kind="${1:-}"
+    target_value="${2:-}"
+    [ -n "$target_kind" ] || usage 1
+    [ -n "$target_value" ] || usage 1
+    shift 2 || true
+    content="$(join_args "$@")"
+    [ -n "$content" ] || usage 1
+    case "$target_kind" in
+      --channel)
+        post_form send --data-urlencode "channel=$target_value" --data-urlencode "content=$content"
+        ;;
+      --to)
+        post_form send --data-urlencode "to=$target_value" --data-urlencode "content=$content"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  reply)
+    parent_id="${1:-}"
+    [ -n "$parent_id" ] || usage 1
+    shift || true
+    content="$(join_args "$@")"
+    [ -n "$content" ] || usage 1
+    post_form reply --data-urlencode "parent_message_id=$parent_id" --data-urlencode "content=$content"
+    ;;
+  inbox)
+    get_query inbox
+    ;;
+  read)
+    target_kind="${1:-}"
+    target_value="${2:-}"
+    [ "$target_kind" = "--channel" ] || usage 1
+    [ -n "$target_value" ] || usage 1
+    post_form read --data-urlencode "channel=$target_value"
+    ;;
+  mark-read)
+    message_id="${1:-}"
+    [ -n "$message_id" ] || usage 1
+    post_form mark-read --data-urlencode "message_id=$message_id"
+    ;;
+  mark-unread)
+    message_id="${1:-}"
+    [ -n "$message_id" ] || usage 1
+    post_form mark-unread --data-urlencode "message_id=$message_id"
+    ;;
+  user)
+    subcommand="${1:-}"
+    [ -n "$subcommand" ] || usage 1
+    shift || true
+    case "$subcommand" in
+      list)
+        get_query users
+        ;;
+      set)
+        username=""
+        display_name=""
+        pwd=""
+        cmd=""
+        description=""
+        enabled="true"
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --username)
+              username="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --display-name)
+              display_name="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --pwd)
+              pwd="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --cmd)
+              cmd="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --description)
+              description="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --disabled)
+              enabled="false"
+              shift
+              ;;
+            --enabled)
+              enabled="true"
+              shift
+              ;;
+            *)
+              usage 1
+              ;;
+          esac
+        done
+        [ -n "$username" ] || usage 1
+        [ -n "$pwd" ] || usage 1
+        [ -n "$cmd" ] || usage 1
+        post_form users/set \
+          --data-urlencode "username=$username" \
+          --data-urlencode "pwd=$pwd" \
+          --data-urlencode "cmd=$cmd" \
+          --data-urlencode "enabled=$enabled" \
+          --data-urlencode "display_name=$display_name" \
+          --data-urlencode "description=$description"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  channel)
+    subcommand="${1:-}"
+    [ -n "$subcommand" ] || usage 1
+    shift || true
+    case "$subcommand" in
+      list)
+        get_query channels
+        ;;
+      set)
+        name=""
+        display_name=""
+        description=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --name)
+              name="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --display-name)
+              display_name="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            --description)
+              description="$(value_arg "$1" "${2:-}")"
+              shift 2
+              ;;
+            *)
+              usage 1
+              ;;
+          esac
+        done
+        [ -n "$name" ] || usage 1
+        post_form channels/set \
+          --data-urlencode "name=$name" \
+          --data-urlencode "display_name=$display_name" \
+          --data-urlencode "description=$description"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  help|-h|--help)
+    usage 0
     ;;
   *)
     usage 1

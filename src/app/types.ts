@@ -126,6 +126,22 @@ export interface DbSession {
   last_accessed_at: number | null;
   is_closed: boolean;
   closed_at: number | null;
+  agent_kind: string | null;
+  agent_session_id: string | null;
+  agent_cwd: string | null;
+  agent_last_seen_at: number | null;
+}
+
+export type AgentKind = "claude" | "codex";
+
+/** Per-terminal agent snapshot used to restart/resume the agent on reopen. */
+export interface SessionAgentInfo {
+  kind: AgentKind;
+  agentSessionId: string | null;
+  cwd: string | null;
+  lastSeenAt: number;
+  /** Original launch command, so resume can preserve flags (e.g. --dangerously-skip-permissions). */
+  command?: string | null;
 }
 
 export interface DbScrollback {
@@ -188,9 +204,100 @@ export interface PasteQueueItem {
   filename: string;
 }
 
-export type AppView = "terminal" | "canvas";
+export type AppView = "terminal" | "canvas" | "team";
 export type CanvasTool = "select" | "pen";
 export type CanvasFileKind = "text" | "image" | "binary";
+
+export interface TeamUser {
+  id: string;
+  username: string;
+  display_name: string;
+  avatar_color: string | null;
+  pwd: string;
+  cmd: string;
+  description: string | null;
+  enabled: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TeamChannel {
+  id: string;
+  name: string;
+  display_name: string;
+  description: string | null;
+  created_at: number;
+  updated_at: number;
+  archived_at: number | null;
+}
+
+export interface TeamConversation {
+  id: string;
+  kind: "channel" | "dm" | "group_dm";
+  channel_id: string | null;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  archived_at: number | null;
+}
+
+export interface TeamMessage {
+  id: string;
+  conversation_id: string;
+  author_kind: "human" | "agent" | "system";
+  author_user_id: string | null;
+  content: string;
+  created_at: number;
+  edited_at: number | null;
+  deleted_at: number | null;
+  status: string;
+  parent_message_id: string | null;
+  thread_reply_count: number;
+  last_reply_at: number | null;
+  pty_session_id: string | null;
+}
+
+export interface TeamAgentRun {
+  id: string;
+  trigger_message_id: string;
+  reply_parent_message_id: string;
+  user_id: string;
+  pty_session_id: string | null;
+  cwd: string;
+  command_template: string;
+  rendered_command: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  started_at: number | null;
+  completed_at: number | null;
+  exit_code: number | null;
+  error: string | null;
+}
+
+export interface TeamInboxItem {
+  message: TeamMessage;
+  conversation: TeamConversation;
+  channel: TeamChannel | null;
+  author: TeamUser | null;
+  parent_message: TeamMessage | null;
+  delivered_at: number | null;
+  read_at: number | null;
+}
+
+export type TeamPinKind = "file" | "message" | "link";
+
+export interface TeamPin {
+  id: string;
+  kind: TeamPinKind;
+  title: string;
+  file_path: string | null;
+  url: string | null;
+  message_id: string | null;
+  message_conversation_id: string | null;
+  message_parent_message_id: string | null;
+  message_preview: string | null;
+  created_at: number;
+  updated_at: number;
+}
 
 export interface CanvasPoint {
   x: number;

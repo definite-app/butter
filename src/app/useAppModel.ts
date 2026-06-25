@@ -37,6 +37,7 @@ import type {
   CcFetchResponse,
   CcSearchResponse,
   CcSearchResult,
+  AgentKind,
   ClipboardHistoryEntry,
   ConfigPreset,
   DbScrollback,
@@ -47,6 +48,7 @@ import type {
   RecorderState,
   RecordingTranscriptionResult,
   SearchDirection,
+  SessionAgentInfo,
   TerminalPreset,
   WebSession,
   WorkspaceFileTab,
@@ -531,12 +533,119 @@ export function useAppModel() {
   let prevClaudeState: Record<string, string> = {};
   let prevCodexState: Record<string, string> = {};
   let lastNotifiedSessionId: string | null = null;
+
+  // ===== Per-terminal agent snapshot (for restart/resume on reopen) =====
+  // The activity poll tells us which agent (claude/codex) is live in each
+  // terminal and, for claude, its conversation id. We persist that to the DB
+  // so a quit or crash doesn't lose which agent — and which conversation — was
+  // running where. Codex ids are resolved from its rollout logs by cwd.
+  const [sessionAgentInfo, setSessionAgentInfo] =
+    createSignal<Record<string, SessionAgentInfo>>({});
+  const persistedAgentCache: Record<
+    string,
+    { kind: AgentKind; agentSessionId: string | null; writtenAt: number }
+  > = {};
+  const codexIdCache: Record<string, string> = {};
+  const isAgentLive = (state?: string) => state === "working" || state === "idle";
+
+  // Build the shell command that resumes (or relaunches) an agent. Prefers
+  // continuing the exact prior conversation by injecting a resume flag into the
+  // user's original launch command, so flags (e.g. --dangerously-skip-permissions)
+  // are preserved. Falls back to a fresh launch when no conversation id is known.
+  const buildAgentResumeCommand = (info: SessionAgentInfo): string => {
+    const original = info.command?.trim() ?? "";
+    if (info.kind === "claude") {
+      if (!info.agentSessionId) return original || "claude";
+      // Insert `--resume <id>` right after `claude`, keeping the user's flags.
+      const rest = /^claude(\s|$)/.test(original)
+        ? original.replace(/^claude\s*/, "")
+        : "";
+      return `claude --resume ${info.agentSessionId}${rest ? ` ${rest}` : ""}`;
+    }
+    // codex
+    return info.agentSessionId ? `codex resume ${info.agentSessionId}` : "codex resume --last";
+  };
+
+  async function resolveCodexSessionId(
+    sessionId: string,
+    cwd: string | null,
+    curr: string | undefined,
+    prev: string | undefined
+  ): Promise<string | null> {
+    if (!cwd) return codexIdCache[sessionId] ?? null;
+    // Re-resolve on the rising edge (a freshly launched codex), otherwise reuse
+    // the cached id to avoid scanning the rollout logs every poll.
+    const risingEdge = isAgentLive(curr) && !isAgentLive(prev);
+    if (codexIdCache[sessionId] && !risingEdge) return codexIdCache[sessionId];
+    try {
+      const id = await invoke<string | null>("codex_latest_session_id", { cwd });
+      if (id) codexIdCache[sessionId] = id;
+      return id ?? codexIdCache[sessionId] ?? null;
+    } catch {
+      return codexIdCache[sessionId] ?? null;
+    }
+  }
+
+  async function persistAgentSnapshots(
+    claudeStates: Record<string, string>,
+    codexStates: Record<string, string>,
+    agentSessionIds: Record<string, string>,
+    prevCodex: Record<string, string>
+  ) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const session of sessions) {
+      const sid = session.id;
+      let kind: AgentKind | null = null;
+      let agentSessionId: string | null = null;
+      if (isAgentLive(claudeStates[sid]) || agentSessionIds[sid]) {
+        kind = "claude";
+        agentSessionId =
+          agentSessionIds[sid] ?? persistedAgentCache[sid]?.agentSessionId ?? null;
+      } else if (isAgentLive(codexStates[sid])) {
+        kind = "codex";
+        agentSessionId = await resolveCodexSessionId(
+          sid,
+          session.directory ?? null,
+          codexStates[sid],
+          prevCodex[sid]
+        );
+      }
+      if (!kind) continue;
+      const cwd = session.directory ?? null;
+      setSessionAgentInfo((prev) => ({
+        ...prev,
+        [sid]: { kind, agentSessionId, cwd, lastSeenAt: nowSec },
+      }));
+      // Throttle DB writes: only when the agent/conversation changed or every 30s.
+      const cached = persistedAgentCache[sid];
+      const changed =
+        !cached || cached.kind !== kind || cached.agentSessionId !== agentSessionId;
+      const stale = !cached || nowSec - cached.writtenAt > 30;
+      if (!changed && !stale) continue;
+      persistedAgentCache[sid] = { kind, agentSessionId, writtenAt: nowSec };
+      try {
+        await invoke("db_set_session_agent", {
+          req: {
+            session_id: sid,
+            agent_kind: kind,
+            agent_session_id: agentSessionId,
+            agent_cwd: cwd,
+            agent_last_seen_at: nowSec,
+          },
+        });
+      } catch {
+        // best-effort; the next poll retries
+      }
+    }
+  }
   const [idleTick, setIdleTick] = createSignal(0);
   const [presets, setPresets] = createSignal<TerminalPreset[]>([]);
   const [appConfig, setAppConfig] = createSignal<AppConfig | null>(null);
   const [restorePromptOpen, setRestorePromptOpen] = createSignal(false);
   const [restoreDecision, setRestoreDecision] = createSignal<"pending" | "yes" | "no">("no");
   const [pendingRestoreActiveId, setPendingRestoreActiveId] = createSignal<string | null>(null);
+  // Previously-open terminals offered in the startup reopen picker.
+  const [restoreCandidates, setRestoreCandidates] = createSignal<DbSession[]>([]);
   const [showPresetEditor, setShowPresetEditor] = createSignal(false);
   const [editingPreset, setEditingPreset] = createSignal<TerminalPreset | null>(null);
   const [newPresetTagName, setNewPresetTagName] = createSignal("");
@@ -547,9 +656,10 @@ export function useAppModel() {
   );
   const [footerInput, setFooterInput] = createSignal("");
   const [showFilterMenu, setShowFilterMenu] = createSignal(false);
-  const [appView, setAppView] = createSignal<AppView>(
-    localStorage.getItem(APP_VIEW_STORAGE_KEY) === "canvas" ? "canvas" : "terminal"
-  );
+  const [appView, setAppView] = createSignal<AppView>((() => {
+    const stored = localStorage.getItem(APP_VIEW_STORAGE_KEY);
+    return stored === "canvas" || stored === "team" ? stored : "terminal";
+  })());
   const [showCommandPalette, setShowCommandPalette] = createSignal(false);
   const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher">(
     "commands"
@@ -679,6 +789,9 @@ export function useAppModel() {
   const terminalHostCleanup = new Map<string, () => void>();
   const lastPtySizeBySession = new Map<string, { rows: number; cols: number }>();
   const commandRunFor = new Set<string>();
+  // Sessions that should relaunch/resume their agent on next terminal spawn.
+  // Populated by the reopen picker; consumed once in ensureTerminal.
+  const pendingAgentResume = new Map<string, SessionAgentInfo>();
   const autoTitleLookupInFlight = new Set<string>();
   const autoTitleResolvedAgentSessions = new Set<string>();
   const quickInputRefs = new Map<string, HTMLInputElement>();
@@ -1943,6 +2056,12 @@ export function useAppModel() {
         label: "Open Canvas View",
         description: "Switch to canvas workspace",
         action: () => setAppViewMode("canvas"),
+      },
+      {
+        id: "open-team-view",
+        label: "Open Team Mode",
+        description: "Switch to Slack-style agent channels and DMs",
+        action: () => setAppViewMode("team"),
       },
     ];
 
@@ -4777,10 +4896,22 @@ export function useAppModel() {
       void updatePtySize(id);
     }
 
+    // Decide what to run on a freshly-spawned PTY. If the reopen picker asked to
+    // resume an agent, that takes precedence over re-running the original command
+    // (which would start a fresh conversation instead of resuming the prior one).
+    const resumeInfo = pendingAgentResume.get(id);
     const command = session?.command?.trim();
-    if (command && createdPty && !commandRunFor.has(id)) {
+    if (resumeInfo && createdPty && !commandRunFor.has(id)) {
+      commandRunFor.add(id);
+      pendingAgentResume.delete(id);
+      const resumeCmd = buildAgentResumeCommand(resumeInfo);
+      void invoke("pty_write", { id: ptyId, data: `${resumeCmd}\n` });
+    } else if (command && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       void invoke("pty_write", { id: ptyId, data: `${command}\n` });
+    } else if (resumeInfo) {
+      // PTY already existed (agent likely still running) — don't double-launch.
+      pendingAgentResume.delete(id);
     }
 
     term.onData((data) => {
@@ -5782,6 +5913,73 @@ export function useAppModel() {
     return id;
   }
 
+  // Reopen the chosen previously-open terminals from the startup picker. Each
+  // selection may opt to also restart/resume its agent. Unselected candidates
+  // are left untouched in the DB (still reopenable later).
+  const reopenSessionsFromPicker = (
+    selections: { id: string; restartAgent: boolean }[]
+  ) => {
+    setRestorePromptOpen(false);
+    const candidates = restoreCandidates();
+    const existingIds = new Set(sessions.map((s) => s.id));
+    let firstId: string | null = null;
+    for (const sel of selections) {
+      const dbSession = candidates.find((c) => c.id === sel.id);
+      if (!dbSession) continue;
+      if (!existingIds.has(dbSession.id)) {
+        setSessions(sessions.length, mapDbSessionToWebSession(dbSession));
+        existingIds.add(dbSession.id);
+      }
+      if (firstId === null) firstId = dbSession.id;
+      if (sel.restartAgent && dbSession.agent_kind) {
+        pendingAgentResume.set(dbSession.id, {
+          kind: dbSession.agent_kind as AgentKind,
+          agentSessionId: dbSession.agent_session_id,
+          cwd: dbSession.agent_cwd ?? dbSession.directory,
+          lastSeenAt: dbSession.agent_last_seen_at ?? 0,
+          command: dbSession.command,
+        });
+      }
+    }
+    setRestoreCandidates([]);
+    if (firstId === null) {
+      // Nothing selected — start fresh.
+      setRestoreDecision("no");
+      createSession();
+      return;
+    }
+    setRestoreDecision("yes");
+    setActiveSessionId(firstId);
+    setTabHistory([firstId]);
+    setTabHistoryIndex(0);
+  };
+
+  // Dismiss the picker without reopening anything; start a fresh terminal.
+  const dismissReopenPicker = () => {
+    setRestorePromptOpen(false);
+    setRestoreCandidates([]);
+    setRestoreDecision("no");
+    if (sessions.length === 0) createSession();
+  };
+
+  // Persist the active terminal id (crash-safe) and keep its last_accessed_at
+  // fresh so the reopen picker can order terminals by recency. Throttled so
+  // rapid tab switching doesn't spam the DB.
+  let lastActiveBumpAt = 0;
+  createEffect(() => {
+    const active = activeSessionId();
+    if (!active) return;
+    void invoke("db_set_app_state", {
+      key: "active_session_id",
+      value: active,
+    }).catch(() => {});
+    const nowMs = Date.now();
+    if (nowMs - lastActiveBumpAt > 5000) {
+      lastActiveBumpAt = nowMs;
+      void dbUpdateSession(active, {});
+    }
+  });
+
   const confirmRestoreSessions = () => {
     setRestorePromptOpen(false);
     setRestoreDecision("yes");
@@ -6496,22 +6694,35 @@ export function useAppModel() {
       }
     }
 
-    // Prompt before restoring previous sessions
+    // Offer to reopen the terminals that were open at last exit. The set
+    // survives both a clean quit and a crash (sessions stay is_closed=0), and
+    // each carries its last-known agent so we can restart/resume it.
     if (sessions.length === 0) {
-      setRestoreDecision("no");
-      createSession();
-    } else {
-      const savedActiveId = localStorage.getItem("terminal-active-session");
-      const preferredId =
-        savedActiveId && sessions.some((s) => s.id === savedActiveId)
-          ? savedActiveId
-          : sessions[0].id;
-      setPendingRestoreActiveId(preferredId);
-      if (preferredId) {
-        setActiveSessionId(preferredId);
+      let candidates: DbSession[] = [];
+      try {
+        candidates = await invoke<DbSession[]>("db_list_sessions");
+      } catch (err) {
+        console.error("[reopen] Failed to list previous sessions:", err);
       }
-      setRestoreDecision("pending");
-      setRestorePromptOpen(true);
+      if (candidates.length === 0) {
+        setRestoreDecision("no");
+        createSession();
+      } else {
+        // Order newest-active first so the picker leads with what you used last.
+        candidates = [...candidates].sort(
+          (a, b) =>
+            (b.last_accessed_at ?? b.created_at) - (a.last_accessed_at ?? a.created_at)
+        );
+        setRestoreCandidates(candidates);
+        const savedActiveId = localStorage.getItem("terminal-active-session");
+        setPendingRestoreActiveId(
+          savedActiveId && candidates.some((c) => c.id === savedActiveId)
+            ? savedActiveId
+            : candidates[0].id
+        );
+        setRestoreDecision("pending");
+        setRestorePromptOpen(true);
+      }
     }
 
     const unlisten = await listen<{ id: string; data: string }>(
@@ -6663,6 +6874,15 @@ export function useAppModel() {
             }
           }
         }
+
+        // Persist the agent snapshot (uses the *previous* codex state for the
+        // rising-edge re-resolve, so do it before overwriting prev state).
+        void persistAgentSnapshots(
+          claudeStates,
+          codexStates,
+          agentSessionIds,
+          { ...prevCodexState }
+        );
 
         prevClaudeState = { ...claudeStates };
         prevCodexState = { ...codexStates };
@@ -6890,6 +7110,10 @@ export function useAppModel() {
     setRestorePromptOpen,
     restoreDecision,
     setRestoreDecision,
+    restoreCandidates,
+    reopenSessionsFromPicker,
+    dismissReopenPicker,
+    sessionAgentInfo,
     pendingRestoreActiveId,
     setPendingRestoreActiveId,
     showPresetEditor,

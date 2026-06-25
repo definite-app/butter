@@ -1,5 +1,5 @@
 use crate::agent_types::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -19,6 +19,25 @@ pub struct Session {
     pub last_accessed_at: Option<i64>,
     pub is_closed: bool,
     pub closed_at: Option<i64>,
+    /// Last-known agent running in this terminal: "claude" | "codex" | null.
+    pub agent_kind: Option<String>,
+    /// Agent conversation id used to resume (claude --resume / codex resume).
+    pub agent_session_id: Option<String>,
+    /// Working directory the agent was running in (for cwd-based resume).
+    pub agent_cwd: Option<String>,
+    /// Unix seconds when the agent was last observed running.
+    pub agent_last_seen_at: Option<i64>,
+}
+
+/// Per-terminal agent snapshot, persisted so a crash/quit doesn't lose which
+/// agent (and which conversation) was running in each terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAgentUpdate {
+    pub session_id: String,
+    pub agent_kind: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub agent_cwd: Option<String>,
+    pub agent_last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,12 +62,305 @@ pub struct SessionScrollback {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamUser {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_color: Option<String>,
+    pub pwd: String,
+    pub cmd: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamUserInput {
+    pub id: Option<String>,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_color: Option<String>,
+    pub pwd: String,
+    pub cmd: String,
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamChannel {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamChannelInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamConversation {
+    pub id: String,
+    pub kind: String,
+    pub channel_id: Option<String>,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub author_kind: String,
+    pub author_user_id: Option<String>,
+    pub content: String,
+    pub created_at: i64,
+    pub edited_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub status: String,
+    pub parent_message_id: Option<String>,
+    pub thread_reply_count: i64,
+    pub last_reply_at: Option<i64>,
+    pub pty_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessageInput {
+    pub id: Option<String>,
+    pub conversation_id: String,
+    pub author_kind: String,
+    pub author_user_id: Option<String>,
+    pub content: String,
+    pub parent_message_id: Option<String>,
+    pub pty_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamInboxItem {
+    pub message: TeamMessage,
+    pub conversation: TeamConversation,
+    pub channel: Option<TeamChannel>,
+    pub author: Option<TeamUser>,
+    pub parent_message: Option<TeamMessage>,
+    pub delivered_at: Option<i64>,
+    pub read_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamPin {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub file_path: Option<String>,
+    pub url: Option<String>,
+    pub message_id: Option<String>,
+    pub message_conversation_id: Option<String>,
+    pub message_parent_message_id: Option<String>,
+    pub message_preview: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamPinInput {
+    pub id: Option<String>,
+    pub kind: String,
+    pub title: Option<String>,
+    pub file_path: Option<String>,
+    pub url: Option<String>,
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAgentRun {
+    pub id: String,
+    pub trigger_message_id: String,
+    pub reply_parent_message_id: String,
+    pub user_id: String,
+    pub pty_session_id: Option<String>,
+    pub cwd: String,
+    pub command_template: String,
+    pub rendered_command: String,
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAgentRunInput {
+    pub trigger_message_id: String,
+    pub reply_parent_message_id: String,
+    pub user_id: String,
+    pub user_msg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAgentRunUpdate {
+    pub pty_session_id: Option<String>,
+    pub status: Option<String>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+}
+
 /// Get current Unix timestamp
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// Columns selected for a full `Session`, in the order `row_to_session` expects.
+const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at";
+
+/// Build a `Session` from a row selecting `SESSION_COLUMNS`.
+fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        directory: row.get(2)?,
+        command: row.get(3)?,
+        created_at: row.get(4)?,
+        last_accessed_at: row.get(5)?,
+        is_closed: row.get::<_, i32>(6)? != 0,
+        closed_at: row.get(7)?,
+        agent_kind: row.get(8)?,
+        agent_session_id: row.get(9)?,
+        agent_cwd: row.get(10)?,
+        agent_last_seen_at: row.get(11)?,
+    })
+}
+
+fn row_to_team_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamUser> {
+    Ok(TeamUser {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        avatar_color: row.get(3)?,
+        pwd: row.get(4)?,
+        cmd: row.get(5)?,
+        description: row.get(6)?,
+        enabled: row.get::<_, i32>(7)? != 0,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn row_to_team_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamChannel> {
+    Ok(TeamChannel {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        display_name: row.get(2)?,
+        description: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        archived_at: row.get(6)?,
+    })
+}
+
+fn row_to_team_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamConversation> {
+    Ok(TeamConversation {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        channel_id: row.get(2)?,
+        title: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        archived_at: row.get(6)?,
+    })
+}
+
+fn row_to_team_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMessage> {
+    Ok(TeamMessage {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        author_kind: row.get(2)?,
+        author_user_id: row.get(3)?,
+        content: row.get(4)?,
+        created_at: row.get(5)?,
+        edited_at: row.get(6)?,
+        deleted_at: row.get(7)?,
+        status: row.get(8)?,
+        parent_message_id: row.get(9)?,
+        thread_reply_count: row.get(10)?,
+        last_reply_at: row.get(11)?,
+        pty_session_id: row.get(12)?,
+    })
+}
+
+fn row_to_team_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamAgentRun> {
+    Ok(TeamAgentRun {
+        id: row.get(0)?,
+        trigger_message_id: row.get(1)?,
+        reply_parent_message_id: row.get(2)?,
+        user_id: row.get(3)?,
+        pty_session_id: row.get(4)?,
+        cwd: row.get(5)?,
+        command_template: row.get(6)?,
+        rendered_command: row.get(7)?,
+        status: row.get(8)?,
+        started_at: row.get(9)?,
+        completed_at: row.get(10)?,
+        exit_code: row.get(11)?,
+        error: row.get(12)?,
+    })
+}
+
+fn row_to_team_pin(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamPin> {
+    Ok(TeamPin {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        file_path: row.get(3)?,
+        url: row.get(4)?,
+        message_id: row.get(5)?,
+        message_conversation_id: row.get(6)?,
+        message_parent_message_id: row.get(7)?,
+        message_preview: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn render_team_command(template: &str, user_msg: &str) -> String {
+    let quoted = shell_quote(user_msg);
+    template
+        .replace("\"{user_msg}\"", &quoted)
+        .replace("'{user_msg}'", &quoted)
+        .replace("{user_msg}", &quoted)
+}
+
+fn compact_pin_title(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut title = normalized
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    title.push_str("...");
+    title
 }
 
 /// Generate a UUID-like ID
@@ -187,7 +499,19 @@ impl AgentDatabase {
                 created_at INTEGER NOT NULL,
                 last_accessed_at INTEGER,
                 is_closed INTEGER DEFAULT 0,
-                closed_at INTEGER
+                closed_at INTEGER,
+                agent_kind TEXT,
+                agent_session_id TEXT,
+                agent_cwd TEXT,
+                agent_last_seen_at INTEGER
+            );
+
+            -- Small key/value store for app-level state we want to survive a
+            -- crash (e.g. the active session id and the ordered open set).
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS session_tags (
@@ -219,9 +543,157 @@ impl AgentDatabase {
             );
             CREATE INDEX IF NOT EXISTS idx_clipboard_created ON clipboard_history(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard_history(content_hash);
+
+            CREATE TABLE IF NOT EXISTS team_users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                avatar_color TEXT,
+                pwd TEXT NOT NULL,
+                cmd TEXT NOT NULL,
+                description TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS team_channels (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS team_conversations (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('channel', 'dm', 'group_dm')),
+                channel_id TEXT,
+                title TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived_at INTEGER,
+                FOREIGN KEY (channel_id) REFERENCES team_channels(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS team_conversation_members (
+                conversation_id TEXT NOT NULL,
+                member_kind TEXT NOT NULL CHECK (member_kind IN ('human', 'agent')),
+                user_id TEXT,
+                display_name TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (conversation_id, member_kind, user_id),
+                FOREIGN KEY (conversation_id) REFERENCES team_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES team_users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS team_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'agent', 'system')),
+                author_user_id TEXT,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                edited_at INTEGER,
+                deleted_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'sent',
+                parent_message_id TEXT,
+                thread_reply_count INTEGER NOT NULL DEFAULT 0,
+                last_reply_at INTEGER,
+                pty_session_id TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES team_conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (author_user_id) REFERENCES team_users(id) ON DELETE SET NULL,
+                FOREIGN KEY (parent_message_id) REFERENCES team_messages(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS team_message_recipients (
+                message_id TEXT NOT NULL,
+                recipient_kind TEXT NOT NULL CHECK (recipient_kind IN ('human', 'agent', 'channel')),
+                recipient_user_id TEXT,
+                channel_id TEXT,
+                delivery_status TEXT NOT NULL DEFAULT 'pending',
+                delivered_at INTEGER,
+                read_at INTEGER,
+                unread INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (message_id, recipient_kind, recipient_user_id, channel_id),
+                FOREIGN KEY (message_id) REFERENCES team_messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (recipient_user_id) REFERENCES team_users(id) ON DELETE CASCADE,
+                FOREIGN KEY (channel_id) REFERENCES team_channels(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS team_agent_runs (
+                id TEXT PRIMARY KEY,
+                trigger_message_id TEXT NOT NULL,
+                reply_parent_message_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                pty_session_id TEXT,
+                cwd TEXT NOT NULL,
+                command_template TEXT NOT NULL,
+                rendered_command TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                started_at INTEGER,
+                completed_at INTEGER,
+                exit_code INTEGER,
+                error TEXT,
+                FOREIGN KEY (trigger_message_id) REFERENCES team_messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (reply_parent_message_id) REFERENCES team_messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES team_users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS team_pins (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'message', 'link')),
+                title TEXT NOT NULL,
+                file_path TEXT,
+                url TEXT,
+                message_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES team_messages(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_team_messages_top_level
+                ON team_messages(conversation_id, created_at)
+                WHERE parent_message_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_team_messages_thread
+                ON team_messages(parent_message_id, created_at)
+                WHERE parent_message_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_team_message_recipients_inbox
+                ON team_message_recipients(recipient_kind, recipient_user_id, unread, delivered_at);
+            CREATE INDEX IF NOT EXISTS idx_team_agent_runs_trigger
+                ON team_agent_runs(trigger_message_id);
+            CREATE INDEX IF NOT EXISTS idx_team_pins_created
+                ON team_pins(created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_team_pins_file_path
+                ON team_pins(file_path)
+                WHERE kind = 'file' AND file_path IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_team_pins_url
+                ON team_pins(url)
+                WHERE kind = 'link' AND url IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_team_pins_message
+                ON team_pins(message_id)
+                WHERE kind = 'message' AND message_id IS NOT NULL;
             "#,
         )
         .map_err(|e| format!("Failed to initialize schema: {}", e))?;
+
+        let timestamp = now();
+        conn.execute(
+            "INSERT OR IGNORE INTO team_channels
+             (id, name, display_name, description, created_at, updated_at)
+             VALUES ('channel-general', 'general', 'general', 'Default team channel', ?1, ?1)",
+            params![timestamp],
+        )
+        .map_err(|e| format!("Failed to seed Team Mode general channel: {}", e))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO team_conversations
+             (id, kind, channel_id, title, created_at, updated_at)
+             VALUES ('conversation-general', 'channel', 'channel-general', 'general', ?1, ?1)",
+            params![timestamp],
+        )
+        .map_err(|e| format!("Failed to seed Team Mode general conversation: {}", e))?;
 
         // Additive migration for existing databases created before `closed_at` existed.
         if let Err(err) = conn.execute("ALTER TABLE sessions ADD COLUMN closed_at INTEGER", []) {
@@ -244,15 +716,32 @@ impl AgentDatabase {
             }
         }
 
-        if let Err(err) =
-            conn.execute("ALTER TABLE hook_events ADD COLUMN suggested_title TEXT", [])
-        {
+        if let Err(err) = conn.execute(
+            "ALTER TABLE hook_events ADD COLUMN suggested_title TEXT",
+            [],
+        ) {
             let message = err.to_string();
             if !message.contains("duplicate column name") {
                 return Err(format!(
                     "Failed to migrate hook_events.suggested_title column: {}",
                     err
                 ));
+            }
+        }
+
+        // Additive migration for the per-terminal agent snapshot columns.
+        for column in [
+            "agent_kind TEXT",
+            "agent_session_id TEXT",
+            "agent_cwd TEXT",
+            "agent_last_seen_at INTEGER",
+        ] {
+            let sql = format!("ALTER TABLE sessions ADD COLUMN {}", column);
+            if let Err(err) = conn.execute(&sql, []) {
+                let message = err.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(format!("Failed to migrate sessions.{}: {}", column, err));
+                }
             }
         }
 
@@ -1155,31 +1644,895 @@ impl AgentDatabase {
         Ok(())
     }
 
+    /// Record the agent snapshot (kind, conversation id, cwd) for a session so
+    /// it can be resumed after a quit or crash. A null `agent_kind` clears it.
+    pub fn set_session_agent(&self, req: &SessionAgentUpdate) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET agent_kind = ?2,
+                 agent_session_id = ?3,
+                 agent_cwd = ?4,
+                 agent_last_seen_at = ?5
+             WHERE id = ?1",
+            params![
+                req.session_id,
+                req.agent_kind,
+                req.agent_session_id,
+                req.agent_cwd,
+                req.agent_last_seen_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to set session agent: {}", e))?;
+        Ok(())
+    }
+
+    /// Read a value from the small app_state key/value store.
+    pub fn get_app_state(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(format!("Failed to read app_state: {}", other)),
+        })
+    }
+
+    /// Upsert a value into the small app_state key/value store.
+    pub fn set_app_state(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            params![key, value, now()],
+        )
+        .map_err(|e| format!("Failed to write app_state: {}", e))?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Team Mode Operations
+    // ========================================================================
+
+    pub fn list_team_users(&self) -> Result<Vec<TeamUser>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, username, display_name, avatar_color, pwd, cmd, description,
+                        enabled, created_at, updated_at
+                 FROM team_users
+                 ORDER BY username ASC",
+            )
+            .map_err(|e| format!("Failed to prepare team users query: {}", e))?;
+        let result = stmt
+            .query_map([], row_to_team_user)
+            .map_err(|e| format!("Failed to query team users: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team users: {}", e));
+        result
+    }
+
+    pub fn get_team_user(&self, id: &str) -> Result<Option<TeamUser>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, username, display_name, avatar_color, pwd, cmd, description,
+                    enabled, created_at, updated_at
+             FROM team_users
+             WHERE id = ?1",
+            params![id],
+            row_to_team_user,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team user: {}", e))
+    }
+
+    pub fn get_team_user_by_username(&self, username: &str) -> Result<Option<TeamUser>, String> {
+        let normalized = username.trim().trim_start_matches('@').to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, username, display_name, avatar_color, pwd, cmd, description,
+                    enabled, created_at, updated_at
+             FROM team_users
+             WHERE username = ?1",
+            params![normalized],
+            row_to_team_user,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team user by username: {}", e))
+    }
+
+    pub fn save_team_user(&self, req: &TeamUserInput) -> Result<TeamUser, String> {
+        let username = req.username.trim().trim_start_matches('@').to_lowercase();
+        if username.is_empty() {
+            return Err("username is required".to_string());
+        }
+        let display_name = req.display_name.trim();
+        if display_name.is_empty() {
+            return Err("display_name is required".to_string());
+        }
+        let pwd = req.pwd.trim();
+        if pwd.is_empty() {
+            return Err("pwd is required".to_string());
+        }
+        let cmd = req.cmd.trim();
+        if cmd.is_empty() {
+            return Err("cmd is required".to_string());
+        }
+
+        let existing_id = self
+            .get_team_user_by_username(&username)?
+            .map(|user| user.id);
+        let id = req
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .or(existing_id)
+            .unwrap_or_else(|| format!("team-user-{}", uuid::Uuid::new_v4()));
+        let timestamp = now();
+        let enabled = req.enabled.unwrap_or(true);
+
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO team_users
+                 (id, username, display_name, avatar_color, pwd, cmd, description, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    username = ?2,
+                    display_name = ?3,
+                    avatar_color = ?4,
+                    pwd = ?5,
+                    cmd = ?6,
+                    description = ?7,
+                    enabled = ?8,
+                    updated_at = ?9",
+                params![
+                    id,
+                    username,
+                    display_name,
+                    req.avatar_color,
+                    pwd,
+                    cmd,
+                    req.description,
+                    if enabled { 1 } else { 0 },
+                    timestamp,
+                ],
+            )
+            .map_err(|e| format!("Failed to save team user: {}", e))?;
+        }
+
+        self.get_team_user(&id)?
+            .ok_or_else(|| "Saved team user was not found".to_string())
+    }
+
+    pub fn list_team_channels(&self) -> Result<Vec<TeamChannel>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, display_name, description, created_at, updated_at, archived_at
+                 FROM team_channels
+                 WHERE archived_at IS NULL
+                 ORDER BY name ASC",
+            )
+            .map_err(|e| format!("Failed to prepare team channels query: {}", e))?;
+        let result = stmt
+            .query_map([], row_to_team_channel)
+            .map_err(|e| format!("Failed to query team channels: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team channels: {}", e));
+        result
+    }
+
+    pub fn get_team_channel(&self, id: &str) -> Result<Option<TeamChannel>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, display_name, description, created_at, updated_at, archived_at
+             FROM team_channels
+             WHERE id = ?1",
+            params![id],
+            row_to_team_channel,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team channel: {}", e))
+    }
+
+    pub fn get_team_channel_by_name(&self, name: &str) -> Result<Option<TeamChannel>, String> {
+        let normalized = name.trim().trim_start_matches('#').to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, display_name, description, created_at, updated_at, archived_at
+             FROM team_channels
+             WHERE name = ?1",
+            params![normalized],
+            row_to_team_channel,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team channel by name: {}", e))
+    }
+
+    pub fn save_team_channel(&self, req: &TeamChannelInput) -> Result<TeamChannel, String> {
+        let name = req.name.trim().trim_start_matches('#').to_lowercase();
+        if name.is_empty() {
+            return Err("channel name is required".to_string());
+        }
+        let display_name = req.display_name.trim();
+        if display_name.is_empty() {
+            return Err("display_name is required".to_string());
+        }
+        let existing_id = self
+            .get_team_channel_by_name(&name)?
+            .map(|channel| channel.id);
+        let id = req
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .or(existing_id)
+            .unwrap_or_else(|| format!("channel-{}", uuid::Uuid::new_v4()));
+        let conversation_id = format!("conversation-{}", id);
+        let timestamp = now();
+
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO team_channels
+                 (id, name, display_name, description, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = ?2,
+                    display_name = ?3,
+                    description = ?4,
+                    updated_at = ?5",
+                params![id, name, display_name, req.description, timestamp],
+            )
+            .map_err(|e| format!("Failed to save team channel: {}", e))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO team_conversations
+                 (id, kind, channel_id, title, created_at, updated_at)
+                 VALUES (?1, 'channel', ?2, ?3, ?4, ?4)",
+                params![conversation_id, id, display_name, timestamp],
+            )
+            .map_err(|e| format!("Failed to save team channel conversation: {}", e))?;
+            conn.execute(
+                "UPDATE team_conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
+                params![conversation_id, display_name, timestamp],
+            )
+            .map_err(|e| format!("Failed to update team channel conversation: {}", e))?;
+        }
+
+        self.get_team_channel(&id)?
+            .ok_or_else(|| "Saved team channel was not found".to_string())
+    }
+
+    pub fn list_team_conversations(&self) -> Result<Vec<TeamConversation>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, channel_id, title, created_at, updated_at, archived_at
+                 FROM team_conversations
+                 WHERE archived_at IS NULL
+                 ORDER BY kind ASC, title ASC",
+            )
+            .map_err(|e| format!("Failed to prepare team conversations query: {}", e))?;
+        let result = stmt
+            .query_map([], row_to_team_conversation)
+            .map_err(|e| format!("Failed to query team conversations: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team conversations: {}", e));
+        result
+    }
+
+    pub fn get_team_conversation(&self, id: &str) -> Result<Option<TeamConversation>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, kind, channel_id, title, created_at, updated_at, archived_at
+             FROM team_conversations
+             WHERE id = ?1",
+            params![id],
+            row_to_team_conversation,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team conversation: {}", e))
+    }
+
+    pub fn get_team_conversation_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<TeamConversation>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, kind, channel_id, title, created_at, updated_at, archived_at
+             FROM team_conversations
+             WHERE channel_id = ?1 AND kind = 'channel'",
+            params![channel_id],
+            row_to_team_conversation,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team channel conversation: {}", e))
+    }
+
+    pub fn get_or_create_team_dm(&self, user_id: &str) -> Result<TeamConversation, String> {
+        let user = self
+            .get_team_user(user_id)?
+            .ok_or_else(|| format!("Team user not found: {}", user_id))?;
+        let conversation_id = format!("dm-{}", user.id);
+        let timestamp = now();
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO team_conversations
+                 (id, kind, channel_id, title, created_at, updated_at)
+                 VALUES (?1, 'dm', NULL, ?2, ?3, ?3)",
+                params![conversation_id, user.display_name, timestamp],
+            )
+            .map_err(|e| format!("Failed to create team DM: {}", e))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO team_conversation_members
+                 (conversation_id, member_kind, user_id, display_name, created_at)
+                 VALUES (?1, 'agent', ?2, ?3, ?4)",
+                params![conversation_id, user.id, user.display_name, timestamp],
+            )
+            .map_err(|e| format!("Failed to add team DM agent member: {}", e))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO team_conversation_members
+                 (conversation_id, member_kind, user_id, display_name, created_at)
+                 VALUES (?1, 'human', NULL, 'You', ?2)",
+                params![conversation_id, timestamp],
+            )
+            .map_err(|e| format!("Failed to add team DM human member: {}", e))?;
+        }
+
+        self.get_team_conversation(&conversation_id)?
+            .ok_or_else(|| "Created team DM was not found".to_string())
+    }
+
+    pub fn get_team_message(&self, id: &str) -> Result<Option<TeamMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, conversation_id, author_kind, author_user_id, content, created_at,
+                    edited_at, deleted_at, status, parent_message_id, thread_reply_count,
+                    last_reply_at, pty_session_id
+             FROM team_messages
+             WHERE id = ?1",
+            params![id],
+            row_to_team_message,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team message: {}", e))
+    }
+
+    pub fn list_team_messages(
+        &self,
+        conversation_id: &str,
+        parent_message_id: Option<&str>,
+    ) -> Result<Vec<TeamMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(parent_id) = parent_message_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, conversation_id, author_kind, author_user_id, content, created_at,
+                            edited_at, deleted_at, status, parent_message_id, thread_reply_count,
+                            last_reply_at, pty_session_id
+                     FROM team_messages
+                     WHERE conversation_id = ?1 AND parent_message_id = ?2 AND deleted_at IS NULL
+                     ORDER BY created_at ASC",
+                )
+                .map_err(|e| format!("Failed to prepare team thread query: {}", e))?;
+            let result = stmt
+                .query_map(params![conversation_id, parent_id], row_to_team_message)
+                .map_err(|e| format!("Failed to query team thread: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect team thread: {}", e));
+            result
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, conversation_id, author_kind, author_user_id, content, created_at,
+                            edited_at, deleted_at, status, parent_message_id, thread_reply_count,
+                            last_reply_at, pty_session_id
+                     FROM team_messages
+                     WHERE conversation_id = ?1 AND parent_message_id IS NULL AND deleted_at IS NULL
+                     ORDER BY created_at ASC",
+                )
+                .map_err(|e| format!("Failed to prepare team messages query: {}", e))?;
+            let result = stmt
+                .query_map(params![conversation_id], row_to_team_message)
+                .map_err(|e| format!("Failed to query team messages: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect team messages: {}", e));
+            result
+        }
+    }
+
+    pub fn create_team_message(&self, req: &TeamMessageInput) -> Result<TeamMessage, String> {
+        if req.content.trim().is_empty() {
+            return Err("message content is required".to_string());
+        }
+        let id = req
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|| format!("team-msg-{}", uuid::Uuid::new_v4()));
+        let timestamp = now();
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO team_messages
+                 (id, conversation_id, author_kind, author_user_id, content, created_at, status,
+                  parent_message_id, pty_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sent', ?7, ?8)",
+                params![
+                    id,
+                    req.conversation_id,
+                    req.author_kind,
+                    req.author_user_id,
+                    req.content,
+                    timestamp,
+                    req.parent_message_id,
+                    req.pty_session_id,
+                ],
+            )
+            .map_err(|e| format!("Failed to create team message: {}", e))?;
+
+            if let Some(parent_id) = &req.parent_message_id {
+                conn.execute(
+                    "UPDATE team_messages
+                     SET thread_reply_count = thread_reply_count + 1,
+                         last_reply_at = ?2
+                     WHERE id = ?1",
+                    params![parent_id, timestamp],
+                )
+                .map_err(|e| format!("Failed to update team thread metadata: {}", e))?;
+            }
+
+            if req.author_kind == "agent" {
+                conn.execute(
+                    "DELETE FROM team_message_recipients
+                     WHERE message_id = ?1 AND recipient_kind = 'human' AND recipient_user_id IS NULL",
+                    params![id],
+                )
+                .map_err(|e| format!("Failed to clear team message recipient: {}", e))?;
+                conn.execute(
+                    "INSERT INTO team_message_recipients
+                     (message_id, recipient_kind, recipient_user_id, channel_id, delivery_status,
+                      delivered_at, read_at, unread)
+                     VALUES (?1, 'human', NULL, NULL, 'delivered', ?2, NULL, 1)",
+                    params![id, timestamp],
+                )
+                .map_err(|e| format!("Failed to create team message recipient: {}", e))?;
+            }
+        }
+
+        self.get_team_message(&id)?
+            .ok_or_else(|| "Created team message was not found".to_string())
+    }
+
+    pub fn mark_team_message_read(&self, message_id: &str) -> Result<(), String> {
+        let timestamp = now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE team_message_recipients
+             SET delivery_status = 'read', read_at = ?2, unread = 0
+             WHERE message_id = ?1 AND recipient_kind = 'human'",
+            params![message_id, timestamp],
+        )
+        .map_err(|e| format!("Failed to mark team message read: {}", e))?;
+        Ok(())
+    }
+
+    pub fn mark_team_message_unread(&self, message_id: &str) -> Result<(), String> {
+        let timestamp = now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM team_message_recipients
+             WHERE message_id = ?1 AND recipient_kind = 'human' AND recipient_user_id IS NULL",
+            params![message_id],
+        )
+        .map_err(|e| format!("Failed to clear team unread recipient: {}", e))?;
+        conn.execute(
+            "INSERT INTO team_message_recipients
+             (message_id, recipient_kind, recipient_user_id, channel_id, delivery_status,
+              delivered_at, read_at, unread)
+             VALUES (?1, 'human', NULL, NULL, 'delivered', ?2, NULL, 1)",
+            params![message_id, timestamp],
+        )
+        .map_err(|e| format!("Failed to mark team message unread: {}", e))?;
+        Ok(())
+    }
+
+    pub fn mark_team_conversation_read(&self, conversation_id: &str) -> Result<(), String> {
+        let timestamp = now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE team_message_recipients
+             SET delivery_status = 'read', read_at = ?2, unread = 0
+             WHERE recipient_kind = 'human'
+               AND message_id IN (SELECT id FROM team_messages WHERE conversation_id = ?1)",
+            params![conversation_id, timestamp],
+        )
+        .map_err(|e| format!("Failed to mark team conversation read: {}", e))?;
+        Ok(())
+    }
+
+    pub fn mark_team_thread_read(&self, parent_message_id: &str) -> Result<(), String> {
+        let timestamp = now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE team_message_recipients
+             SET delivery_status = 'read', read_at = ?2, unread = 0
+             WHERE recipient_kind = 'human'
+               AND message_id IN (
+                 SELECT id FROM team_messages WHERE id = ?1 OR parent_message_id = ?1
+               )",
+            params![parent_message_id, timestamp],
+        )
+        .map_err(|e| format!("Failed to mark team thread read: {}", e))?;
+        Ok(())
+    }
+
+    pub fn list_team_pins(&self) -> Result<Vec<TeamPin>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.id, p.kind, p.title, p.file_path, p.url, p.message_id,
+                        m.conversation_id, m.parent_message_id, m.content,
+                        p.created_at, p.updated_at
+                 FROM team_pins p
+                 LEFT JOIN team_messages m ON m.id = p.message_id
+                 ORDER BY p.created_at DESC",
+            )
+            .map_err(|e| format!("Failed to prepare team pins query: {}", e))?;
+        let result = stmt
+            .query_map([], row_to_team_pin)
+            .map_err(|e| format!("Failed to query team pins: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team pins: {}", e));
+        result
+    }
+
+    pub fn get_team_pin(&self, id: &str) -> Result<Option<TeamPin>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT p.id, p.kind, p.title, p.file_path, p.url, p.message_id,
+                    m.conversation_id, m.parent_message_id, m.content,
+                    p.created_at, p.updated_at
+             FROM team_pins p
+             LEFT JOIN team_messages m ON m.id = p.message_id
+             WHERE p.id = ?1",
+            params![id],
+            row_to_team_pin,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team pin: {}", e))
+    }
+
+    pub fn save_team_pin(&self, req: &TeamPinInput) -> Result<TeamPin, String> {
+        let kind = req.kind.trim().to_lowercase();
+        let file_path = req
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let url = req
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let message_id = req
+            .message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let message = if kind == "message" {
+            let id = message_id
+                .as_deref()
+                .ok_or_else(|| "message_id is required for message pins".to_string())?;
+            Some(
+                self.get_team_message(id)?
+                    .ok_or_else(|| format!("Team message not found: {}", id))?,
+            )
+        } else {
+            None
+        };
+
+        match kind.as_str() {
+            "file" if file_path.is_none() => {
+                return Err("file_path is required for file pins".to_string())
+            }
+            "link" if url.is_none() => return Err("url is required for link pins".to_string()),
+            "message" => {}
+            "file" | "link" => {}
+            _ => return Err("pin kind must be file, message, or link".to_string()),
+        }
+
+        let title = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match kind.as_str() {
+                "file" => file_path
+                    .as_deref()
+                    .and_then(|path| path.trim_end_matches('/').rsplit('/').next())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("File")
+                    .to_string(),
+                "link" => url.clone().unwrap_or_else(|| "Link".to_string()),
+                "message" => compact_pin_title(
+                    message
+                        .as_ref()
+                        .map(|entry| entry.content.as_str())
+                        .unwrap_or("Message"),
+                    80,
+                ),
+                _ => "Pin".to_string(),
+            });
+
+        let timestamp = now();
+        let id = {
+            let conn = self.conn.lock().unwrap();
+            let existing_id = match kind.as_str() {
+                "file" => conn
+                    .query_row(
+                        "SELECT id FROM team_pins WHERE kind = 'file' AND file_path = ?1",
+                        params![file_path.as_ref().unwrap()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to find existing file pin: {}", e))?,
+                "link" => conn
+                    .query_row(
+                        "SELECT id FROM team_pins WHERE kind = 'link' AND url = ?1",
+                        params![url.as_ref().unwrap()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to find existing link pin: {}", e))?,
+                "message" => conn
+                    .query_row(
+                        "SELECT id FROM team_pins WHERE kind = 'message' AND message_id = ?1",
+                        params![message_id.as_ref().unwrap()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to find existing message pin: {}", e))?,
+                _ => None,
+            };
+            let id = req
+                .id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+                .or(existing_id)
+                .unwrap_or_else(|| format!("team-pin-{}", uuid::Uuid::new_v4()));
+
+            conn.execute(
+                "INSERT INTO team_pins
+                 (id, kind, title, file_path, url, message_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind = ?2,
+                    title = ?3,
+                    file_path = ?4,
+                    url = ?5,
+                    message_id = ?6,
+                    updated_at = ?7",
+                params![id, kind, title, file_path, url, message_id, timestamp],
+            )
+            .map_err(|e| format!("Failed to save team pin: {}", e))?;
+            id
+        };
+
+        self.get_team_pin(&id)?
+            .ok_or_else(|| "Saved team pin was not found".to_string())
+    }
+
+    pub fn delete_team_pin(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM team_pins WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete team pin: {}", e))?;
+        Ok(())
+    }
+
+    pub fn create_team_agent_run(&self, req: &TeamAgentRunInput) -> Result<TeamAgentRun, String> {
+        let user = self
+            .get_team_user(&req.user_id)?
+            .ok_or_else(|| format!("Team user not found: {}", req.user_id))?;
+        if !user.enabled {
+            return Err(format!("Team user '{}' is disabled", user.username));
+        }
+        let id = format!("team-run-{}", uuid::Uuid::new_v4());
+        let rendered_command = render_team_command(&user.cmd, &req.user_msg);
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO team_agent_runs
+                 (id, trigger_message_id, reply_parent_message_id, user_id, cwd,
+                  command_template, rendered_command, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued')",
+                params![
+                    id,
+                    req.trigger_message_id,
+                    req.reply_parent_message_id,
+                    req.user_id,
+                    user.pwd,
+                    user.cmd,
+                    rendered_command,
+                ],
+            )
+            .map_err(|e| format!("Failed to create team agent run: {}", e))?;
+        }
+
+        self.get_team_agent_run(&id)?
+            .ok_or_else(|| "Created team agent run was not found".to_string())
+    }
+
+    pub fn get_team_agent_run(&self, id: &str) -> Result<Option<TeamAgentRun>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, trigger_message_id, reply_parent_message_id, user_id, pty_session_id,
+                    cwd, command_template, rendered_command, status, started_at, completed_at,
+                    exit_code, error
+             FROM team_agent_runs
+             WHERE id = ?1",
+            params![id],
+            row_to_team_agent_run,
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get team agent run: {}", e))
+    }
+
+    pub fn update_team_agent_run(
+        &self,
+        id: &str,
+        req: &TeamAgentRunUpdate,
+    ) -> Result<TeamAgentRun, String> {
+        let status = req.status.as_deref();
+        let timestamp = now();
+        {
+            let conn = self.conn.lock().unwrap();
+            if let Some(pty_session_id) = &req.pty_session_id {
+                conn.execute(
+                    "UPDATE team_agent_runs SET pty_session_id = ?2 WHERE id = ?1",
+                    params![id, pty_session_id],
+                )
+                .map_err(|e| format!("Failed to update team run pty: {}", e))?;
+            }
+            if let Some(status) = status {
+                conn.execute(
+                    "UPDATE team_agent_runs
+                     SET status = ?2,
+                         started_at = CASE
+                           WHEN ?2 = 'running' AND started_at IS NULL THEN ?3
+                           ELSE started_at
+                         END,
+                         completed_at = CASE
+                           WHEN ?2 IN ('succeeded', 'failed', 'cancelled') THEN ?3
+                           ELSE completed_at
+                         END
+                     WHERE id = ?1",
+                    params![id, status, timestamp],
+                )
+                .map_err(|e| format!("Failed to update team run status: {}", e))?;
+            }
+            if req.exit_code.is_some() || req.error.is_some() {
+                conn.execute(
+                    "UPDATE team_agent_runs SET exit_code = ?2, error = ?3 WHERE id = ?1",
+                    params![id, req.exit_code, req.error],
+                )
+                .map_err(|e| format!("Failed to update team run result: {}", e))?;
+            }
+        }
+
+        self.get_team_agent_run(id)?
+            .ok_or_else(|| "Updated team agent run was not found".to_string())
+    }
+
+    pub fn list_team_agent_runs(&self) -> Result<Vec<TeamAgentRun>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, trigger_message_id, reply_parent_message_id, user_id, pty_session_id,
+                        cwd, command_template, rendered_command, status, started_at, completed_at,
+                        exit_code, error
+                 FROM team_agent_runs
+                 ORDER BY COALESCE(started_at, completed_at, 0) DESC, id DESC
+                 LIMIT 100",
+            )
+            .map_err(|e| format!("Failed to prepare team runs query: {}", e))?;
+        let result = stmt
+            .query_map([], row_to_team_agent_run)
+            .map_err(|e| format!("Failed to query team runs: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team runs: {}", e));
+        result
+    }
+
+    pub fn get_team_inbox(&self) -> Result<Vec<TeamInboxItem>, String> {
+        let rows: Vec<(String, Option<i64>, Option<i64>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT message_id, delivered_at, read_at
+                     FROM team_message_recipients
+                     WHERE recipient_kind = 'human' AND unread = 1
+                     ORDER BY COALESCE(delivered_at, 0) DESC
+                     LIMIT 200",
+                )
+                .map_err(|e| format!("Failed to prepare team inbox query: {}", e))?;
+            let result = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(|e| format!("Failed to query team inbox: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect team inbox: {}", e))?;
+            result
+        };
+
+        let mut items = Vec::new();
+        for (message_id, delivered_at, read_at) in rows {
+            let Some(message) = self.get_team_message(&message_id)? else {
+                continue;
+            };
+            let Some(conversation) = self.get_team_conversation(&message.conversation_id)? else {
+                continue;
+            };
+            let channel = conversation
+                .channel_id
+                .as_deref()
+                .map(|id| self.get_team_channel(id))
+                .transpose()?
+                .flatten();
+            let author = message
+                .author_user_id
+                .as_deref()
+                .map(|id| self.get_team_user(id))
+                .transpose()?
+                .flatten();
+            let parent_message = message
+                .parent_message_id
+                .as_deref()
+                .map(|id| self.get_team_message(id))
+                .transpose()?
+                .flatten();
+            items.push(TeamInboxItem {
+                message,
+                conversation,
+                channel,
+                author,
+                parent_message,
+                delivered_at,
+                read_at,
+            });
+        }
+
+        Ok(items)
+    }
+
     /// List all open (non-closed) sessions
     pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at
+            .prepare(&format!(
+                "SELECT {SESSION_COLUMNS}
                  FROM sessions
                  WHERE is_closed = 0
                  ORDER BY created_at ASC"
-            )
+            ))
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let sessions = stmt
-            .query_map([], |row| {
-                Ok(Session {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    directory: row.get(2)?,
-                    command: row.get(3)?,
-                    created_at: row.get(4)?,
-                    last_accessed_at: row.get(5)?,
-                    is_closed: row.get::<_, i32>(6)? != 0,
-                    closed_at: row.get(7)?,
-                })
-            })
+            .query_map([], |row| row_to_session(row))
             .map_err(|e| format!("Failed to query sessions: {}", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect sessions: {}", e))?;
@@ -1191,10 +2544,9 @@ impl AgentDatabase {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at
-                 FROM sessions WHERE id = ?1"
-            )
+            .prepare(&format!(
+                "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"
+            ))
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let mut rows = stmt
@@ -1205,31 +2557,9 @@ impl AgentDatabase {
             .next()
             .map_err(|e| format!("Failed to get row: {}", e))?
         {
-            Ok(Some(Session {
-                id: row.get(0).map_err(|e| format!("Failed to get id: {}", e))?,
-                title: row
-                    .get(1)
-                    .map_err(|e| format!("Failed to get title: {}", e))?,
-                directory: row
-                    .get(2)
-                    .map_err(|e| format!("Failed to get directory: {}", e))?,
-                command: row
-                    .get(3)
-                    .map_err(|e| format!("Failed to get command: {}", e))?,
-                created_at: row
-                    .get(4)
-                    .map_err(|e| format!("Failed to get created_at: {}", e))?,
-                last_accessed_at: row
-                    .get(5)
-                    .map_err(|e| format!("Failed to get last_accessed_at: {}", e))?,
-                is_closed: row
-                    .get::<_, i32>(6)
-                    .map_err(|e| format!("Failed to get is_closed: {}", e))?
-                    != 0,
-                closed_at: row
-                    .get(7)
-                    .map_err(|e| format!("Failed to get closed_at: {}", e))?,
-            }))
+            Ok(Some(
+                row_to_session(row).map_err(|e| format!("Failed to read session: {}", e))?,
+            ))
         } else {
             Ok(None)
         }
@@ -1264,28 +2594,17 @@ impl AgentDatabase {
         let conn = self.conn.lock().unwrap();
         let max_items = limit.unwrap_or(20).clamp(1, 200) as i64;
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at
+            .prepare(&format!(
+                "SELECT {SESSION_COLUMNS}
                  FROM sessions
                  WHERE is_closed = 1
                  ORDER BY COALESCE(closed_at, last_accessed_at, created_at) DESC
                  LIMIT ?1"
-            )
+            ))
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let sessions = stmt
-            .query_map(params![max_items], |row| {
-                Ok(Session {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    directory: row.get(2)?,
-                    command: row.get(3)?,
-                    created_at: row.get(4)?,
-                    last_accessed_at: row.get(5)?,
-                    is_closed: row.get::<_, i32>(6)? != 0,
-                    closed_at: row.get(7)?,
-                })
-            })
+            .query_map(params![max_items], |row| row_to_session(row))
             .map_err(|e| format!("Failed to query closed sessions: {}", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect closed sessions: {}", e))?;
@@ -1486,7 +2805,9 @@ impl AgentDatabase {
     ) -> Result<Option<i64>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, content_hash FROM clipboard_history ORDER BY created_at DESC LIMIT 1")
+            .prepare(
+                "SELECT id, content_hash FROM clipboard_history ORDER BY created_at DESC LIMIT 1",
+            )
             .map_err(|e| format!("Failed to prepare dedupe query: {}", e))?;
         let head: Option<(i64, String)> = stmt
             .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1597,11 +2918,7 @@ impl AgentDatabase {
     }
 
     /// Trim history to caps. Returns image paths that should be removed from disk.
-    pub fn clipboard_evict(
-        &self,
-        max_text: i64,
-        max_image: i64,
-    ) -> Result<Vec<String>, String> {
+    pub fn clipboard_evict(&self, max_text: i64, max_image: i64) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().unwrap();
         let mut to_remove: Vec<(i64, Option<String>)> = Vec::new();
 
@@ -1687,6 +3004,155 @@ mod tests {
             .get_latest_hook_event_by_pid(1234)
             .expect("query should succeed");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_team_mode_threaded_agent_reply_and_inbox_state() {
+        let db = make_db();
+        let molly = db
+            .save_team_user(&TeamUserInput {
+                id: Some("user-molly".to_string()),
+                username: "molly".to_string(),
+                display_name: "Molly".to_string(),
+                avatar_color: None,
+                pwd: "/tmp".to_string(),
+                cmd: "claude -p \"{user_msg}\"".to_string(),
+                description: None,
+                enabled: Some(true),
+            })
+            .unwrap();
+
+        let general = db.get_team_channel_by_name("general").unwrap().unwrap();
+        let conversation = db
+            .get_team_conversation_for_channel(&general.id)
+            .unwrap()
+            .unwrap();
+        let top_level = db
+            .create_team_message(&TeamMessageInput {
+                id: Some("msg-1".to_string()),
+                conversation_id: conversation.id.clone(),
+                author_kind: "human".to_string(),
+                author_user_id: None,
+                content: "hey @molly please look at xyz".to_string(),
+                parent_message_id: None,
+                pty_session_id: None,
+            })
+            .unwrap();
+
+        let run = db
+            .create_team_agent_run(&TeamAgentRunInput {
+                trigger_message_id: top_level.id.clone(),
+                reply_parent_message_id: top_level.id.clone(),
+                user_id: molly.id.clone(),
+                user_msg: top_level.content.clone(),
+            })
+            .unwrap();
+        assert_eq!(run.cwd, "/tmp");
+        assert_eq!(
+            run.rendered_command,
+            "claude -p 'hey @molly please look at xyz'"
+        );
+
+        db.create_team_message(&TeamMessageInput {
+            id: Some("msg-2".to_string()),
+            conversation_id: conversation.id.clone(),
+            author_kind: "agent".to_string(),
+            author_user_id: Some(molly.id),
+            content: "I checked xyz.".to_string(),
+            parent_message_id: Some(top_level.id.clone()),
+            pty_session_id: Some(run.id),
+        })
+        .unwrap();
+
+        let refreshed_parent = db.get_team_message(&top_level.id).unwrap().unwrap();
+        assert_eq!(refreshed_parent.thread_reply_count, 1);
+        assert!(refreshed_parent.last_reply_at.is_some());
+
+        let inbox = db.get_team_inbox().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message.content, "I checked xyz.");
+        assert_eq!(
+            inbox[0].parent_message.as_ref().map(|msg| msg.id.as_str()),
+            Some("msg-1")
+        );
+
+        db.mark_team_message_read("msg-2").unwrap();
+        assert!(db.get_team_inbox().unwrap().is_empty());
+
+        db.mark_team_message_unread("msg-2").unwrap();
+        assert_eq!(db.get_team_inbox().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_team_pins_store_file_link_and_message_targets() {
+        let db = make_db();
+        let general = db.get_team_channel_by_name("general").unwrap().unwrap();
+        let conversation = db
+            .get_team_conversation_for_channel(&general.id)
+            .unwrap()
+            .unwrap();
+        let message = db
+            .create_team_message(&TeamMessageInput {
+                id: Some("pin-msg-1".to_string()),
+                conversation_id: conversation.id.clone(),
+                author_kind: "human".to_string(),
+                author_user_id: None,
+                content: "please keep this around".to_string(),
+                parent_message_id: None,
+                pty_session_id: None,
+            })
+            .unwrap();
+
+        let file_pin = db
+            .save_team_pin(&TeamPinInput {
+                id: None,
+                kind: "file".to_string(),
+                title: None,
+                file_path: Some("/tmp/readme.md".to_string()),
+                url: None,
+                message_id: None,
+            })
+            .unwrap();
+        assert_eq!(file_pin.title, "readme.md");
+
+        db.save_team_pin(&TeamPinInput {
+            id: None,
+            kind: "link".to_string(),
+            title: Some("Docs".to_string()),
+            file_path: None,
+            url: Some("https://example.com/docs".to_string()),
+            message_id: None,
+        })
+        .unwrap();
+
+        let message_pin = db
+            .save_team_pin(&TeamPinInput {
+                id: None,
+                kind: "message".to_string(),
+                title: None,
+                file_path: None,
+                url: None,
+                message_id: Some(message.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(message_pin.message_conversation_id, Some(conversation.id));
+        assert_eq!(message_pin.message_preview, Some(message.content));
+
+        let updated_file_pin = db
+            .save_team_pin(&TeamPinInput {
+                id: None,
+                kind: "file".to_string(),
+                title: Some("README".to_string()),
+                file_path: Some("/tmp/readme.md".to_string()),
+                url: None,
+                message_id: None,
+            })
+            .unwrap();
+        assert_eq!(updated_file_pin.id, file_pin.id);
+        assert_eq!(db.list_team_pins().unwrap().len(), 3);
+
+        db.delete_team_pin(&updated_file_pin.id).unwrap();
+        assert_eq!(db.list_team_pins().unwrap().len(), 2);
     }
 
     // ========================================================================

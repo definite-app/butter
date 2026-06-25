@@ -1,0 +1,4 @@
+interface:
+  display_name: "Butter CLI"
+  short_description: "Quick reference for Team Mode CLI"
+  default_prompt: "Use $butter-cli to send Team Mode messages or configure agents and channels."

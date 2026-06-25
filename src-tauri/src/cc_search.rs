@@ -226,7 +226,9 @@ fn extract_text(content: &serde_json::Value) -> String {
             .iter()
             .filter_map(|item| {
                 if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    item.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -239,7 +241,9 @@ fn extract_text(content: &serde_json::Value) -> String {
 }
 
 #[tauri::command]
-pub fn cc_last_assistant_turn(agent_session_id: String) -> Result<Option<LastAssistantTurn>, String> {
+pub fn cc_last_assistant_turn(
+    agent_session_id: String,
+) -> Result<Option<LastAssistantTurn>, String> {
     let Some(path) = find_session_jsonl(&agent_session_id) else {
         return Ok(None);
     };
@@ -264,17 +268,20 @@ pub fn cc_last_assistant_turn(agent_session_id: String) -> Result<Option<LastAss
             Some(m) => m,
             None => continue,
         };
-        let text = message
-            .get("content")
-            .map(extract_text)
-            .unwrap_or_default();
+        let text = message.get("content").map(extract_text).unwrap_or_default();
         if text.trim().is_empty() {
             continue;
         }
         return Ok(Some(LastAssistantTurn {
             text,
-            timestamp: v.get("timestamp").and_then(|t| t.as_str()).map(String::from),
-            model: message.get("model").and_then(|m| m.as_str()).map(String::from),
+            timestamp: v
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .map(String::from),
+            model: message
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(String::from),
         }));
     }
     Ok(None)
@@ -287,7 +294,9 @@ pub fn cc_last_assistant_turn(agent_session_id: String) -> Result<Option<LastAss
 /// newest-first by year/month/day so a cold scan is bounded.
 fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<PathBuf> {
     fn sorted_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
         let mut out: Vec<PathBuf> = entries
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -300,7 +309,9 @@ fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<Pat
     for year in sorted_subdirs(root) {
         for month in sorted_subdirs(&year) {
             for day in sorted_subdirs(&month) {
-                let Ok(files) = fs::read_dir(&day) else { continue };
+                let Ok(files) = fs::read_dir(&day) else {
+                    continue;
+                };
                 let mut day_files: Vec<(PathBuf, std::time::SystemTime)> = files
                     .flatten()
                     .filter_map(|e| {
@@ -308,10 +319,7 @@ fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<Pat
                         if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                             return None;
                         }
-                        let mtime = e
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .ok()?;
+                        let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
                         Some((p, mtime))
                     })
                     .collect();
@@ -355,7 +363,9 @@ fn codex_extract_output_text(content: &serde_json::Value) -> String {
             .iter()
             .filter_map(|item| {
                 if item.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                    item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    item.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -394,7 +404,9 @@ pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn
                     if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
                         continue;
                     }
-                    let Some(payload) = v.get("payload") else { continue };
+                    let Some(payload) = v.get("payload") else {
+                        continue;
+                    };
                     if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
                         continue;
                     }
@@ -410,7 +422,10 @@ pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn
                     }
                     return Ok(Some(LastAssistantTurn {
                         text,
-                        timestamp: v.get("timestamp").and_then(|t| t.as_str()).map(String::from),
+                        timestamp: v
+                            .get("timestamp")
+                            .and_then(|t| t.as_str())
+                            .map(String::from),
                         model: None,
                     }));
                 }
@@ -419,6 +434,44 @@ pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn
                 return Ok(None);
             }
             _ => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// Read the Codex session id (UUID) from a rollout's `session_meta` line.
+fn codex_session_id(path: &std::path::Path) -> Option<String> {
+    let f = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(f);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).ok()? == 0 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(first_line.trim()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    v.get("payload")
+        .and_then(|p| p.get("id"))
+        .and_then(|i| i.as_str())
+        .map(String::from)
+}
+
+/// Resolve the most recent Codex rollout whose `cwd` matches and return its
+/// session id (UUID) so the frontend can build `codex resume <id>`.
+#[tauri::command]
+pub fn codex_latest_session_id(cwd: String) -> Result<Option<String>, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
+    };
+    let root = home.join(".codex").join("sessions");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let candidates = list_codex_jsonls_newest_first(&root, 200);
+    for path in candidates {
+        if codex_session_cwd(&path).as_deref() == Some(cwd.as_str()) {
+            return Ok(codex_session_id(&path));
         }
     }
     Ok(None)

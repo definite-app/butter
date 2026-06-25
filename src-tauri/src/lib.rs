@@ -13,8 +13,10 @@ use browser::{
     BrowserSessionState,
 };
 use database::{
-    AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionScrollback,
-    UpdateSessionRequest,
+    AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionAgentUpdate,
+    SessionScrollback, TeamAgentRun, TeamAgentRunInput, TeamAgentRunUpdate, TeamChannel,
+    TeamChannelInput, TeamConversation, TeamInboxItem, TeamMessage, TeamMessageInput, TeamPin,
+    TeamPinInput, TeamUser, TeamUserInput, UpdateSessionRequest,
 };
 use pty::PtyManager;
 use serde::{Deserialize, Serialize};
@@ -788,6 +790,160 @@ fn db_update_session(
 }
 
 #[tauri::command]
+fn db_set_session_agent(
+    req: SessionAgentUpdate,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.set_session_agent(&req)
+}
+
+#[tauri::command]
+fn db_get_app_state(key: String, db: State<Arc<AgentDatabase>>) -> Result<Option<String>, String> {
+    db.get_app_state(&key)
+}
+
+#[tauri::command]
+fn db_set_app_state(
+    key: String,
+    value: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.set_app_state(&key, &value)
+}
+
+#[tauri::command]
+fn team_list_users(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamUser>, String> {
+    db.list_team_users()
+}
+
+#[tauri::command]
+fn team_save_user(req: TeamUserInput, db: State<Arc<AgentDatabase>>) -> Result<TeamUser, String> {
+    db.save_team_user(&req)
+}
+
+#[tauri::command]
+fn team_list_channels(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamChannel>, String> {
+    db.list_team_channels()
+}
+
+#[tauri::command]
+fn team_save_channel(
+    req: TeamChannelInput,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<TeamChannel, String> {
+    db.save_team_channel(&req)
+}
+
+#[tauri::command]
+fn team_list_conversations(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamConversation>, String> {
+    db.list_team_conversations()
+}
+
+#[tauri::command]
+fn team_get_channel_conversation(
+    channel_id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Option<TeamConversation>, String> {
+    db.get_team_conversation_for_channel(&channel_id)
+}
+
+#[tauri::command]
+fn team_get_or_create_dm(
+    user_id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<TeamConversation, String> {
+    db.get_or_create_team_dm(&user_id)
+}
+
+#[tauri::command]
+fn team_list_messages(
+    conversation_id: String,
+    parent_message_id: Option<String>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Vec<TeamMessage>, String> {
+    db.list_team_messages(&conversation_id, parent_message_id.as_deref())
+}
+
+#[tauri::command]
+fn team_send_message(
+    req: TeamMessageInput,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<TeamMessage, String> {
+    db.create_team_message(&req)
+}
+
+#[tauri::command]
+fn team_mark_message_read(message_id: String, db: State<Arc<AgentDatabase>>) -> Result<(), String> {
+    db.mark_team_message_read(&message_id)
+}
+
+#[tauri::command]
+fn team_mark_message_unread(
+    message_id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.mark_team_message_unread(&message_id)
+}
+
+#[tauri::command]
+fn team_mark_conversation_read(
+    conversation_id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.mark_team_conversation_read(&conversation_id)
+}
+
+#[tauri::command]
+fn team_mark_thread_read(
+    parent_message_id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.mark_team_thread_read(&parent_message_id)
+}
+
+#[tauri::command]
+fn team_create_agent_run(
+    req: TeamAgentRunInput,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<TeamAgentRun, String> {
+    db.create_team_agent_run(&req)
+}
+
+#[tauri::command]
+fn team_update_agent_run(
+    id: String,
+    req: TeamAgentRunUpdate,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<TeamAgentRun, String> {
+    db.update_team_agent_run(&id, &req)
+}
+
+#[tauri::command]
+fn team_list_agent_runs(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamAgentRun>, String> {
+    db.list_team_agent_runs()
+}
+
+#[tauri::command]
+fn team_get_inbox(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamInboxItem>, String> {
+    db.get_team_inbox()
+}
+
+#[tauri::command]
+fn team_list_pins(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamPin>, String> {
+    db.list_team_pins()
+}
+
+#[tauri::command]
+fn team_save_pin(req: TeamPinInput, db: State<Arc<AgentDatabase>>) -> Result<TeamPin, String> {
+    db.save_team_pin(&req)
+}
+
+#[tauri::command]
+fn team_delete_pin(id: String, db: State<Arc<AgentDatabase>>) -> Result<(), String> {
+    db.delete_team_pin(&id)
+}
+
+#[tauri::command]
 fn db_list_sessions(db: State<Arc<AgentDatabase>>) -> Result<Vec<Session>, String> {
     db.list_sessions()
 }
@@ -1499,6 +1655,7 @@ fn clipboard_history_clear(db: State<Arc<AgentDatabase>>) -> Result<(), String> 
 
 #[tauri::command]
 fn clipboard_history_compose(
+    app: tauri::AppHandle,
     ids: Vec<i64>,
     separator: Option<String>,
     include_source: Option<bool>,
@@ -1506,7 +1663,7 @@ fn clipboard_history_compose(
 ) -> Result<String, String> {
     let sep = separator.unwrap_or_else(|| "\n\n".to_string());
     let include = include_source.unwrap_or(true);
-    clipboard_history::compose(db.inner(), &ids, &sep, include)
+    clipboard_history::compose(&app, db.inner(), &ids, &sep, include)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1632,6 +1789,29 @@ pub fn run() {
             // Session persistence commands
             db_create_session,
             db_update_session,
+            db_set_session_agent,
+            db_get_app_state,
+            db_set_app_state,
+            team_list_users,
+            team_save_user,
+            team_list_channels,
+            team_save_channel,
+            team_list_conversations,
+            team_get_channel_conversation,
+            team_get_or_create_dm,
+            team_list_messages,
+            team_send_message,
+            team_mark_message_read,
+            team_mark_message_unread,
+            team_mark_conversation_read,
+            team_mark_thread_read,
+            team_create_agent_run,
+            team_update_agent_run,
+            team_list_agent_runs,
+            team_get_inbox,
+            team_list_pins,
+            team_save_pin,
+            team_delete_pin,
             db_list_sessions,
             db_get_session,
             db_close_session,
@@ -1668,6 +1848,7 @@ pub fn run() {
             cc_search::cc_export_session,
             cc_search::cc_last_assistant_turn,
             cc_search::codex_last_assistant_turn,
+            cc_search::codex_latest_session_id,
         ])
         .setup(|app| {
             // Initialize the agent database

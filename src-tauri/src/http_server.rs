@@ -3,7 +3,7 @@ use crate::browser::{
     BrowserActionCallback, BrowserConsoleEvent, BrowserConsoleFilter, BrowserImageFormat,
     BrowserManager, BrowserNetworkEvent, BrowserNetworkFilter,
 };
-use crate::database::AgentDatabase;
+use crate::database::{AgentDatabase, TeamChannelInput, TeamMessageInput, TeamUserInput};
 use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -53,6 +53,17 @@ pub async fn start_server(
         .route("/browser/callback", post(browser_callback))
         .route("/browser/console", post(browser_console))
         .route("/browser/network", post(browser_network))
+        // Team Mode CLI routes
+        .route("/team/:id/send", post(team_send))
+        .route("/team/:id/reply", post(team_reply))
+        .route("/team/:id/inbox", get(team_inbox))
+        .route("/team/:id/read", post(team_read))
+        .route("/team/:id/mark-read", post(team_mark_read))
+        .route("/team/:id/mark-unread", post(team_mark_unread))
+        .route("/team/:id/users", get(team_users))
+        .route("/team/:id/users/set", post(team_user_set))
+        .route("/team/:id/channels", get(team_channels))
+        .route("/team/:id/channels/set", post(team_channel_set))
         // Agent routes
         .route("/agents", get(list_agents))
         .route("/agents/register", post(register_agent))
@@ -539,6 +550,338 @@ async fn browser_network(State(state): State<Arc<AppState>>, body: String) -> im
             format!("Invalid browser network payload: {err}"),
         )
             .into_response(),
+    }
+}
+
+// ============================================================================
+// Team Mode CLI Handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+struct TeamSendForm {
+    token: String,
+    #[serde(default)]
+    actor_user_id: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct TeamReplyForm {
+    token: String,
+    #[serde(default)]
+    actor_user_id: Option<String>,
+    parent_message_id: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct TeamReadForm {
+    token: String,
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TeamMessageIdForm {
+    token: String,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct TeamUserSetForm {
+    token: String,
+    #[serde(default)]
+    id: Option<String>,
+    username: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    avatar_color: Option<String>,
+    pwd: String,
+    cmd: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TeamChannelSetForm {
+    token: String,
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+fn team_author(actor_user_id: Option<String>) -> (String, Option<String>) {
+    match actor_user_id.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        Some(user_id) => ("agent".to_string(), Some(user_id)),
+        None => ("human".to_string(), None),
+    }
+}
+
+async fn team_send(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamSendForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+
+    let conversation = if let Some(channel_name) = form.channel.as_deref() {
+        let channel = match state.db.get_team_channel_by_name(channel_name) {
+            Ok(Some(channel)) => channel,
+            Ok(None) => return error_json(StatusCode::NOT_FOUND, "Team channel not found"),
+            Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        };
+        match state.db.get_team_conversation_for_channel(&channel.id) {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => {
+                return error_json(StatusCode::NOT_FOUND, "Team channel conversation not found")
+            }
+            Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        }
+    } else if let Some(username) = form.to.as_deref() {
+        let user = match state.db.get_team_user_by_username(username) {
+            Ok(Some(user)) => user,
+            Ok(None) => return error_json(StatusCode::NOT_FOUND, "Team user not found"),
+            Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        };
+        match state.db.get_or_create_team_dm(&user.id) {
+            Ok(conversation) => conversation,
+            Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        }
+    } else {
+        return error_json(StatusCode::BAD_REQUEST, "Expected --channel or --to");
+    };
+
+    let (author_kind, author_user_id) = team_author(form.actor_user_id);
+    let req = TeamMessageInput {
+        id: None,
+        conversation_id: conversation.id,
+        author_kind,
+        author_user_id,
+        content: form.content,
+        parent_message_id: None,
+        pty_session_id: Some(id),
+    };
+    match state.db.create_team_message(&req) {
+        Ok(message) => ok_json(message),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_reply(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamReplyForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let parent = match state.db.get_team_message(&form.parent_message_id) {
+        Ok(Some(message)) => message,
+        Ok(None) => return error_json(StatusCode::NOT_FOUND, "Parent message not found"),
+        Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let top_level_parent = parent
+        .parent_message_id
+        .clone()
+        .unwrap_or_else(|| parent.id.clone());
+    let (author_kind, author_user_id) = team_author(form.actor_user_id);
+    let req = TeamMessageInput {
+        id: None,
+        conversation_id: parent.conversation_id,
+        author_kind,
+        author_user_id,
+        content: form.content,
+        parent_message_id: Some(top_level_parent),
+        pty_session_id: Some(id),
+    };
+    match state.db.create_team_message(&req) {
+        Ok(message) => ok_json(message),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_inbox(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<BrowserAuthQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &query.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match state.db.get_team_inbox() {
+        Ok(items) => ok_json(items),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_read(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamReadForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let Some(channel_name) = form.channel.as_deref() else {
+        return error_json(StatusCode::BAD_REQUEST, "Expected --channel");
+    };
+    let channel = match state.db.get_team_channel_by_name(channel_name) {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return error_json(StatusCode::NOT_FOUND, "Team channel not found"),
+        Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let conversation = match state.db.get_team_conversation_for_channel(&channel.id) {
+        Ok(Some(conversation)) => conversation,
+        Ok(None) => {
+            return error_json(StatusCode::NOT_FOUND, "Team channel conversation not found")
+        }
+        Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match state.db.mark_team_conversation_read(&conversation.id) {
+        Ok(()) => ok_json(serde_json::json!({ "success": true })),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_mark_read(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamMessageIdForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match state.db.mark_team_message_read(&form.message_id) {
+        Ok(()) => ok_json(serde_json::json!({ "success": true })),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_mark_unread(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamMessageIdForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match state.db.mark_team_message_unread(&form.message_id) {
+        Ok(()) => ok_json(serde_json::json!({ "success": true })),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_users(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<BrowserAuthQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &query.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match state.db.list_team_users() {
+        Ok(users) => ok_json(users),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_user_set(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamUserSetForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let username = form.username.trim().trim_start_matches('@').to_string();
+    let display_name = form
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&username)
+        .to_string();
+    let enabled = form.enabled.as_deref().map(|value| {
+        !matches!(
+            value.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "disabled"
+        )
+    });
+    let req = TeamUserInput {
+        id: form.id,
+        username,
+        display_name,
+        avatar_color: form.avatar_color,
+        pwd: form.pwd,
+        cmd: form.cmd,
+        description: form.description,
+        enabled,
+    };
+    match state.db.save_team_user(&req) {
+        Ok(user) => ok_json(user),
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn team_channels(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<BrowserAuthQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &query.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match state.db.list_team_channels() {
+        Ok(channels) => ok_json(channels),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_channel_set(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<TeamChannelSetForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let name = form.name.trim().trim_start_matches('#').to_string();
+    let display_name = form
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&name)
+        .to_string();
+    let req = TeamChannelInput {
+        id: form.id,
+        name,
+        display_name,
+        description: form.description,
+    };
+    match state.db.save_team_channel(&req) {
+        Ok(channel) => ok_json(channel),
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
     }
 }
 
