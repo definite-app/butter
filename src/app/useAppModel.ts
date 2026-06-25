@@ -4384,6 +4384,7 @@ export function useAppModel() {
       scrollback: 5000,
       scrollSensitivity: 4,
       fastScrollSensitivity: 7,
+      macOptionClickForcesSelection: true,
       allowProposedApi: true,
       linkHandler,
       theme: {

@@ -2319,10 +2319,18 @@
   width: 100%;
   box-sizing: border-box;
   background: var(--surface-terminal);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .butter-web-terminal-inner .xterm {
   height: 100%;
+}
+
+.butter-web-terminal-inner .xterm-accessibility-tree,
+.butter-web-terminal-inner .xterm-accessibility-tree * {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .butter-web-terminal-inner .xterm-viewport {
