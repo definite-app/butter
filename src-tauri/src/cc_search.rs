@@ -488,6 +488,12 @@ pub fn codex_latest_session_id(
     let Some(home) = dirs::home_dir() else {
         return Ok(None);
     };
+    // Codex builds with per-thread writer locks are resolved exactly from the
+    // lock (codex_session.rs). With no lock held (e.g. the resume picker is
+    // open) a cwd guess would just pick another terminal's conversation.
+    if home.join(".codex").join("thread-writer-locks").is_dir() {
+        return Ok(None);
+    }
     let root = home.join(".codex").join("sessions");
     if !root.exists() {
         return Ok(None);
