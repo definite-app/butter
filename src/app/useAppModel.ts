@@ -22,6 +22,7 @@ import { inferImageMimeType, extractImageFromClipboard } from "../utils/clipboar
 import { buildFooterCommand } from "../utils/shell";
 import { captureScrollback, getLastLinesFromBuffer } from "../utils/terminal";
 import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree";
+import { buildAgentResumeCommand } from "../utils/agentResume";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import type {
   AppView,
@@ -42,6 +43,7 @@ import type {
   ConfigPreset,
   DbScrollback,
   DbSession,
+  RestoreCandidate,
   FileBrowserEntry,
   PasteQueueItem,
   RecordingClipboardEvent,
@@ -548,23 +550,41 @@ export function useAppModel() {
   const codexIdCache: Record<string, string> = {};
   const isAgentLive = (state?: string) => state === "working" || state === "idle";
 
-  // Build the shell command that resumes (or relaunches) an agent. Prefers
-  // continuing the exact prior conversation by injecting a resume flag into the
-  // user's original launch command, so flags (e.g. --dangerously-skip-permissions)
-  // are preserved. Falls back to a fresh launch when no conversation id is known.
-  const buildAgentResumeCommand = (info: SessionAgentInfo): string => {
-    const original = info.command?.trim() ?? "";
-    if (info.kind === "claude") {
-      if (!info.agentSessionId) return original || "claude";
-      // Insert `--resume <id>` right after `claude`, keeping the user's flags.
-      const rest = /^claude(\s|$)/.test(original)
-        ? original.replace(/^claude\s*/, "")
-        : "";
-      return `claude --resume ${info.agentSessionId}${rest ? ` ${rest}` : ""}`;
+  // Codex conversation ids per terminal. Resolved from the running codex
+  // process's thread writer lock (exact per terminal); the cwd-based rollout
+  // scan is only a fallback for Codex builds without those locks.
+  const codexThreadCache: Record<string, { id: string; cwd: string | null; at: number }> = {};
+  const CODEX_THREAD_REFRESH_MS = 15_000;
+
+  async function resolveCodexThreads(
+    codexStates: Record<string, string>,
+    prevCodex: Record<string, string>
+  ): Promise<void> {
+    const nowMs = Date.now();
+    const ptys = ptyBySession();
+    const due = Object.keys(codexStates).filter((sid) => {
+      if (!isAgentLive(codexStates[sid]) || !ptys[sid]) return false;
+      const cached = codexThreadCache[sid];
+      const risingEdge = !isAgentLive(prevCodex[sid]);
+      return !cached || risingEdge || nowMs - cached.at > CODEX_THREAD_REFRESH_MS;
+    });
+    if (due.length === 0) return;
+    let results: { id: string; thread_id: string | null; cwd: string | null }[] = [];
+    try {
+      results = await invoke("get_codex_threads", { ids: due.map((sid) => ptys[sid]) });
+    } catch {
+      results = [];
     }
-    // codex
-    return info.agentSessionId ? `codex resume ${info.agentSessionId}` : "codex resume --last";
-  };
+    const lookup = sessionByPty();
+    for (const r of results) {
+      const sid = lookup[r.id];
+      if (!sid) continue;
+      if (r.thread_id) {
+        codexThreadCache[sid] = { id: r.thread_id, cwd: r.cwd, at: nowMs };
+        codexIdCache[sid] = r.thread_id;
+      }
+    }
+  }
 
   async function resolveCodexSessionId(
     sessionId: string,
@@ -572,13 +592,19 @@ export function useAppModel() {
     curr: string | undefined,
     prev: string | undefined
   ): Promise<string | null> {
+    const fromLock = codexThreadCache[sessionId];
+    if (fromLock) return fromLock.id;
     if (!cwd) return codexIdCache[sessionId] ?? null;
-    // Re-resolve on the rising edge (a freshly launched codex), otherwise reuse
-    // the cached id to avoid scanning the rollout logs every poll.
+    // Fallback: newest interactive rollout in this cwd that no other terminal
+    // already owns. Re-resolve on the rising edge (a freshly launched codex),
+    // otherwise reuse the cached id to avoid scanning the rollout logs.
     const risingEdge = isAgentLive(curr) && !isAgentLive(prev);
     if (codexIdCache[sessionId] && !risingEdge) return codexIdCache[sessionId];
+    const exclude = Object.entries(codexIdCache)
+      .filter(([sid]) => sid !== sessionId)
+      .map(([, id]) => id);
     try {
-      const id = await invoke<string | null>("codex_latest_session_id", { cwd });
+      const id = await invoke<string | null>("codex_latest_session_id", { cwd, exclude });
       if (id) codexIdCache[sessionId] = id;
       return id ?? codexIdCache[sessionId] ?? null;
     } catch {
@@ -593,11 +619,16 @@ export function useAppModel() {
     prevCodex: Record<string, string>
   ) {
     const nowSec = Math.floor(Date.now() / 1000);
+    await resolveCodexThreads(codexStates, prevCodex);
     for (const session of sessions) {
       const sid = session.id;
       let kind: AgentKind | null = null;
       let agentSessionId: string | null = null;
-      if (isAgentLive(claudeStates[sid]) || agentSessionIds[sid]) {
+      let cwd = session.directory ?? null;
+      // A live codex process wins over a Claude id left in the hook log by an
+      // earlier Claude run in the same shell; that stale id used to make
+      // Codex terminals restore as `claude --resume <old id>`.
+      if (isAgentLive(claudeStates[sid])) {
         kind = "claude";
         agentSessionId =
           agentSessionIds[sid] ?? persistedAgentCache[sid]?.agentSessionId ?? null;
@@ -609,9 +640,12 @@ export function useAppModel() {
           codexStates[sid],
           prevCodex[sid]
         );
+        cwd = codexThreadCache[sid]?.cwd ?? cwd;
+      } else if (agentSessionIds[sid]) {
+        kind = "claude";
+        agentSessionId = agentSessionIds[sid];
       }
       if (!kind) continue;
-      const cwd = session.directory ?? null;
       setSessionAgentInfo((prev) => ({
         ...prev,
         [sid]: { kind, agentSessionId, cwd, lastSeenAt: nowSec },
@@ -645,7 +679,7 @@ export function useAppModel() {
   const [restoreDecision, setRestoreDecision] = createSignal<"pending" | "yes" | "no">("no");
   const [pendingRestoreActiveId, setPendingRestoreActiveId] = createSignal<string | null>(null);
   // Previously-open terminals offered in the startup reopen picker.
-  const [restoreCandidates, setRestoreCandidates] = createSignal<DbSession[]>([]);
+  const [restoreCandidates, setRestoreCandidates] = createSignal<RestoreCandidate[]>([]);
   const [showPresetEditor, setShowPresetEditor] = createSignal(false);
   const [editingPreset, setEditingPreset] = createSignal<TerminalPreset | null>(null);
   const [newPresetTagName, setNewPresetTagName] = createSignal("");
@@ -4434,6 +4468,11 @@ export function useAppModel() {
         const session = mapDbSessionToWebSession(dbSession);
         setSessions(startIndex + index, session);
       });
+      // Record them as open in this run so the next launch offers them.
+      await invoke("db_resolve_restore", {
+        keep: newSessions.map((s) => s.id),
+        retire: [],
+      }).catch((err) => console.error("[restore] Failed to record restored sessions:", err));
       // Load tags for restored sessions
       const dbTags = await invoke<Record<string, string[]>>("db_get_all_session_tags");
       if (dbTags && Object.keys(dbTags).length > 0) {
@@ -4889,7 +4928,9 @@ export function useAppModel() {
         id,
         rows: term.rows,
         cols: term.cols,
-        cwd: session?.directory || null,
+        // Resuming an agent: start the shell where the agent ran, so Codex
+        // (and Claude, whose history is per project dir) sees the same cwd.
+        cwd: pendingAgentResume.get(id)?.cwd || session?.directory || null,
         command: null,
       });
       setPtyBySession((prev) => ({ ...prev, [id]: ptyId }));
@@ -5933,9 +5974,21 @@ export function useAppModel() {
     return id;
   }
 
+  // Persist the picker's answer: reopened terminals join this run; every other
+  // candidate is marked closed (still reopenable from Recently Closed). Without
+  // this, unpicked terminals stayed "open" in the DB and piled up across
+  // launches, so the picker kept offering (and pre-checking) old sessions.
+  const resolveRestoreCandidates = async (keep: string[], retire: string[]) => {
+    try {
+      await invoke("db_resolve_restore", { keep, retire });
+    } catch (err) {
+      console.error("[reopen] Failed to persist picker selection:", err);
+    }
+    await refreshRecentlyClosedSessions();
+  };
+
   // Reopen the chosen previously-open terminals from the startup picker. Each
-  // selection may opt to also restart/resume its agent. Unselected candidates
-  // are left untouched in the DB (still reopenable later).
+  // selection may opt to also restart/resume its agent.
   const reopenSessionsFromPicker = (
     selections: { id: string; restartAgent: boolean }[]
   ) => {
@@ -5943,9 +5996,11 @@ export function useAppModel() {
     const candidates = restoreCandidates();
     const existingIds = new Set(sessions.map((s) => s.id));
     let firstId: string | null = null;
+    const kept = new Set<string>();
     for (const sel of selections) {
       const dbSession = candidates.find((c) => c.id === sel.id);
       if (!dbSession) continue;
+      kept.add(dbSession.id);
       if (!existingIds.has(dbSession.id)) {
         setSessions(sessions.length, mapDbSessionToWebSession(dbSession));
         existingIds.add(dbSession.id);
@@ -5961,6 +6016,10 @@ export function useAppModel() {
         });
       }
     }
+    void resolveRestoreCandidates(
+      [...kept],
+      candidates.filter((c) => !kept.has(c.id)).map((c) => c.id)
+    );
     setRestoreCandidates([]);
     if (firstId === null) {
       // Nothing selected — start fresh.
@@ -5976,6 +6035,11 @@ export function useAppModel() {
 
   // Dismiss the picker without reopening anything; start a fresh terminal.
   const dismissReopenPicker = () => {
+    const candidates = restoreCandidates();
+    void resolveRestoreCandidates(
+      [],
+      candidates.map((c) => c.id)
+    );
     setRestorePromptOpen(false);
     setRestoreCandidates([]);
     setRestoreDecision("no");
@@ -6720,13 +6784,15 @@ export function useAppModel() {
       }
     }
 
-    // Offer to reopen the terminals that were open at last exit. The set
-    // survives both a clean quit and a crash (sessions stay is_closed=0), and
-    // each carries its last-known agent so we can restart/resume it.
+    // Offer to reopen the terminals that were open at last exit. Open/close is
+    // written to the DB as it happens (not at shutdown), so the set survives
+    // both a clean quit and a crash; the backend flags the ones from the most
+    // recent run as `preselect`, and each carries its last-known agent so we
+    // can restart/resume it.
     if (sessions.length === 0) {
-      let candidates: DbSession[] = [];
+      let candidates: RestoreCandidate[] = [];
       try {
-        candidates = await invoke<DbSession[]>("db_list_sessions");
+        candidates = await invoke<RestoreCandidate[]>("db_restore_candidates");
       } catch (err) {
         console.error("[reopen] Failed to list previous sessions:", err);
       }
@@ -6734,17 +6800,20 @@ export function useAppModel() {
         setRestoreDecision("no");
         createSession();
       } else {
-        // Order newest-active first so the picker leads with what you used last.
+        // Last run's terminals first, then newest-active first.
+        const activity = (c: RestoreCandidate) => c.last_accessed_at ?? c.created_at;
         candidates = [...candidates].sort(
           (a, b) =>
-            (b.last_accessed_at ?? b.created_at) - (a.last_accessed_at ?? a.created_at)
+            Number(b.preselect) - Number(a.preselect) || activity(b) - activity(a)
         );
         setRestoreCandidates(candidates);
         const savedActiveId = localStorage.getItem("terminal-active-session");
+        const preselected = candidates.filter((c) => c.preselect);
+        const pool = preselected.length > 0 ? preselected : candidates;
         setPendingRestoreActiveId(
-          savedActiveId && candidates.some((c) => c.id === savedActiveId)
+          savedActiveId && pool.some((c) => c.id === savedActiveId)
             ? savedActiveId
-            : candidates[0].id
+            : pool[0].id
         );
         setRestoreDecision("pending");
         setRestorePromptOpen(true);
