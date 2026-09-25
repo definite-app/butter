@@ -130,6 +130,14 @@ export interface DbSession {
   agent_session_id: string | null;
   agent_cwd: string | null;
   agent_last_seen_at: number | null;
+  /** Id of the app run that last had this terminal open. */
+  run_id: string | null;
+}
+
+/** A terminal offered by the startup reopen picker. */
+export interface RestoreCandidate extends DbSession {
+  /** Open in the most recent run, so checked by default. */
+  preselect: boolean;
 }
 
 export type AgentKind = "claude" | "codex";

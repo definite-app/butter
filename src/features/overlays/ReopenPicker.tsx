@@ -14,20 +14,31 @@ export function ReopenPicker() {
   const [rows, setRows] = createSignal<Record<string, RowState>>({});
 
   // (Re)initialize selection whenever the candidate set changes. Default: check
-  // terminals that had an agent (or were last active) and arm their restart.
+  // exactly the terminals that were open in the last run (`preselect`, decided
+  // by the backend), and arm agent resume for the ones that had an agent.
   createEffect(() => {
     const candidates = app.restoreCandidates();
     const preferred = app.pendingRestoreActiveId();
+    const anyPreselected = candidates.some((c) => c.preselect);
     const next: Record<string, RowState> = {};
     for (const c of candidates) {
       const hasAgent = Boolean(c.agent_kind);
-      next[c.id] = { selected: hasAgent || c.id === preferred, restart: hasAgent };
+      const selected = anyPreselected ? c.preselect : c.id === preferred;
+      next[c.id] = { selected, restart: hasAgent };
     }
     setRows(next);
   });
 
   const toggleSelected = (id: string) =>
     setRows((prev) => ({ ...prev, [id]: { ...prev[id], selected: !prev[id]?.selected } }));
+  const setAllSelected = (selected: boolean) =>
+    setRows((prev) => {
+      const next: Record<string, RowState> = {};
+      for (const c of app.restoreCandidates()) {
+        next[c.id] = { restart: prev[c.id]?.restart ?? Boolean(c.agent_kind), selected };
+      }
+      return next;
+    });
   const toggleRestart = (id: string) =>
     setRows((prev) => ({ ...prev, [id]: { ...prev[id], restart: !prev[id]?.restart } }));
 
@@ -75,9 +86,30 @@ export function ReopenPicker() {
         <div class="reopen-card" onClick={(e) => e.stopPropagation()}>
           <div class="reopen-header">
             <div class="reopen-title">Reopen previous terminals</div>
-            <div class="reopen-subtitle">
-              {app.restoreCandidates().length} terminal
-              {app.restoreCandidates().length === 1 ? "" : "s"} from your last session
+            <div class="reopen-subtitle-row">
+              <div class="reopen-subtitle">
+                {app.restoreCandidates().length} terminal
+                {app.restoreCandidates().length === 1 ? "" : "s"} from your last session
+              </div>
+              <div class="reopen-bulk">
+                <button
+                  type="button"
+                  class="reopen-bulk-btn"
+                  disabled={selectedCount() === app.restoreCandidates().length}
+                  onClick={() => setAllSelected(true)}
+                >
+                  Select all
+                </button>
+                <span class="reopen-dot">·</span>
+                <button
+                  type="button"
+                  class="reopen-bulk-btn"
+                  disabled={selectedCount() === 0}
+                  onClick={() => setAllSelected(false)}
+                >
+                  Select none
+                </button>
+              </div>
             </div>
           </div>
 
