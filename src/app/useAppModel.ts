@@ -664,6 +664,7 @@ export function useAppModel() {
   const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher">(
     "commands"
   );
+  const [teamSearchRequestId, setTeamSearchRequestId] = createSignal(0);
   const [switcherIndex, setSwitcherIndex] = createSignal(0);
   const [showClipboardDrawer, setShowClipboardDrawer] = createSignal(false);
   const [clipboardHistory, setClipboardHistory] = createSignal<ClipboardHistoryEntry[]>([]);
@@ -6140,6 +6141,12 @@ export function useAppModel() {
       const isFind =
         (event.key === "f" || event.key === "F") && (event.metaKey || event.ctrlKey);
       if (!isFind) return;
+      if (appView() === "team") {
+        event.preventDefault();
+        event.stopPropagation();
+        setTeamSearchRequestId((prev) => prev + 1);
+        return;
+      }
       if (activeWorkspaceTabKind() === "text_file") {
         event.preventDefault();
         event.stopPropagation();
@@ -7138,6 +7145,7 @@ export function useAppModel() {
     setShowCommandPalette,
     commandPaletteMode,
     setCommandPaletteMode,
+    teamSearchRequestId,
     switcherIndex,
     setSwitcherIndex,
     showClipboardDrawer,

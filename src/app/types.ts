@@ -263,6 +263,8 @@ export interface TeamAgentRun {
   reply_parent_message_id: string;
   user_id: string;
   pty_session_id: string | null;
+  agent_kind: "claude" | "codex" | null;
+  agent_session_id: string | null;
   cwd: string;
   command_template: string;
   rendered_command: string;
@@ -281,6 +283,14 @@ export interface TeamInboxItem {
   parent_message: TeamMessage | null;
   delivered_at: number | null;
   read_at: number | null;
+}
+
+export interface TeamSearchResult {
+  message: TeamMessage;
+  conversation: TeamConversation;
+  channel: TeamChannel | null;
+  author: TeamUser | null;
+  parent_message: TeamMessage | null;
 }
 
 export type TeamPinKind = "file" | "message" | "link";

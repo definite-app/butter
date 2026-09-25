@@ -1642,7 +1642,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1658,7 +1660,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1773,7 +1777,31 @@ case "$command" in
     post_form reply --data-urlencode "parent_message_id=$parent_id" --data-urlencode "content=$content"
     ;;
   inbox)
-    get_query inbox
+    case "${1:-}" in
+      "")
+        get_query inbox
+        ;;
+      --recent)
+        get_query inbox --data-urlencode "include_read=true"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  search)
+    advanced=""
+    if [ "${1:-}" = "--advanced" ]; then
+      advanced="true"
+      shift || true
+    fi
+    query="$(join_args "$@")"
+    [ -n "$query" ] || usage 1
+    if [ -n "$advanced" ]; then
+      get_query search --data-urlencode "q=$query" --data-urlencode "advanced=true"
+    else
+      get_query search --data-urlencode "q=$query"
+    fi
     ;;
   read)
     target_kind="${1:-}"

@@ -16,7 +16,7 @@ use database::{
     AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionAgentUpdate,
     SessionScrollback, TeamAgentRun, TeamAgentRunInput, TeamAgentRunUpdate, TeamChannel,
     TeamChannelInput, TeamConversation, TeamInboxItem, TeamMessage, TeamMessageInput, TeamPin,
-    TeamPinInput, TeamUser, TeamUserInput, UpdateSessionRequest,
+    TeamPinInput, TeamSearchResult, TeamUser, TeamUserInput, UpdateSessionRequest,
 };
 use pty::PtyManager;
 use serde::{Deserialize, Serialize};
@@ -924,8 +924,25 @@ fn team_list_agent_runs(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamAgentRu
 }
 
 #[tauri::command]
-fn team_get_inbox(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamInboxItem>, String> {
-    db.get_team_inbox()
+fn team_get_inbox(
+    include_read: Option<bool>,
+    limit: Option<usize>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Vec<TeamInboxItem>, String> {
+    db.get_team_inbox(include_read.unwrap_or(false), limit)
+}
+
+#[tauri::command]
+fn team_search_messages(
+    q: String,
+    limit: Option<usize>,
+    advanced: Option<bool>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Vec<TeamSearchResult>, String> {
+    if advanced.unwrap_or(false) {
+        return db.search_team_messages_advanced(&q, limit);
+    }
+    db.search_team_messages(&q, limit)
 }
 
 #[tauri::command]
@@ -1577,9 +1594,17 @@ fn read_clipboard_types_native() -> Result<Vec<String>, String> {
     Err("Clipboard types not supported on this platform".to_string())
 }
 
-fn paste_images_dir() -> Result<PathBuf, String> {
+fn butter_files_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home.join(".config").join("butter").join("paste-images"))
+    Ok(home.join(".config").join("butter"))
+}
+
+fn paste_images_dir() -> Result<PathBuf, String> {
+    Ok(butter_files_dir()?.join("paste-images"))
+}
+
+fn notes_dir() -> Result<PathBuf, String> {
+    Ok(butter_files_dir()?.join("notes"))
 }
 
 fn enforce_paste_image_limit(dir: &PathBuf, max_files: usize) -> Result<(), String> {
@@ -1636,6 +1661,22 @@ fn save_clipboard_image() -> Result<String, String> {
 #[tauri::command]
 fn save_clipboard_image() -> Result<String, String> {
     Err("Clipboard image not supported on this platform".to_string())
+}
+
+#[tauri::command]
+fn save_team_note_file(content: String) -> Result<String, String> {
+    if content.trim().is_empty() {
+        return Err("note content is required".to_string());
+    }
+    let dir = notes_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let filename = format!(
+        "note-{}.md",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f")
+    );
+    let path = dir.join(sanitize_filename(&filename));
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1809,6 +1850,7 @@ pub fn run() {
             team_update_agent_run,
             team_list_agent_runs,
             team_get_inbox,
+            team_search_messages,
             team_list_pins,
             team_save_pin,
             team_delete_pin,
@@ -1839,6 +1881,7 @@ pub fn run() {
             read_clipboard_image_native,
             read_clipboard_types_native,
             save_clipboard_image,
+            save_team_note_file,
             clipboard_history_list,
             clipboard_history_delete,
             clipboard_history_clear,

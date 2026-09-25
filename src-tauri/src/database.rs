@@ -1,9 +1,12 @@
 use crate::agent_types::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const TEAM_MESSAGE_MAX_CHARS: usize = 40_000;
 
 // ============================================================================
 // Session Types for Terminal Persistence
@@ -158,6 +161,15 @@ pub struct TeamInboxItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamSearchResult {
+    pub message: TeamMessage,
+    pub conversation: TeamConversation,
+    pub channel: Option<TeamChannel>,
+    pub author: Option<TeamUser>,
+    pub parent_message: Option<TeamMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamPin {
     pub id: String,
     pub kind: String,
@@ -189,6 +201,8 @@ pub struct TeamAgentRun {
     pub reply_parent_message_id: String,
     pub user_id: String,
     pub pty_session_id: Option<String>,
+    pub agent_kind: Option<String>,
+    pub agent_session_id: Option<String>,
     pub cwd: String,
     pub command_template: String,
     pub rendered_command: String,
@@ -210,6 +224,8 @@ pub struct TeamAgentRunInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamAgentRunUpdate {
     pub pty_session_id: Option<String>,
+    pub agent_kind: Option<String>,
+    pub agent_session_id: Option<String>,
     pub status: Option<String>,
     pub exit_code: Option<i64>,
     pub error: Option<String>,
@@ -308,14 +324,16 @@ fn row_to_team_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamAgentR
         reply_parent_message_id: row.get(2)?,
         user_id: row.get(3)?,
         pty_session_id: row.get(4)?,
-        cwd: row.get(5)?,
-        command_template: row.get(6)?,
-        rendered_command: row.get(7)?,
-        status: row.get(8)?,
-        started_at: row.get(9)?,
-        completed_at: row.get(10)?,
-        exit_code: row.get(11)?,
-        error: row.get(12)?,
+        agent_kind: row.get(5)?,
+        agent_session_id: row.get(6)?,
+        cwd: row.get(7)?,
+        command_template: row.get(8)?,
+        rendered_command: row.get(9)?,
+        status: row.get(10)?,
+        started_at: row.get(11)?,
+        completed_at: row.get(12)?,
+        exit_code: row.get(13)?,
+        error: row.get(14)?,
     })
 }
 
@@ -348,6 +366,36 @@ fn render_team_command(template: &str, user_msg: &str) -> String {
         .replace("\"{user_msg}\"", &quoted)
         .replace("'{user_msg}'", &quoted)
         .replace("{user_msg}", &quoted)
+}
+
+fn escape_sql_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn team_search_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn team_search_trigrams(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut trigrams = Vec::new();
+    for token in team_search_tokens(query) {
+        let chars = token.chars().collect::<Vec<_>>();
+        for window in chars.windows(3) {
+            let trigram = window.iter().collect::<String>();
+            if seen.insert(trigram.clone()) {
+                trigrams.push(trigram);
+            }
+        }
+    }
+    trigrams
 }
 
 fn compact_pin_title(value: &str, max_chars: usize) -> String {
@@ -629,6 +677,8 @@ impl AgentDatabase {
                 reply_parent_message_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 pty_session_id TEXT,
+                agent_kind TEXT,
+                agent_session_id TEXT,
                 cwd TEXT NOT NULL,
                 command_template TEXT NOT NULL,
                 rendered_command TEXT NOT NULL,
@@ -743,6 +793,105 @@ impl AgentDatabase {
                     return Err(format!("Failed to migrate sessions.{}: {}", column, err));
                 }
             }
+        }
+
+        for column in ["agent_kind TEXT", "agent_session_id TEXT"] {
+            let sql = format!("ALTER TABLE team_agent_runs ADD COLUMN {}", column);
+            if let Err(err) = conn.execute(&sql, []) {
+                let message = err.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(format!(
+                        "Failed to migrate team_agent_runs.{}: {}",
+                        column, err
+                    ));
+                }
+            }
+        }
+
+        if let Err(err) = conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS team_messages_fts
+                USING fts5(message_id UNINDEXED, content);
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_fts_ai
+            AFTER INSERT ON team_messages
+            WHEN new.deleted_at IS NULL
+            BEGIN
+                INSERT INTO team_messages_fts(rowid, message_id, content)
+                VALUES (new.rowid, new.id, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_fts_ad
+            AFTER DELETE ON team_messages
+            BEGIN
+                DELETE FROM team_messages_fts WHERE rowid = old.rowid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_fts_au
+            AFTER UPDATE OF content, deleted_at ON team_messages
+            BEGIN
+                DELETE FROM team_messages_fts WHERE rowid = old.rowid;
+                INSERT INTO team_messages_fts(rowid, message_id, content)
+                SELECT new.rowid, new.id, new.content
+                WHERE new.deleted_at IS NULL;
+            END;
+
+            DELETE FROM team_messages_fts
+            WHERE rowid NOT IN (
+                SELECT rowid FROM team_messages WHERE deleted_at IS NULL
+            );
+
+            INSERT INTO team_messages_fts(rowid, message_id, content)
+            SELECT rowid, id, content
+            FROM team_messages
+            WHERE deleted_at IS NULL
+              AND rowid NOT IN (SELECT rowid FROM team_messages_fts);
+            "#,
+        ) {
+            eprintln!("Team Mode message FTS unavailable; falling back to LIKE search: {err}");
+        }
+
+        if let Err(err) = conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS team_messages_trigram
+                USING fts5(message_id UNINDEXED, content, tokenize='trigram');
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_trigram_ai
+            AFTER INSERT ON team_messages
+            WHEN new.deleted_at IS NULL
+            BEGIN
+                INSERT INTO team_messages_trigram(rowid, message_id, content)
+                VALUES (new.rowid, new.id, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_trigram_ad
+            AFTER DELETE ON team_messages
+            BEGIN
+                DELETE FROM team_messages_trigram WHERE rowid = old.rowid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS team_messages_trigram_au
+            AFTER UPDATE OF content, deleted_at ON team_messages
+            BEGIN
+                DELETE FROM team_messages_trigram WHERE rowid = old.rowid;
+                INSERT INTO team_messages_trigram(rowid, message_id, content)
+                SELECT new.rowid, new.id, new.content
+                WHERE new.deleted_at IS NULL;
+            END;
+
+            DELETE FROM team_messages_trigram
+            WHERE rowid NOT IN (
+                SELECT rowid FROM team_messages WHERE deleted_at IS NULL
+            );
+
+            INSERT INTO team_messages_trigram(rowid, message_id, content)
+            SELECT rowid, id, content
+            FROM team_messages
+            WHERE deleted_at IS NULL
+              AND rowid NOT IN (SELECT rowid FROM team_messages_trigram);
+            "#,
+        ) {
+            eprintln!("Team Mode trigram search unavailable: {err}");
         }
 
         Ok(())
@@ -2049,9 +2198,172 @@ impl AgentDatabase {
         }
     }
 
+    fn search_team_message_ids_fts(&self, query: &str, limit: i64) -> Result<Vec<String>, String> {
+        let fts_query = team_search_tokens(query)
+            .into_iter()
+            .map(|term| format!("{term}*"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id
+                 FROM team_messages_fts
+                 JOIN team_messages m ON m.rowid = team_messages_fts.rowid
+                 WHERE team_messages_fts MATCH ?1 AND m.deleted_at IS NULL
+                 ORDER BY bm25(team_messages_fts), m.created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare team FTS search query: {}", e))?;
+        let result = stmt
+            .query_map(params![fts_query, limit], |row| row.get(0))
+            .map_err(|e| format!("Failed to search team messages with FTS: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team FTS search results: {}", e));
+        result
+    }
+
+    fn search_team_message_ids_like(&self, query: &str, limit: i64) -> Result<Vec<String>, String> {
+        let pattern = format!("%{}%", escape_sql_like(&query.to_lowercase()));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id
+                 FROM team_messages
+                 WHERE deleted_at IS NULL
+                   AND LOWER(content) LIKE ?1 ESCAPE '\\'
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare team LIKE search query: {}", e))?;
+        let result = stmt
+            .query_map(params![pattern, limit], |row| row.get(0))
+            .map_err(|e| format!("Failed to search team messages with LIKE: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team LIKE search results: {}", e));
+        result
+    }
+
+    fn search_team_message_ids_trigram(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        let trigrams = team_search_trigrams(query);
+        if trigrams.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = trigrams.join(" OR ");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id
+                 FROM team_messages_trigram
+                 JOIN team_messages m ON m.rowid = team_messages_trigram.rowid
+                 WHERE team_messages_trigram MATCH ?1 AND m.deleted_at IS NULL
+                 ORDER BY bm25(team_messages_trigram), m.created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare team trigram search query: {}", e))?;
+        let result = stmt
+            .query_map(params![fts_query, limit], |row| row.get(0))
+            .map_err(|e| format!("Failed to search team messages with trigrams: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect team trigram search results: {}", e));
+        result
+    }
+
+    fn team_search_results_for_ids(
+        &self,
+        message_ids: Vec<String>,
+    ) -> Result<Vec<TeamSearchResult>, String> {
+        let mut results = Vec::new();
+        for message_id in message_ids {
+            let Some(message) = self.get_team_message(&message_id)? else {
+                continue;
+            };
+            let Some(conversation) = self.get_team_conversation(&message.conversation_id)? else {
+                continue;
+            };
+            let channel = match conversation.channel_id.as_deref() {
+                Some(channel_id) => self.get_team_channel(channel_id)?,
+                None => None,
+            };
+            let author = match message.author_user_id.as_deref() {
+                Some(user_id) => self.get_team_user(user_id)?,
+                None => None,
+            };
+            let parent_message = match message.parent_message_id.as_deref() {
+                Some(parent_id) => self.get_team_message(parent_id)?,
+                None => None,
+            };
+            results.push(TeamSearchResult {
+                message,
+                conversation,
+                channel,
+                author,
+                parent_message,
+            });
+        }
+
+        Ok(results)
+    }
+
+    pub fn search_team_messages(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TeamSearchResult>, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.unwrap_or(50).clamp(1, 200) as i64;
+        let mut message_ids = self
+            .search_team_message_ids_fts(query, limit)
+            .unwrap_or_default();
+        if message_ids.len() < limit as usize {
+            let mut seen = message_ids.iter().cloned().collect::<HashSet<_>>();
+            for id in self.search_team_message_ids_like(query, limit)? {
+                if seen.insert(id.clone()) {
+                    message_ids.push(id);
+                    if message_ids.len() >= limit as usize {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.team_search_results_for_ids(message_ids)
+    }
+
+    pub fn search_team_messages_advanced(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TeamSearchResult>, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.unwrap_or(50).clamp(1, 200) as i64;
+        let message_ids = self.search_team_message_ids_trigram(query, limit)?;
+        self.team_search_results_for_ids(message_ids)
+    }
+
     pub fn create_team_message(&self, req: &TeamMessageInput) -> Result<TeamMessage, String> {
         if req.content.trim().is_empty() {
             return Err("message content is required".to_string());
+        }
+        let content_chars = req.content.chars().count();
+        if content_chars > TEAM_MESSAGE_MAX_CHARS {
+            return Err(format!(
+                "message content is too long: {content_chars} characters, max {TEAM_MESSAGE_MAX_CHARS}"
+            ));
         }
         let id = req
             .id
@@ -2382,8 +2694,8 @@ impl AgentDatabase {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, trigger_message_id, reply_parent_message_id, user_id, pty_session_id,
-                    cwd, command_template, rendered_command, status, started_at, completed_at,
-                    exit_code, error
+                    agent_kind, agent_session_id, cwd, command_template, rendered_command, status,
+                    started_at, completed_at, exit_code, error
              FROM team_agent_runs
              WHERE id = ?1",
             params![id],
@@ -2408,6 +2720,16 @@ impl AgentDatabase {
                     params![id, pty_session_id],
                 )
                 .map_err(|e| format!("Failed to update team run pty: {}", e))?;
+            }
+            if req.agent_kind.is_some() || req.agent_session_id.is_some() {
+                conn.execute(
+                    "UPDATE team_agent_runs
+                     SET agent_kind = COALESCE(?2, agent_kind),
+                         agent_session_id = COALESCE(?3, agent_session_id)
+                     WHERE id = ?1",
+                    params![id, req.agent_kind, req.agent_session_id],
+                )
+                .map_err(|e| format!("Failed to update team run agent session: {}", e))?;
             }
             if let Some(status) = status {
                 conn.execute(
@@ -2444,8 +2766,8 @@ impl AgentDatabase {
         let mut stmt = conn
             .prepare(
                 "SELECT id, trigger_message_id, reply_parent_message_id, user_id, pty_session_id,
-                        cwd, command_template, rendered_command, status, started_at, completed_at,
-                        exit_code, error
+                        agent_kind, agent_session_id, cwd, command_template, rendered_command,
+                        status, started_at, completed_at, exit_code, error
                  FROM team_agent_runs
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, id DESC
                  LIMIT 100",
@@ -2459,20 +2781,34 @@ impl AgentDatabase {
         result
     }
 
-    pub fn get_team_inbox(&self) -> Result<Vec<TeamInboxItem>, String> {
+    pub fn get_team_inbox(
+        &self,
+        include_read: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<TeamInboxItem>, String> {
+        let limit = limit.unwrap_or(200).clamp(1, 500) as i64;
         let rows: Vec<(String, Option<i64>, Option<i64>)> = {
             let conn = self.conn.lock().unwrap();
+            let sql = if include_read {
+                "SELECT message_id, delivered_at, read_at
+                 FROM team_message_recipients
+                 WHERE recipient_kind = 'human'
+                 ORDER BY COALESCE(delivered_at, read_at, 0) DESC
+                 LIMIT ?1"
+            } else {
+                "SELECT message_id, delivered_at, read_at
+                 FROM team_message_recipients
+                 WHERE recipient_kind = 'human' AND unread = 1
+                 ORDER BY COALESCE(delivered_at, 0) DESC
+                 LIMIT ?1"
+            };
             let mut stmt = conn
-                .prepare(
-                    "SELECT message_id, delivered_at, read_at
-                     FROM team_message_recipients
-                     WHERE recipient_kind = 'human' AND unread = 1
-                     ORDER BY COALESCE(delivered_at, 0) DESC
-                     LIMIT 200",
-                )
+                .prepare(sql)
                 .map_err(|e| format!("Failed to prepare team inbox query: {}", e))?;
             let result = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .query_map(params![limit], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .map_err(|e| format!("Failed to query team inbox: {}", e))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to collect team inbox: {}", e))?;
@@ -3052,6 +3388,24 @@ mod tests {
             run.rendered_command,
             "claude -p 'hey @molly please look at xyz'"
         );
+        assert!(run.agent_kind.is_none());
+        assert!(run.agent_session_id.is_none());
+
+        let run = db
+            .update_team_agent_run(
+                &run.id,
+                &TeamAgentRunUpdate {
+                    pty_session_id: Some(run.id.clone()),
+                    agent_kind: Some("claude".to_string()),
+                    agent_session_id: Some("claude-session-1".to_string()),
+                    status: Some("running".to_string()),
+                    exit_code: None,
+                    error: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(run.agent_kind.as_deref(), Some("claude"));
+        assert_eq!(run.agent_session_id.as_deref(), Some("claude-session-1"));
 
         db.create_team_message(&TeamMessageInput {
             id: Some("msg-2".to_string()),
@@ -3064,11 +3418,22 @@ mod tests {
         })
         .unwrap();
 
+        db.create_team_message(&TeamMessageInput {
+            id: Some("msg-3".to_string()),
+            conversation_id: conversation.id.clone(),
+            author_kind: "human".to_string(),
+            author_user_id: None,
+            content: "QuickBooks OAuth callback failed.".to_string(),
+            parent_message_id: None,
+            pty_session_id: None,
+        })
+        .unwrap();
+
         let refreshed_parent = db.get_team_message(&top_level.id).unwrap().unwrap();
         assert_eq!(refreshed_parent.thread_reply_count, 1);
         assert!(refreshed_parent.last_reply_at.is_some());
 
-        let inbox = db.get_team_inbox().unwrap();
+        let inbox = db.get_team_inbox(false, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].message.content, "I checked xyz.");
         assert_eq!(
@@ -3077,10 +3442,65 @@ mod tests {
         );
 
         db.mark_team_message_read("msg-2").unwrap();
-        assert!(db.get_team_inbox().unwrap().is_empty());
+        assert!(db.get_team_inbox(false, None).unwrap().is_empty());
+        let recent_inbox = db.get_team_inbox(true, None).unwrap();
+        assert_eq!(recent_inbox.len(), 1);
+        assert!(recent_inbox[0].read_at.is_some());
 
         db.mark_team_message_unread("msg-2").unwrap();
-        assert_eq!(db.get_team_inbox().unwrap().len(), 1);
+        assert_eq!(db.get_team_inbox(false, None).unwrap().len(), 1);
+
+        let search_results = db.search_team_messages("checked xyz", Some(10)).unwrap();
+        assert_eq!(search_results.len(), 1);
+        assert_eq!(search_results[0].message.id, "msg-2");
+        assert_eq!(
+            search_results[0]
+                .parent_message
+                .as_ref()
+                .map(|message| message.id.as_str()),
+            Some("msg-1")
+        );
+        assert_eq!(
+            search_results[0]
+                .author
+                .as_ref()
+                .map(|user| user.username.as_str()),
+            Some("molly")
+        );
+        assert_eq!(
+            search_results[0]
+                .channel
+                .as_ref()
+                .map(|channel| channel.name.as_str()),
+            Some("general")
+        );
+        assert_eq!(
+            db.search_team_messages("check", Some(10)).unwrap()[0]
+                .message
+                .id,
+            "msg-2"
+        );
+        assert_eq!(
+            db.search_team_messages("quickbook", Some(10)).unwrap()[0]
+                .message
+                .id,
+            "msg-3"
+        );
+        assert!(db
+            .search_team_messages("quickboks", Some(10))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_team_messages_advanced("quickboks", Some(10))
+                .unwrap()[0]
+                .message
+                .id,
+            "msg-3"
+        );
+        assert!(db
+            .search_team_messages("definitely-not-present", Some(10))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
