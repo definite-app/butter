@@ -56,15 +56,6 @@ export function ReopenPicker() {
     app.reopenSessionsFromPicker(selections);
   };
 
-  const reopenAll = () => {
-    const r = rows();
-    const selections = app.restoreCandidates().map((c) => ({
-      id: c.id,
-      restartAgent: r[c.id]?.restart ?? Boolean(c.agent_kind),
-    }));
-    app.reopenSessionsFromPicker(selections);
-  };
-
   const fmtDir = (dir?: string | null) =>
     dir ? dir.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~") : "";
 
@@ -184,9 +175,6 @@ export function ReopenPicker() {
               New terminal
             </button>
             <div class="reopen-actions-right">
-              <button class="reopen-btn" onClick={reopenAll}>
-                Reopen all
-              </button>
               <button
                 class="reopen-btn primary"
                 disabled={selectedCount() === 0}
