@@ -3010,13 +3010,46 @@ impl AgentDatabase {
             let newest = sessions.iter().map(activity).max().unwrap_or(0);
             Box::new(move |s: &Session| activity(s) >= newest - LEGACY_LAST_RUN_WINDOW_SECS)
         };
+        let shared_codex_ids = self.shared_codex_session_ids()?;
         Ok(sessions
             .into_iter()
-            .map(|session| {
+            .map(|mut session| {
                 let preselect = preselect(&session);
+                // Older builds guessed Codex ids from the newest rollout in the
+                // cwd, so several terminals got the same (mostly wrong) id. An
+                // id shared by more than one terminal can't be trusted; drop it
+                // so resume opens Codex's picker in the agent cwd instead.
+                if session.agent_kind.as_deref() == Some("codex")
+                    && session
+                        .agent_session_id
+                        .as_ref()
+                        .is_some_and(|id| shared_codex_ids.contains(id))
+                {
+                    session.agent_session_id = None;
+                }
                 RestoreCandidate { session, preselect }
             })
             .collect())
+    }
+
+    /// Codex conversation ids recorded on more than one session row (open or
+    /// closed).
+    fn shared_codex_session_ids(&self) -> Result<HashSet<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_session_id FROM sessions
+                 WHERE agent_kind = 'codex' AND agent_session_id IS NOT NULL
+                 GROUP BY agent_session_id
+                 HAVING COUNT(*) > 1",
+            )
+            .map_err(|e| format!("Failed to prepare shared codex id query: {}", e))?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query shared codex ids: {}", e))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| format!("Failed to collect shared codex ids: {}", e))?;
+        Ok(ids)
     }
 
     /// Resolve the startup reopen picker: `keep` terminals are reopened in this
@@ -3612,6 +3645,60 @@ mod tests {
         let (all, pre) = picker(&run3);
         assert_eq!(all, ids(&["new", "old"]));
         assert_eq!(pre, ids(&["new"]));
+    }
+
+    #[test]
+    fn shared_codex_ids_are_dropped_unique_ones_kept() {
+        let db = make_db();
+        for id in ["aws-billing", "fi-show-blocker", "unique", "closed-dup", "claude-tab"] {
+            open_terminal(&db, id);
+        }
+        db.close_session("closed-dup").unwrap();
+        let set = |sid: &str, kind: &str, agent_id: &str| {
+            db.set_session_agent(&SessionAgentUpdate {
+                session_id: sid.to_string(),
+                agent_kind: Some(kind.to_string()),
+                agent_session_id: Some(agent_id.to_string()),
+                agent_cwd: Some("/Users/me/mike3".to_string()),
+                agent_last_seen_at: Some(1),
+            })
+            .unwrap();
+        };
+        // Two open rows share an id (old folder-scan guess).
+        set("aws-billing", "codex", "01a0d39a-shared");
+        set("fi-show-blocker", "codex", "01a0d39a-shared");
+        // Unique open id, but a closed row carries it too.
+        set("unique", "codex", "01a0-unique");
+        set("closed-dup", "codex", "01a0-unique");
+        // Claude ids are unaffected by the rule.
+        set("claude-tab", "claude", "01a0d39a-shared");
+        let by_id: std::collections::HashMap<String, RestoreCandidate> = db
+            .restore_candidates()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.session.id.clone(), c))
+            .collect();
+        assert_eq!(by_id["aws-billing"].session.agent_session_id, None);
+        assert_eq!(by_id["fi-show-blocker"].session.agent_session_id, None);
+        assert_eq!(by_id["unique"].session.agent_session_id, None);
+        assert_eq!(
+            by_id["aws-billing"].session.agent_cwd.as_deref(),
+            Some("/Users/me/mike3")
+        );
+        assert_eq!(
+            by_id["claude-tab"].session.agent_session_id.as_deref(),
+            Some("01a0d39a-shared")
+        );
+
+        // A codex id held by one row only is trusted.
+        set("closed-dup", "codex", "01a0-other");
+        let unique = db
+            .restore_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.session.id == "unique")
+            .unwrap();
+        assert_eq!(unique.session.agent_session_id.as_deref(), Some("01a0-unique"));
     }
 
     #[test]
