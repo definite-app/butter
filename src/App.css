@@ -3771,6 +3771,41 @@ body.butter-printing-markdown .butter-print-content hr {
   color: var(--text-muted);
 }
 
+.reopen-subtitle-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.reopen-bulk {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.reopen-bulk-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+.reopen-bulk-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.reopen-bulk-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .reopen-list {
   display: flex;
   flex-direction: column;

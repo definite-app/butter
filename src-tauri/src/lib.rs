@@ -2,6 +2,7 @@ mod agent_types;
 mod browser;
 mod cc_search;
 mod clipboard_history;
+mod codex_session;
 mod config;
 mod database;
 mod http_server;
@@ -13,7 +14,8 @@ use browser::{
     BrowserSessionState,
 };
 use database::{
-    AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionAgentUpdate,
+    AgentDatabase, ClipboardEntry, CreateSessionRequest, RestoreCandidate, Session,
+    SessionAgentUpdate,
     SessionScrollback, TeamAgentRun, TeamAgentRunInput, TeamAgentRunUpdate, TeamChannel,
     TeamChannelInput, TeamConversation, TeamInboxItem, TeamMessage, TeamMessageInput, TeamPin,
     TeamPinInput, TeamSearchResult, TeamUser, TeamUserInput, UpdateSessionRequest,
@@ -414,6 +416,18 @@ fn get_codex_activity(
                     let codex_alive = is_codex_running(pid);
                     activity_log(&format!("    codex pid={} alive={}", pid, codex_alive));
 
+                    // Hook events for this shell may come from an earlier
+                    // Claude run; without a live codex process they must not
+                    // mark the terminal as running Codex.
+                    if !codex_alive {
+                        activity_log(&format!("  codex pty={} => state=unknown", id));
+                        return ClaudeActivity {
+                            id,
+                            state: "unknown".to_string(),
+                            since: None,
+                        };
+                    }
+
                     match db.get_latest_hook_event_by_pid(pid) {
                         Ok(Some((event, ts))) => {
                             activity_log(&format!(
@@ -454,6 +468,41 @@ fn get_codex_activity(
 
             activity_log(&format!("  codex pty={} => state={}", id, state));
             ClaudeActivity { id, state, since }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct CodexThreadActivity {
+    /// PTY id.
+    id: String,
+    /// Codex conversation (thread) id the terminal's codex is writing.
+    thread_id: Option<String>,
+    /// Working directory of that codex process.
+    cwd: Option<String>,
+}
+
+/// For each PTY, the Codex conversation its running `codex` holds open (via
+/// Codex's per-thread writer lock). Exact per terminal, unlike cwd matching.
+#[tauri::command(async)]
+fn get_codex_threads(ids: Vec<String>, manager: State<'_, PtyManager>) -> Vec<CodexThreadActivity> {
+    let pids: Vec<(String, Option<u32>)> = ids
+        .into_iter()
+        .map(|id| {
+            let pid = manager.get_pid(&id).ok().flatten();
+            (id, pid)
+        })
+        .collect();
+    let shell_pids: Vec<u32> = pids.iter().filter_map(|(_, p)| *p).collect();
+    let threads = codex_session::resolve_codex_threads(&shell_pids);
+    pids.into_iter()
+        .map(|(id, pid)| {
+            let thread = pid.and_then(|p| threads.get(&p));
+            CodexThreadActivity {
+                id,
+                thread_id: thread.map(|t| t.thread_id.clone()),
+                cwd: thread.and_then(|t| t.cwd.clone()),
+            }
         })
         .collect()
 }
@@ -963,6 +1012,20 @@ fn team_delete_pin(id: String, db: State<Arc<AgentDatabase>>) -> Result<(), Stri
 #[tauri::command]
 fn db_list_sessions(db: State<Arc<AgentDatabase>>) -> Result<Vec<Session>, String> {
     db.list_sessions()
+}
+
+#[tauri::command]
+fn db_restore_candidates(db: State<Arc<AgentDatabase>>) -> Result<Vec<RestoreCandidate>, String> {
+    db.restore_candidates()
+}
+
+#[tauri::command]
+fn db_resolve_restore(
+    keep: Vec<String>,
+    retire: Vec<String>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.resolve_restore(&keep, &retire)
 }
 
 #[tauri::command]
@@ -1815,6 +1878,7 @@ pub fn run() {
             browser_network_event,
             get_claude_activity,
             get_codex_activity,
+            get_codex_threads,
             get_agent_session_ids,
             get_agent_first_prompt_title,
             get_pty_cwd,
@@ -1855,6 +1919,8 @@ pub fn run() {
             team_save_pin,
             team_delete_pin,
             db_list_sessions,
+            db_restore_candidates,
+            db_resolve_restore,
             db_get_session,
             db_close_session,
             db_reopen_session,

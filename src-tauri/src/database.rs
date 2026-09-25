@@ -30,7 +30,28 @@ pub struct Session {
     pub agent_cwd: Option<String>,
     /// Unix seconds when the agent was last observed running.
     pub agent_last_seen_at: Option<i64>,
+    /// Id of the app run (launch) that last had this terminal open. Used to
+    /// pre-select only the terminals that were open in the most recent run.
+    pub run_id: Option<String>,
 }
+
+/// A previously-open terminal offered by the startup reopen picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreCandidate {
+    #[serde(flatten)]
+    pub session: Session,
+    /// True when the terminal was open in the most recent run, so the picker
+    /// checks it by default.
+    pub preselect: bool,
+}
+
+/// app_state key: id of the most recent run that had at least one terminal open.
+const LAST_ACTIVE_RUN_KEY: &str = "last_active_run_id";
+
+/// Legacy fallback (rows written before run ids existed): a terminal counts as
+/// open in the last run if it was active within this many seconds of the most
+/// recently active candidate. The agent snapshot refreshes every ~30s.
+const LEGACY_LAST_RUN_WINDOW_SECS: i64 = 5 * 60;
 
 /// Per-terminal agent snapshot, persisted so a crash/quit doesn't lose which
 /// agent (and which conversation) was running in each terminal.
@@ -240,7 +261,7 @@ fn now() -> i64 {
 }
 
 /// Columns selected for a full `Session`, in the order `row_to_session` expects.
-const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at";
+const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at, run_id";
 
 /// Build a `Session` from a row selecting `SESSION_COLUMNS`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -257,6 +278,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         agent_session_id: row.get(9)?,
         agent_cwd: row.get(10)?,
         agent_last_seen_at: row.get(11)?,
+        run_id: row.get(12)?,
     })
 }
 
@@ -423,6 +445,14 @@ fn generate_id(prefix: &str) -> String {
 /// Database manager for agent communication
 pub struct AgentDatabase {
     conn: Mutex<Connection>,
+    /// Unique id for this app launch. Every terminal opened during this run is
+    /// stamped with it, so the next launch knows which terminals were open.
+    run_id: String,
+    /// The most recent earlier run that had terminals open (read at startup,
+    /// before this run stamps anything).
+    previous_run_id: Option<String>,
+    /// Set once this run has recorded itself as the last active run.
+    run_marked_active: std::sync::atomic::AtomicBool,
 }
 
 impl AgentDatabase {
@@ -431,11 +461,15 @@ impl AgentDatabase {
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory()
             .map_err(|e| format!("Failed to open in-memory database: {}", e))?;
-        let db = Self {
-            conn: Mutex::new(conn),
-        };
-        db.initialize_schema()?;
-        Ok(db)
+        Self::from_connection(conn)
+    }
+
+    /// Open a database at an explicit path (tests simulate app relaunches).
+    #[cfg(test)]
+    pub fn open_at(path: &std::path::Path) -> Result<Self, String> {
+        let conn =
+            Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+        Self::from_connection(conn)
     }
 
     /// Open or create the database
@@ -451,11 +485,18 @@ impl AgentDatabase {
         let conn =
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
-        let db = Self {
+        Self::from_connection(conn)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self, String> {
+        let mut db = Self {
             conn: Mutex::new(conn),
+            run_id: format!("run-{}", uuid::Uuid::new_v4()),
+            previous_run_id: None,
+            run_marked_active: std::sync::atomic::AtomicBool::new(false),
         };
         db.initialize_schema()?;
-
+        db.previous_run_id = db.get_app_state(LAST_ACTIVE_RUN_KEY)?;
         Ok(db)
     }
 
@@ -551,7 +592,8 @@ impl AgentDatabase {
                 agent_kind TEXT,
                 agent_session_id TEXT,
                 agent_cwd TEXT,
-                agent_last_seen_at INTEGER
+                agent_last_seen_at INTEGER,
+                run_id TEXT
             );
 
             -- Small key/value store for app-level state we want to survive a
@@ -785,6 +827,7 @@ impl AgentDatabase {
             "agent_session_id TEXT",
             "agent_cwd TEXT",
             "agent_last_seen_at INTEGER",
+            "run_id TEXT",
         ] {
             let sql = format!("ALTER TABLE sessions ADD COLUMN {}", column);
             if let Err(err) = conn.execute(&sql, []) {
@@ -1746,8 +1789,8 @@ impl AgentDatabase {
 
         conn.execute(
             r#"
-            INSERT INTO sessions (id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, NULL)
+            INSERT INTO sessions (id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, run_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, NULL, ?6)
             "#,
             params![
                 req.id,
@@ -1755,9 +1798,12 @@ impl AgentDatabase {
                 req.directory,
                 req.command,
                 timestamp,
+                self.run_id,
             ],
         )
         .map_err(|e| format!("Failed to create session: {}", e))?;
+        drop(conn);
+        self.mark_run_active()?;
 
         Ok(())
     }
@@ -2918,10 +2964,96 @@ impl AgentDatabase {
         let conn = self.conn.lock().unwrap();
         let timestamp = now();
         conn.execute(
-            "UPDATE sessions SET is_closed = 0, closed_at = NULL, last_accessed_at = ?2 WHERE id = ?1",
-            params![id, timestamp],
+            "UPDATE sessions SET is_closed = 0, closed_at = NULL, last_accessed_at = ?2, run_id = ?3 WHERE id = ?1",
+            params![id, timestamp, self.run_id],
         )
         .map_err(|e| format!("Failed to reopen session: {}", e))?;
+        drop(conn);
+        self.mark_run_active()?;
+        Ok(())
+    }
+
+    /// Record this run as the most recent run with open terminals. Written
+    /// lazily (on the first terminal opened) so a launch that crashes before
+    /// opening anything doesn't hide the previous run's terminals.
+    fn mark_run_active(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.run_marked_active.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.set_app_state(LAST_ACTIVE_RUN_KEY, &self.run_id)?;
+        self.run_marked_active.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Terminals offered by the startup reopen picker: every session still
+    /// marked open, flagged `preselect` when it was open in the most recent run.
+    ///
+    /// Closing a tab marks it closed immediately and the picker retires what the
+    /// user doesn't reopen, so the open set normally equals the last run's
+    /// terminals after both a clean quit and a crash. The run id check is the
+    /// safety net for rows left behind by older builds.
+    pub fn restore_candidates(&self) -> Result<Vec<RestoreCandidate>, String> {
+        let sessions = self.list_sessions()?;
+        let any_run_ids = sessions.iter().any(|s| s.run_id.is_some());
+        let preselect: Box<dyn Fn(&Session) -> bool> = if any_run_ids {
+            let previous = self.previous_run_id.clone();
+            Box::new(move |s: &Session| {
+                previous.is_some() && s.run_id.as_deref() == previous.as_deref()
+            })
+        } else {
+            // Legacy rows only (written before run ids existed): treat the
+            // terminals active close to the most recent activity as the last run.
+            let activity = |s: &Session| {
+                s.created_at
+                    .max(s.last_accessed_at.unwrap_or(0))
+                    .max(s.agent_last_seen_at.unwrap_or(0))
+            };
+            let newest = sessions.iter().map(activity).max().unwrap_or(0);
+            Box::new(move |s: &Session| activity(s) >= newest - LEGACY_LAST_RUN_WINDOW_SECS)
+        };
+        Ok(sessions
+            .into_iter()
+            .map(|session| {
+                let preselect = preselect(&session);
+                RestoreCandidate { session, preselect }
+            })
+            .collect())
+    }
+
+    /// Resolve the startup reopen picker: `keep` terminals are reopened in this
+    /// run; `retire` terminals are marked closed so they stop coming back on
+    /// every launch (they stay available under Recently Closed). A retired
+    /// terminal's `closed_at` is its last activity, not "now", so a large
+    /// backlog doesn't push genuinely recent closes out of that list.
+    pub fn resolve_restore(&self, keep: &[String], retire: &[String]) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin restore transaction: {}", e))?;
+        for id in keep {
+            tx.execute(
+                "UPDATE sessions SET is_closed = 0, closed_at = NULL, run_id = ?2 WHERE id = ?1",
+                params![id, self.run_id],
+            )
+            .map_err(|e| format!("Failed to keep session {}: {}", id, e))?;
+        }
+        for id in retire {
+            tx.execute(
+                "UPDATE sessions
+                 SET is_closed = 1,
+                     closed_at = MAX(created_at, COALESCE(last_accessed_at, 0), COALESCE(agent_last_seen_at, 0))
+                 WHERE id = ?1 AND is_closed = 0",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to retire session {}: {}", id, e))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit restore: {}", e))?;
+        drop(conn);
+        if !keep.is_empty() {
+            self.mark_run_active()?;
+        }
         Ok(())
     }
 
@@ -3325,6 +3457,189 @@ mod tests {
 
     fn make_db() -> AgentDatabase {
         AgentDatabase::open_in_memory().expect("Failed to open in-memory database")
+    }
+
+    // ========================================================================
+    // Session restore (reopen picker) Tests
+    // ========================================================================
+
+    /// A DB file that survives "relaunches" (re-opening = a new app run).
+    struct TempDbPath(PathBuf);
+    impl TempDbPath {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "butter-restore-{}-{}.db",
+                name,
+                uuid::Uuid::new_v4()
+            ));
+            Self(path)
+        }
+        fn launch(&self) -> AgentDatabase {
+            AgentDatabase::open_at(&self.0).expect("open db")
+        }
+    }
+    impl Drop for TempDbPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_terminal(db: &AgentDatabase, id: &str) {
+        db.create_session(&CreateSessionRequest {
+            id: id.to_string(),
+            title: id.to_string(),
+            directory: None,
+            command: None,
+        })
+        .expect("create session");
+    }
+
+    fn picker(db: &AgentDatabase) -> (Vec<String>, Vec<String>) {
+        let mut all: Vec<String> = Vec::new();
+        let mut pre: Vec<String> = Vec::new();
+        for c in db.restore_candidates().expect("candidates") {
+            if c.preselect {
+                pre.push(c.session.id.clone());
+            }
+            all.push(c.session.id);
+        }
+        all.sort();
+        pre.sort();
+        (all, pre)
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn restore_offers_exactly_the_terminals_open_at_quit_or_crash() {
+        let path = TempDbPath::new("quit");
+        {
+            // Run 1: open three terminals, close one, then quit or crash (the
+            // DB sees no shutdown hook either way).
+            let run1 = path.launch();
+            open_terminal(&run1, "a");
+            open_terminal(&run1, "b");
+            open_terminal(&run1, "c");
+            run1.close_session("b").unwrap();
+        }
+        let run2 = path.launch();
+        let (all, pre) = picker(&run2);
+        assert_eq!(all, ids(&["a", "c"]));
+        assert_eq!(pre, ids(&["a", "c"]));
+    }
+
+    #[test]
+    fn unselected_picker_rows_do_not_come_back_next_launch() {
+        let path = TempDbPath::new("retire");
+        {
+            let run1 = path.launch();
+            for id in ["a", "b", "c"] {
+                open_terminal(&run1, id);
+            }
+        }
+        {
+            // Run 2: reopen only "a", then crash after opening "d".
+            let run2 = path.launch();
+            run2.resolve_restore(&ids(&["a"]), &ids(&["b", "c"])).unwrap();
+            open_terminal(&run2, "d");
+        }
+        let run3 = path.launch();
+        let (all, pre) = picker(&run3);
+        assert_eq!(all, ids(&["a", "d"]));
+        assert_eq!(pre, ids(&["a", "d"]));
+        // Retired terminals stay reopenable from Recently Closed.
+        let closed: Vec<String> = run3
+            .list_closed_sessions(None)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(closed.contains(&"b".to_string()) && closed.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn new_terminal_from_picker_retires_all_candidates() {
+        let path = TempDbPath::new("dismiss");
+        {
+            let run1 = path.launch();
+            open_terminal(&run1, "a");
+            open_terminal(&run1, "b");
+        }
+        {
+            let run2 = path.launch();
+            run2.resolve_restore(&[], &ids(&["a", "b"])).unwrap();
+            open_terminal(&run2, "fresh");
+        }
+        let run3 = path.launch();
+        let (all, pre) = picker(&run3);
+        assert_eq!(all, ids(&["fresh"]));
+        assert_eq!(pre, ids(&["fresh"]));
+    }
+
+    #[test]
+    fn crash_while_picker_is_open_keeps_last_run_selection() {
+        let path = TempDbPath::new("pickercrash");
+        {
+            let run1 = path.launch();
+            open_terminal(&run1, "a");
+            open_terminal(&run1, "b");
+        }
+        {
+            // Run 2 shows the picker and crashes before the user answers.
+            let run2 = path.launch();
+            let _ = picker(&run2);
+        }
+        let run3 = path.launch();
+        let (all, pre) = picker(&run3);
+        assert_eq!(all, ids(&["a", "b"]));
+        assert_eq!(pre, ids(&["a", "b"]));
+    }
+
+    #[test]
+    fn rows_from_older_runs_are_offered_but_not_preselected() {
+        let path = TempDbPath::new("older");
+        {
+            let run1 = path.launch();
+            open_terminal(&run1, "old");
+        }
+        {
+            // Run 2 opens its own terminal without resolving "old" (e.g. an
+            // older build that never retired picker leftovers).
+            let run2 = path.launch();
+            open_terminal(&run2, "new");
+        }
+        let run3 = path.launch();
+        let (all, pre) = picker(&run3);
+        assert_eq!(all, ids(&["new", "old"]));
+        assert_eq!(pre, ids(&["new"]));
+    }
+
+    #[test]
+    fn legacy_rows_preselect_only_the_most_recent_activity_window() {
+        let db = make_db();
+        let conn = db.conn.lock().unwrap();
+        let t = 1_800_000_000_i64;
+        // (id, created_at, last_accessed_at, agent_last_seen_at)
+        let rows: [(&str, i64, Option<i64>, Option<i64>); 4] = [
+            ("stale-agent", t - 86_400 * 30, Some(t - 86_400 * 20), Some(t - 86_400 * 20)),
+            ("stale-plain", t - 86_400 * 3, None, None),
+            ("live-agent", t - 86_400, Some(t - 3_600), Some(t - 20)),
+            ("live-focused", t - 600, Some(t), None),
+        ];
+        for (id, created, accessed, agent_seen) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, title, created_at, last_accessed_at, is_closed, agent_last_seen_at)
+                 VALUES (?1, ?1, ?2, ?3, 0, ?4)",
+                params![id, created, accessed, agent_seen],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let (all, pre) = picker(&db);
+        assert_eq!(all.len(), 4);
+        assert_eq!(pre, ids(&["live-agent", "live-focused"]));
     }
 
     // ========================================================================
