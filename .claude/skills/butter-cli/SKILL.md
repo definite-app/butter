@@ -39,12 +39,32 @@ butter-cli team reply <message-id> "I checked this and here is the result."
 
 Prefer `reply` when responding to a request. Team Mode uses Slack-style one-level threads, so agent replies to mentions should stay under the original message.
 
+## Search
+
+Search Team Mode messages:
+
+```bash
+butter-cli team search <query>
+```
+
+Use advanced trigram search for typo-tolerant nearest matches:
+
+```bash
+butter-cli team search --advanced <query>
+```
+
 ## Inbox
 
 List unread DMs, mentions, and thread replies:
 
 ```bash
 butter-cli team inbox
+```
+
+Review recent inbox items, including messages already marked read:
+
+```bash
+butter-cli team inbox --recent
 ```
 
 Mark a message read or unread:

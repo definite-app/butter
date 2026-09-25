@@ -2,9 +2,11 @@ mod agent_types;
 mod browser;
 mod cc_search;
 mod clipboard_history;
+mod codex_session;
 mod config;
 mod database;
 mod http_server;
+mod paths;
 mod pty;
 
 use agent_types::*;
@@ -13,10 +15,11 @@ use browser::{
     BrowserSessionState,
 };
 use database::{
-    AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionAgentUpdate,
+    AgentDatabase, ClipboardEntry, CreateSessionRequest, RestoreCandidate, Session,
+    SessionAgentUpdate,
     SessionScrollback, TeamAgentRun, TeamAgentRunInput, TeamAgentRunUpdate, TeamChannel,
     TeamChannelInput, TeamConversation, TeamInboxItem, TeamMessage, TeamMessageInput, TeamPin,
-    TeamPinInput, TeamUser, TeamUserInput, UpdateSessionRequest,
+    TeamPinInput, TeamSearchResult, TeamUser, TeamUserInput, UpdateSessionRequest,
 };
 use pty::PtyManager;
 use serde::{Deserialize, Serialize};
@@ -29,10 +32,11 @@ use std::sync::Arc;
 use tauri::{Manager, State, WebviewWindow};
 
 fn activity_log(msg: &str) {
+    let log_path = Path::new("/tmp").join(paths::flavored_name("butter-activity.log"));
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/butter-activity.log")
+        .open(log_path)
     {
         let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
     }
@@ -60,8 +64,18 @@ fn pty_cwd_by_id(manager: &PtyManager, id: &str) -> Result<String, String> {
     Err("Could not determine current working directory".to_string())
 }
 
+/// Agent API port range. The dev flavor uses its own range so it never takes
+/// 9876 (which docs and tools assume is the release app).
+fn agent_api_port_range() -> std::ops::RangeInclusive<u16> {
+    if paths::IS_DEV_FLAVOR {
+        19876..=19976
+    } else {
+        9876..=9976
+    }
+}
+
 fn bind_agent_api_listener() -> Result<TcpListener, String> {
-    for port in 9876..=9976 {
+    for port in agent_api_port_range() {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
@@ -414,6 +428,18 @@ fn get_codex_activity(
                     let codex_alive = is_codex_running(pid);
                     activity_log(&format!("    codex pid={} alive={}", pid, codex_alive));
 
+                    // Hook events for this shell may come from an earlier
+                    // Claude run; without a live codex process they must not
+                    // mark the terminal as running Codex.
+                    if !codex_alive {
+                        activity_log(&format!("  codex pty={} => state=unknown", id));
+                        return ClaudeActivity {
+                            id,
+                            state: "unknown".to_string(),
+                            since: None,
+                        };
+                    }
+
                     match db.get_latest_hook_event_by_pid(pid) {
                         Ok(Some((event, ts))) => {
                             activity_log(&format!(
@@ -454,6 +480,41 @@ fn get_codex_activity(
 
             activity_log(&format!("  codex pty={} => state={}", id, state));
             ClaudeActivity { id, state, since }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct CodexThreadActivity {
+    /// PTY id.
+    id: String,
+    /// Codex conversation (thread) id the terminal's codex is writing.
+    thread_id: Option<String>,
+    /// Working directory of that codex process.
+    cwd: Option<String>,
+}
+
+/// For each PTY, the Codex conversation its running `codex` holds open (via
+/// Codex's per-thread writer lock). Exact per terminal, unlike cwd matching.
+#[tauri::command(async)]
+fn get_codex_threads(ids: Vec<String>, manager: State<'_, PtyManager>) -> Vec<CodexThreadActivity> {
+    let pids: Vec<(String, Option<u32>)> = ids
+        .into_iter()
+        .map(|id| {
+            let pid = manager.get_pid(&id).ok().flatten();
+            (id, pid)
+        })
+        .collect();
+    let shell_pids: Vec<u32> = pids.iter().filter_map(|(_, p)| *p).collect();
+    let threads = codex_session::resolve_codex_threads(&shell_pids);
+    pids.into_iter()
+        .map(|(id, pid)| {
+            let thread = pid.and_then(|p| threads.get(&p));
+            CodexThreadActivity {
+                id,
+                thread_id: thread.map(|t| t.thread_id.clone()),
+                cwd: thread.and_then(|t| t.cwd.clone()),
+            }
         })
         .collect()
 }
@@ -924,8 +985,25 @@ fn team_list_agent_runs(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamAgentRu
 }
 
 #[tauri::command]
-fn team_get_inbox(db: State<Arc<AgentDatabase>>) -> Result<Vec<TeamInboxItem>, String> {
-    db.get_team_inbox()
+fn team_get_inbox(
+    include_read: Option<bool>,
+    limit: Option<usize>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Vec<TeamInboxItem>, String> {
+    db.get_team_inbox(include_read.unwrap_or(false), limit)
+}
+
+#[tauri::command]
+fn team_search_messages(
+    q: String,
+    limit: Option<usize>,
+    advanced: Option<bool>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Vec<TeamSearchResult>, String> {
+    if advanced.unwrap_or(false) {
+        return db.search_team_messages_advanced(&q, limit);
+    }
+    db.search_team_messages(&q, limit)
 }
 
 #[tauri::command]
@@ -946,6 +1024,20 @@ fn team_delete_pin(id: String, db: State<Arc<AgentDatabase>>) -> Result<(), Stri
 #[tauri::command]
 fn db_list_sessions(db: State<Arc<AgentDatabase>>) -> Result<Vec<Session>, String> {
     db.list_sessions()
+}
+
+#[tauri::command]
+fn db_restore_candidates(db: State<Arc<AgentDatabase>>) -> Result<Vec<RestoreCandidate>, String> {
+    db.restore_candidates()
+}
+
+#[tauri::command]
+fn db_resolve_restore(
+    keep: Vec<String>,
+    retire: Vec<String>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.resolve_restore(&keep, &retire)
 }
 
 #[tauri::command]
@@ -1577,9 +1669,16 @@ fn read_clipboard_types_native() -> Result<Vec<String>, String> {
     Err("Clipboard types not supported on this platform".to_string())
 }
 
+fn butter_files_dir() -> Result<PathBuf, String> {
+    paths::butter_config_dir()
+}
+
 fn paste_images_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home.join(".config").join("butter").join("paste-images"))
+    Ok(butter_files_dir()?.join("paste-images"))
+}
+
+fn notes_dir() -> Result<PathBuf, String> {
+    Ok(butter_files_dir()?.join("notes"))
 }
 
 fn enforce_paste_image_limit(dir: &PathBuf, max_files: usize) -> Result<(), String> {
@@ -1639,6 +1738,22 @@ fn save_clipboard_image() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn save_team_note_file(content: String) -> Result<String, String> {
+    if content.trim().is_empty() {
+        return Err("note content is required".to_string());
+    }
+    let dir = notes_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let filename = format!(
+        "note-{}.md",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f")
+    );
+    let path = dir.join(sanitize_filename(&filename));
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn clipboard_history_list(db: State<Arc<AgentDatabase>>) -> Result<Vec<ClipboardEntry>, String> {
     clipboard_history::list(db.inner())
 }
@@ -1664,6 +1779,12 @@ fn clipboard_history_compose(
     let sep = separator.unwrap_or_else(|| "\n\n".to_string());
     let include = include_source.unwrap_or(true);
     clipboard_history::compose(&app, db.inner(), &ids, &sep, include)
+}
+
+/// Build flavor ("release" or "dev") so the UI can show a DEV badge.
+#[tauri::command]
+fn app_flavor() -> &'static str {
+    paths::flavor()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1774,6 +1895,7 @@ pub fn run() {
             browser_network_event,
             get_claude_activity,
             get_codex_activity,
+            get_codex_threads,
             get_agent_session_ids,
             get_agent_first_prompt_title,
             get_pty_cwd,
@@ -1809,10 +1931,13 @@ pub fn run() {
             team_update_agent_run,
             team_list_agent_runs,
             team_get_inbox,
+            team_search_messages,
             team_list_pins,
             team_save_pin,
             team_delete_pin,
             db_list_sessions,
+            db_restore_candidates,
+            db_resolve_restore,
             db_get_session,
             db_close_session,
             db_reopen_session,
@@ -1839,6 +1964,7 @@ pub fn run() {
             read_clipboard_image_native,
             read_clipboard_types_native,
             save_clipboard_image,
+            save_team_note_file,
             clipboard_history_list,
             clipboard_history_delete,
             clipboard_history_clear,
@@ -1849,8 +1975,13 @@ pub fn run() {
             cc_search::cc_last_assistant_turn,
             cc_search::codex_last_assistant_turn,
             cc_search::codex_latest_session_id,
+            app_flavor,
         ])
         .setup(|app| {
+            // Dev flavor: seed ~/.butter-dev from the release data on first
+            // launch (read-only on the release files). No-op in release.
+            paths::seed_dev_flavor_data();
+
             // Initialize the agent database
             let db = Arc::new(AgentDatabase::open().expect("Failed to initialize agent database"));
             app.manage(db.clone());
@@ -1894,20 +2025,30 @@ pub fn run() {
             {
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
-                let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
-                let app_handle = app.handle().clone();
+                // The dev flavor never registers Cmd+E so it cannot steal it
+                // from the release app running side by side.
+                if !paths::IS_DEV_FLAVOR {
+                    let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
+                    let app_handle = app.handle().clone();
 
-                app.global_shortcut()
-                    .on_shortcut(shortcut, move |_app, _shortcut, _event| {
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                    // Non-fatal: if another app already holds Cmd+E, log and
+                    // keep starting instead of aborting setup.
+                    if let Err(err) = app.global_shortcut().on_shortcut(
+                        shortcut,
+                        move |_app, _shortcut, _event| {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                if window.is_visible().unwrap_or(false) {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
                             }
-                        }
-                    })?;
+                        },
+                    ) {
+                        eprintln!("Failed to register Cmd+E global shortcut: {}", err);
+                    }
+                }
             }
 
             Ok(())

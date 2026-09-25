@@ -2,6 +2,7 @@ import { For, Show, Suspense, createMemo, createSignal, lazy, onCleanup, onMount
 import type { JSX } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
 import { BrowserPane } from "../browser/BrowserPane";
+import { MarkdownViewToggle } from "../files/MarkdownViewToggle";
 import { HeaderActionMenu } from "./HeaderActionMenu";
 import { TerminalStack } from "./TerminalStack";
 
@@ -346,6 +347,7 @@ export function TerminalArea() {
               </Show>
             </div>
           </Show>
+          <MarkdownViewToggle />
           <HeaderActionMenu />
         </div>
       </div>

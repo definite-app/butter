@@ -19,11 +19,15 @@ fn now_secs() -> i64 {
 }
 
 pub fn images_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home
-        .join(".config")
-        .join("butter")
-        .join("clipboard-history"))
+    Ok(crate::paths::butter_config_dir()?.join("clipboard-history"))
+}
+
+/// Delete an image file referenced by a clipboard row. In the dev flavor the
+/// rows may come from the seeded release DB, so never delete outside dev dirs.
+fn remove_image_file(path: &str) {
+    if crate::paths::may_delete(std::path::Path::new(path)) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -315,7 +319,7 @@ fn capture_snapshot(
 
     let evicted = db.clipboard_evict(MAX_TEXT_ENTRIES, MAX_IMAGE_ENTRIES)?;
     for path in evicted {
-        let _ = std::fs::remove_file(path);
+        remove_image_file(&path);
     }
     emit_changed(app, db);
     Ok(true)
@@ -353,7 +357,7 @@ pub fn list(db: &AgentDatabase) -> Result<Vec<ClipboardEntry>, String> {
 
 pub fn delete(db: &AgentDatabase, id: i64) -> Result<(), String> {
     if let Some(path) = db.clipboard_delete(id)? {
-        let _ = std::fs::remove_file(path);
+        remove_image_file(&path);
     }
     Ok(())
 }
@@ -361,7 +365,7 @@ pub fn delete(db: &AgentDatabase, id: i64) -> Result<(), String> {
 pub fn clear(db: &AgentDatabase) -> Result<(), String> {
     let paths = db.clipboard_clear()?;
     for p in paths {
-        let _ = std::fs::remove_file(p);
+        remove_image_file(&p);
     }
     Ok(())
 }

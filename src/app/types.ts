@@ -130,6 +130,14 @@ export interface DbSession {
   agent_session_id: string | null;
   agent_cwd: string | null;
   agent_last_seen_at: number | null;
+  /** Id of the app run that last had this terminal open. */
+  run_id: string | null;
+}
+
+/** A terminal offered by the startup reopen picker. */
+export interface RestoreCandidate extends DbSession {
+  /** Open in the most recent run, so checked by default. */
+  preselect: boolean;
 }
 
 export type AgentKind = "claude" | "codex";
@@ -263,6 +271,8 @@ export interface TeamAgentRun {
   reply_parent_message_id: string;
   user_id: string;
   pty_session_id: string | null;
+  agent_kind: "claude" | "codex" | null;
+  agent_session_id: string | null;
   cwd: string;
   command_template: string;
   rendered_command: string;
@@ -281,6 +291,14 @@ export interface TeamInboxItem {
   parent_message: TeamMessage | null;
   delivered_at: number | null;
   read_at: number | null;
+}
+
+export interface TeamSearchResult {
+  message: TeamMessage;
+  conversation: TeamConversation;
+  channel: TeamChannel | null;
+  author: TeamUser | null;
+  parent_message: TeamMessage | null;
 }
 
 export type TeamPinKind = "file" | "message" | "link";

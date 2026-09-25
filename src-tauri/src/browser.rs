@@ -407,7 +407,27 @@ impl<R: Runtime> BrowserManager<R> {
         let token = self.ensure_token(session_id)?;
         let bin_dir = cli_bin_dir()?;
         let path_prefix = bin_dir.to_string_lossy().to_string();
-        Ok(vec![
+        let mut env = self.base_shell_env(session_id, token, path_prefix);
+        if crate::paths::IS_DEV_FLAVOR {
+            // Lets hook scripts that honor BUTTER_DB_PATH write activity
+            // events to the dev DB instead of the release one.
+            if let Ok(db_path) = crate::database::AgentDatabase::get_db_path() {
+                env.push((
+                    "BUTTER_DB_PATH".to_string(),
+                    db_path.to_string_lossy().to_string(),
+                ));
+            }
+        }
+        Ok(env)
+    }
+
+    fn base_shell_env(
+        &self,
+        session_id: &str,
+        token: String,
+        path_prefix: String,
+    ) -> Vec<(String, String)> {
+        vec![
             ("BUTTER_SESSION_ID".to_string(), session_id.to_string()),
             ("BUTTER_BROWSER_ENDPOINT".to_string(), self.endpoint_url()),
             ("BUTTER_BROWSER_TOKEN".to_string(), token.clone()),
@@ -422,7 +442,7 @@ impl<R: Runtime> BrowserManager<R> {
                     Err(_) => path_prefix,
                 },
             ),
-        ])
+        ]
     }
 
     pub fn ensure_token(&self, session_id: &str) -> Result<String, String> {
@@ -1403,9 +1423,11 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
+/// `~/.butter/bin` (`~/.butter-dev/bin` in the dev flavor). Only put on PATH
+/// for shells that Butter itself spawns, so the dev shims never shadow the
+/// release ones.
 fn cli_bin_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-    Ok(home.join(".butter").join("bin"))
+    Ok(crate::paths::butter_home()?.join("bin"))
 }
 
 fn cli_script() -> &'static str {
@@ -1642,7 +1664,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1658,7 +1682,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1773,7 +1799,31 @@ case "$command" in
     post_form reply --data-urlencode "parent_message_id=$parent_id" --data-urlencode "content=$content"
     ;;
   inbox)
-    get_query inbox
+    case "${1:-}" in
+      "")
+        get_query inbox
+        ;;
+      --recent)
+        get_query inbox --data-urlencode "include_read=true"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  search)
+    advanced=""
+    if [ "${1:-}" = "--advanced" ]; then
+      advanced="true"
+      shift || true
+    fi
+    query="$(join_args "$@")"
+    [ -n "$query" ] || usage 1
+    if [ -n "$advanced" ]; then
+      get_query search --data-urlencode "q=$query" --data-urlencode "advanced=true"
+    else
+      get_query search --data-urlencode "q=$query"
+    fi
     ;;
   read)
     target_kind="${1:-}"

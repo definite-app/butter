@@ -14,7 +14,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const SCRIPT_SRC: &str = include_str!("../scripts/cc_search.py");
-const STDERR_LOG: &str = "/tmp/butter-cc-search.log";
+fn stderr_log() -> PathBuf {
+    PathBuf::from("/tmp").join(crate::paths::flavored_name("butter-cc-search.log"))
+}
 
 struct Proc {
     child: Child,
@@ -59,7 +61,7 @@ fn find_uv() -> PathBuf {
 /// Write the bundled Python helper to a temp file so `uv run --script` can
 /// pick up its inline dependency metadata, regardless of how the app is run.
 fn ensure_script() -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join("butter_cc_search.py");
+    let path = std::env::temp_dir().join(crate::paths::flavored_name("butter_cc_search.py"));
     fs::write(&path, SCRIPT_SRC).map_err(|e| format!("write helper script: {e}"))?;
     Ok(path)
 }
@@ -69,7 +71,7 @@ fn spawn_proc() -> Result<Proc, String> {
     let stderr = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(STDERR_LOG)
+        .open(stderr_log())
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
 
@@ -440,6 +442,8 @@ pub fn codex_last_assistant_turn(cwd: String) -> Result<Option<LastAssistantTurn
 }
 
 /// Read the Codex session id (UUID) from a rollout's `session_meta` line.
+/// Returns None for rollouts that can't be resumed as a top-level interactive
+/// conversation: multi-agent sub-agent threads and `codex exec` runs.
 fn codex_session_id(path: &std::path::Path) -> Option<String> {
     let f = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(f);
@@ -451,16 +455,36 @@ fn codex_session_id(path: &std::path::Path) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    v.get("payload")
-        .and_then(|p| p.get("id"))
+    let payload = v.get("payload")?;
+    if !codex_meta_is_interactive_root(payload) {
+        return None;
+    }
+    payload
+        .get("id")
         .and_then(|i| i.as_str())
         .map(String::from)
 }
 
-/// Resolve the most recent Codex rollout whose `cwd` matches and return its
-/// session id (UUID) so the frontend can build `codex resume <id>`.
+fn codex_meta_is_interactive_root(payload: &serde_json::Value) -> bool {
+    if payload.get("thread_source").and_then(|t| t.as_str()) == Some("subagent") {
+        return false;
+    }
+    match payload.get("source") {
+        // Sub-agent rollouts carry an object source ({"subagent": ...}).
+        Some(serde_json::Value::Object(_)) => false,
+        Some(serde_json::Value::String(src)) => src != "exec",
+        _ => true,
+    }
+}
+
+/// Fallback when the running codex process can't be mapped to its thread lock:
+/// the most recent interactive Codex rollout whose `cwd` matches, skipping ids
+/// in `exclude` (conversations other terminals already own).
 #[tauri::command]
-pub fn codex_latest_session_id(cwd: String) -> Result<Option<String>, String> {
+pub fn codex_latest_session_id(
+    cwd: String,
+    exclude: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
     let Some(home) = dirs::home_dir() else {
         return Ok(None);
     };
@@ -468,13 +492,39 @@ pub fn codex_latest_session_id(cwd: String) -> Result<Option<String>, String> {
     if !root.exists() {
         return Ok(None);
     }
+    let exclude = exclude.unwrap_or_default();
     let candidates = list_codex_jsonls_newest_first(&root, 200);
     for path in candidates {
-        if codex_session_cwd(&path).as_deref() == Some(cwd.as_str()) {
-            return Ok(codex_session_id(&path));
+        if codex_session_cwd(&path).as_deref() != Some(cwd.as_str()) {
+            continue;
+        }
+        if let Some(id) = codex_session_id(&path) {
+            if !exclude.iter().any(|e| e == &id) {
+                return Ok(Some(id));
+            }
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod codex_meta_tests {
+    use super::codex_meta_is_interactive_root;
+    use serde_json::json;
+
+    #[test]
+    fn skips_subagent_and_exec_rollouts() {
+        assert!(codex_meta_is_interactive_root(
+            &json!({"id": "a", "source": "cli", "thread_source": "user"})
+        ));
+        assert!(codex_meta_is_interactive_root(&json!({"id": "a"})));
+        assert!(!codex_meta_is_interactive_root(&json!({
+            "id": "a",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}},
+            "thread_source": "subagent"
+        })));
+        assert!(!codex_meta_is_interactive_root(&json!({"id": "a", "source": "exec"})));
+    }
 }
 
 /// Copy a session's raw `.jsonl` into a temp file and return that path, so it
@@ -483,7 +533,7 @@ pub fn codex_latest_session_id(cwd: String) -> Result<Option<String>, String> {
 pub fn cc_export_session(file_path: String) -> Result<String, String> {
     let src = PathBuf::from(&file_path);
     let data = fs::read(&src).map_err(|e| format!("read session file: {e}"))?;
-    let dir = std::env::temp_dir().join("butter-cc-sessions");
+    let dir = std::env::temp_dir().join(crate::paths::flavored_name("butter-cc-sessions"));
     fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
     let name = src
         .file_name()
