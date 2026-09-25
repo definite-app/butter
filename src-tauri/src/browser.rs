@@ -407,7 +407,27 @@ impl<R: Runtime> BrowserManager<R> {
         let token = self.ensure_token(session_id)?;
         let bin_dir = cli_bin_dir()?;
         let path_prefix = bin_dir.to_string_lossy().to_string();
-        Ok(vec![
+        let mut env = self.base_shell_env(session_id, token, path_prefix);
+        if crate::paths::IS_DEV_FLAVOR {
+            // Lets hook scripts that honor BUTTER_DB_PATH write activity
+            // events to the dev DB instead of the release one.
+            if let Ok(db_path) = crate::database::AgentDatabase::get_db_path() {
+                env.push((
+                    "BUTTER_DB_PATH".to_string(),
+                    db_path.to_string_lossy().to_string(),
+                ));
+            }
+        }
+        Ok(env)
+    }
+
+    fn base_shell_env(
+        &self,
+        session_id: &str,
+        token: String,
+        path_prefix: String,
+    ) -> Vec<(String, String)> {
+        vec![
             ("BUTTER_SESSION_ID".to_string(), session_id.to_string()),
             ("BUTTER_BROWSER_ENDPOINT".to_string(), self.endpoint_url()),
             ("BUTTER_BROWSER_TOKEN".to_string(), token.clone()),
@@ -422,7 +442,7 @@ impl<R: Runtime> BrowserManager<R> {
                     Err(_) => path_prefix,
                 },
             ),
-        ])
+        ]
     }
 
     pub fn ensure_token(&self, session_id: &str) -> Result<String, String> {
@@ -1403,9 +1423,11 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
     hash
 }
 
+/// `~/.butter/bin` (`~/.butter-dev/bin` in the dev flavor). Only put on PATH
+/// for shells that Butter itself spawns, so the dev shims never shadow the
+/// release ones.
 fn cli_bin_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-    Ok(home.join(".butter").join("bin"))
+    Ok(crate::paths::butter_home()?.join("bin"))
 }
 
 fn cli_script() -> &'static str {

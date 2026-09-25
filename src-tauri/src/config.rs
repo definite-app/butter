@@ -3,9 +3,11 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Get the config file path: ~/.config/butter/config.toml
+/// (~/.config/butter-dev/config.toml in the dev flavor).
 pub fn config_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".config").join("butter").join("config.toml")
+    crate::paths::butter_config_dir()
+        .expect("Could not find home directory")
+        .join("config.toml")
 }
 
 /// Main configuration structure

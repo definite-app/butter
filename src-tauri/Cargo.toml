@@ -9,6 +9,12 @@ edition = "2021"
 name = "butter_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+# "Butter Dev" build flavor: isolated data dirs (~/.butter-dev,
+# ~/.config/butter-dev), no Cmd+E global shortcut, separate agent API ports.
+# Enabled by tauri.dev.conf.json (build.features); see `npm run build:dev-app`.
+dev-flavor = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

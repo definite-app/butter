@@ -9080,3 +9080,23 @@ body.butter-printing-markdown .butter-print-content hr {
 .switcher-footer-attention {
   color: var(--accent-warning);
 }
+
+/* --- Butter Dev build flavor badge --- */
+.butter-dev-badge {
+  position: fixed;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 16px;
+  pointer-events: none;
+  user-select: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}

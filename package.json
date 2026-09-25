@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "tauri:smoke": "node scripts/tauri-smoke.cjs"
+    "tauri:smoke": "node scripts/tauri-smoke.cjs",
+    "build:dev-app": "cd src-tauri && cargo tauri build --bundles app --config tauri.dev.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",
