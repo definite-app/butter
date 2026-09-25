@@ -5296,14 +5296,7 @@ export function useAppModel() {
       }
       const text = await readClipboardText();
       console.log("[paste] clipboard text fallback length", text?.length ?? 0, "preview", text?.slice(0, 20));
-      let wrote = false;
-      if (text) {
-        const ptyId = ptyBySession()[sessionId];
-        if (ptyId) {
-          await invoke("pty_write", { id: ptyId, data: text });
-          wrote = true;
-        }
-      }
+      const wrote = text ? await pasteTextToSession(sessionId, text) : false;
       if (!wrote) {
         console.log("[paste] falling back to ctrl+v", source);
         await sendCtrlVToSession(sessionId, source);
@@ -5438,6 +5431,32 @@ export function useAppModel() {
 
   const openPathExternally = async (path: string) => {
     await Command.create("open", [path]).execute();
+  };
+
+  /**
+   * Deliver clipboard text to a session as a real terminal paste.
+   *
+   * Goes through xterm.js `paste()`, which turns newlines into CR and wraps the text in
+   * ESC[200~ ... ESC[201~ when the running program enabled bracketed paste (DECSET 2004),
+   * then emits it as one onData chunk (one pty_write). Writing the raw clipboard text
+   * straight to the PTY skips both steps: a TUI such as Claude Code then gets a long
+   * unbracketed burst that arrives over many small reads, cannot tell where the paste
+   * starts, and keeps only the tail of the text.
+   */
+  const pasteTextToSession = async (sessionId: string, text: string): Promise<boolean> => {
+    const instance = terminalInstances.get(sessionId);
+    if (instance) {
+      instance.term.paste(text);
+      return true;
+    }
+    const ptyId = ptyBySession()[sessionId];
+    if (!ptyId) {
+      console.warn("[paste] no pty for session", sessionId);
+      return false;
+    }
+    // No xterm instance, so we cannot know the bracketed paste mode. Match xterm's newline handling.
+    await invoke("pty_write", { id: ptyId, data: text.replace(/\r?\n/g, "\r") });
+    return true;
   };
 
   const sendCtrlVToSession = async (sessionId: string, source: string) => {
