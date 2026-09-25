@@ -501,10 +501,8 @@ impl AgentDatabase {
     }
 
     /// Get the database file path
-    fn get_db_path() -> Result<PathBuf, String> {
-        let home =
-            dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-        Ok(home.join(".butter").join("agent.db"))
+    pub fn get_db_path() -> Result<PathBuf, String> {
+        Ok(crate::paths::butter_home()?.join("agent.db"))
     }
 
     /// Initialize database schema

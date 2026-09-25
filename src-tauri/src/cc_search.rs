@@ -14,7 +14,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const SCRIPT_SRC: &str = include_str!("../scripts/cc_search.py");
-const STDERR_LOG: &str = "/tmp/butter-cc-search.log";
+fn stderr_log() -> PathBuf {
+    PathBuf::from("/tmp").join(crate::paths::flavored_name("butter-cc-search.log"))
+}
 
 struct Proc {
     child: Child,
@@ -59,7 +61,7 @@ fn find_uv() -> PathBuf {
 /// Write the bundled Python helper to a temp file so `uv run --script` can
 /// pick up its inline dependency metadata, regardless of how the app is run.
 fn ensure_script() -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join("butter_cc_search.py");
+    let path = std::env::temp_dir().join(crate::paths::flavored_name("butter_cc_search.py"));
     fs::write(&path, SCRIPT_SRC).map_err(|e| format!("write helper script: {e}"))?;
     Ok(path)
 }
@@ -69,7 +71,7 @@ fn spawn_proc() -> Result<Proc, String> {
     let stderr = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(STDERR_LOG)
+        .open(stderr_log())
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
 
@@ -531,7 +533,7 @@ mod codex_meta_tests {
 pub fn cc_export_session(file_path: String) -> Result<String, String> {
     let src = PathBuf::from(&file_path);
     let data = fs::read(&src).map_err(|e| format!("read session file: {e}"))?;
-    let dir = std::env::temp_dir().join("butter-cc-sessions");
+    let dir = std::env::temp_dir().join(crate::paths::flavored_name("butter-cc-sessions"));
     fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
     let name = src
         .file_name()

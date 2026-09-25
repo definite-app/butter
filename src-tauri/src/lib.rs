@@ -6,6 +6,7 @@ mod codex_session;
 mod config;
 mod database;
 mod http_server;
+mod paths;
 mod pty;
 
 use agent_types::*;
@@ -31,10 +32,11 @@ use std::sync::Arc;
 use tauri::{Manager, State, WebviewWindow};
 
 fn activity_log(msg: &str) {
+    let log_path = Path::new("/tmp").join(paths::flavored_name("butter-activity.log"));
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/butter-activity.log")
+        .open(log_path)
     {
         let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
     }
@@ -62,8 +64,18 @@ fn pty_cwd_by_id(manager: &PtyManager, id: &str) -> Result<String, String> {
     Err("Could not determine current working directory".to_string())
 }
 
+/// Agent API port range. The dev flavor uses its own range so it never takes
+/// 9876 (which docs and tools assume is the release app).
+fn agent_api_port_range() -> std::ops::RangeInclusive<u16> {
+    if paths::IS_DEV_FLAVOR {
+        19876..=19976
+    } else {
+        9876..=9976
+    }
+}
+
 fn bind_agent_api_listener() -> Result<TcpListener, String> {
-    for port in 9876..=9976 {
+    for port in agent_api_port_range() {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
@@ -1658,8 +1670,7 @@ fn read_clipboard_types_native() -> Result<Vec<String>, String> {
 }
 
 fn butter_files_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home.join(".config").join("butter"))
+    paths::butter_config_dir()
 }
 
 fn paste_images_dir() -> Result<PathBuf, String> {
@@ -1768,6 +1779,12 @@ fn clipboard_history_compose(
     let sep = separator.unwrap_or_else(|| "\n\n".to_string());
     let include = include_source.unwrap_or(true);
     clipboard_history::compose(&app, db.inner(), &ids, &sep, include)
+}
+
+/// Build flavor ("release" or "dev") so the UI can show a DEV badge.
+#[tauri::command]
+fn app_flavor() -> &'static str {
+    paths::flavor()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1958,8 +1975,13 @@ pub fn run() {
             cc_search::cc_last_assistant_turn,
             cc_search::codex_last_assistant_turn,
             cc_search::codex_latest_session_id,
+            app_flavor,
         ])
         .setup(|app| {
+            // Dev flavor: seed ~/.butter-dev from the release data on first
+            // launch (read-only on the release files). No-op in release.
+            paths::seed_dev_flavor_data();
+
             // Initialize the agent database
             let db = Arc::new(AgentDatabase::open().expect("Failed to initialize agent database"));
             app.manage(db.clone());
@@ -2003,20 +2025,30 @@ pub fn run() {
             {
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
-                let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
-                let app_handle = app.handle().clone();
+                // The dev flavor never registers Cmd+E so it cannot steal it
+                // from the release app running side by side.
+                if !paths::IS_DEV_FLAVOR {
+                    let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
+                    let app_handle = app.handle().clone();
 
-                app.global_shortcut()
-                    .on_shortcut(shortcut, move |_app, _shortcut, _event| {
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                    // Non-fatal: if another app already holds Cmd+E, log and
+                    // keep starting instead of aborting setup.
+                    if let Err(err) = app.global_shortcut().on_shortcut(
+                        shortcut,
+                        move |_app, _shortcut, _event| {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                if window.is_visible().unwrap_or(false) {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
                             }
-                        }
-                    })?;
+                        },
+                    ) {
+                        eprintln!("Failed to register Cmd+E global shortcut: {}", err);
+                    }
+                }
             }
 
             Ok(())
