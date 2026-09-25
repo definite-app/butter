@@ -2361,29 +2361,53 @@
   min-height: 0;
 }
 
+/* Markdown reading view. Kept deliberately quiet: one text column, no
+   heading rules, no tinted boxes, borders only where they carry structure. */
 .butter-markdown-preview {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
-  background: #141518;
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* Same surface as the Monaco editor so Edit <-> Preview does not flash. */
+  background: #1e1e1e;
   display: flex;
   justify-content: center;
+  outline: none;
 }
 
 .butter-markdown-preview-content {
-  max-width: 780px;
+  --md-text: #e4e1dc;
+  --md-muted: var(--text-secondary);
+  --md-rule: rgba(255, 255, 255, 0.08);
+  --md-code-bg: rgba(255, 255, 255, 0.05);
+  max-width: 72ch;
   width: 100%;
-  padding: 48px 56px 96px;
-  color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  height: fit-content;
+  padding: 56px 32px 120px;
+  color: var(--md-text);
+  font-family: var(--font-sans);
   font-size: 15px;
-  line-height: 1.65;
+  line-height: 1.7;
+  overflow-wrap: break-word;
+  -webkit-font-smoothing: antialiased;
   /* Override the global body `user-select: none` so users can copy text
      out of the rendered preview. */
   user-select: text;
   -webkit-user-select: text;
   cursor: text;
+}
+
+.butter-markdown-preview-content ::selection {
+  background: rgba(245, 215, 110, 0.28);
+}
+
+.butter-markdown-preview-content > :first-child {
+  margin-top: 0;
+}
+
+.butter-markdown-preview-content > :last-child {
+  margin-bottom: 0;
 }
 
 .butter-markdown-preview-content h1,
@@ -2392,106 +2416,199 @@
 .butter-markdown-preview-content h4,
 .butter-markdown-preview-content h5,
 .butter-markdown-preview-content h6 {
-  margin: 1.6em 0 0.6em;
+  margin: 2em 0 0.6em;
+  font-family: var(--font-display);
   font-weight: 600;
-  line-height: 1.25;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
   color: var(--text-primary);
 }
 
 .butter-markdown-preview-content h1 {
-  font-size: 2em;
-  border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: 0.3em;
+  font-size: 1.75em;
+  margin-bottom: 0.8em;
 }
 
 .butter-markdown-preview-content h2 {
-  font-size: 1.5em;
-  border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: 0.3em;
+  font-size: 1.35em;
 }
 
 .butter-markdown-preview-content h3 {
-  font-size: 1.25em;
+  font-size: 1.12em;
 }
 
-.butter-markdown-preview-content p {
-  margin: 0 0 1em;
+.butter-markdown-preview-content h4,
+.butter-markdown-preview-content h5,
+.butter-markdown-preview-content h6 {
+  font-size: 1em;
+}
+
+.butter-markdown-preview-content h5,
+.butter-markdown-preview-content h6 {
+  color: var(--md-muted);
+}
+
+.butter-markdown-preview-content p,
+.butter-markdown-preview-content ul,
+.butter-markdown-preview-content ol,
+.butter-markdown-preview-content pre,
+.butter-markdown-preview-content blockquote,
+.butter-markdown-preview-content table {
+  margin: 0 0 1.1em;
+}
+
+.butter-markdown-preview-content strong {
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .butter-markdown-preview-content a {
   color: var(--accent-primary);
-  text-decoration: underline;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(245, 215, 110, 0.3);
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+.butter-markdown-preview-content a:hover {
+  border-bottom-color: var(--accent-primary);
 }
 
 .butter-markdown-preview-content code {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 4px;
-  padding: 0.15em 0.4em;
-  font-family: "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.9em;
+  background: var(--md-code-bg);
+  border-radius: var(--radius-sm);
+  padding: 0.12em 0.36em;
+  font-family: var(--font-mono);
+  font-size: 0.86em;
 }
 
 .butter-markdown-preview-content pre {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
+  background: var(--md-code-bg);
+  border-radius: var(--radius-lg);
   padding: 14px 16px;
-  overflow-x: auto;
-  margin: 0 0 1em;
+  /* Wrap long code lines instead of scrolling sideways. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
 }
 
 .butter-markdown-preview-content pre code {
   background: transparent;
   padding: 0;
-  font-size: 0.88em;
+  font-size: 0.84em;
   color: var(--text-primary);
 }
 
 .butter-markdown-preview-content blockquote {
-  border-left: 3px solid var(--accent-primary);
-  padding: 0.2em 1em;
-  margin: 0 0 1em;
-  color: var(--text-secondary);
-  background: rgba(245, 215, 110, 0.04);
+  border-left: 2px solid var(--border-strong);
+  padding: 0 0 0 1em;
+  color: var(--md-muted);
+}
+
+.butter-markdown-preview-content blockquote > :last-child {
+  margin-bottom: 0;
 }
 
 .butter-markdown-preview-content ul,
 .butter-markdown-preview-content ol {
-  margin: 0 0 1em;
-  padding-left: 1.6em;
+  padding-left: 1.4em;
 }
 
 .butter-markdown-preview-content li {
-  margin: 0.2em 0;
+  margin: 0.3em 0;
+}
+
+.butter-markdown-preview-content li::marker {
+  color: var(--text-muted);
+}
+
+.butter-markdown-preview-content li > ul,
+.butter-markdown-preview-content li > ol,
+.butter-markdown-preview-content li > p {
+  margin-bottom: 0.3em;
+}
+
+.butter-markdown-preview-content li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.4em;
+}
+
+.butter-markdown-preview-content input[type="checkbox"] {
+  margin: 0 0.5em 0 0;
+  vertical-align: -0.1em;
+  accent-color: var(--accent-primary);
 }
 
 .butter-markdown-preview-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
-  margin: 0 0 1em;
-  width: 100%;
+  font-size: 0.93em;
 }
 
 .butter-markdown-preview-content th,
 .butter-markdown-preview-content td {
-  border: 1px solid var(--border-subtle);
-  padding: 8px 12px;
+  border-bottom: 1px solid var(--md-rule);
+  padding: 7px 16px 7px 0;
   text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 .butter-markdown-preview-content th {
-  background: rgba(255, 255, 255, 0.04);
   font-weight: 600;
+  color: var(--md-muted);
+  border-bottom-color: var(--border-strong);
 }
 
 .butter-markdown-preview-content hr {
   border: none;
-  border-top: 1px solid var(--border-subtle);
-  margin: 2em 0;
+  border-top: 1px solid var(--md-rule);
+  margin: 2.2em 0;
 }
 
 .butter-markdown-preview-content img {
   max-width: 100%;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
+}
+
+/* Edit / Preview switch in the workspace header (markdown tabs only). */
+.butter-md-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: var(--radius-full);
+  background: var(--surface-elevated);
+  -webkit-app-region: no-drag;
+}
+
+.butter-md-view-toggle button {
+  padding: 4px 10px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.butter-md-view-toggle button:hover {
+  color: var(--text-secondary);
+}
+
+.butter-md-view-toggle button.active {
+  background: var(--surface-selected);
+  color: var(--text-primary);
+}
+
+.butter-md-view-toggle button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(245, 215, 110, 0.35);
 }
 
 /* Print container appended to <body> by exportActiveMarkdownAsPdf. Hidden by

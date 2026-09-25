@@ -121,6 +121,7 @@ export function HeaderActionMenu() {
         kind: "action",
         id: "preview",
         label: inPreview ? "Show source" : "Show preview",
+        shortcut: "⌘E",
         active: inPreview,
         icon: inPreview ? EditIcon : EyeIcon,
         onSelect: () => app.toggleMarkdownViewMode(markdown.id),
