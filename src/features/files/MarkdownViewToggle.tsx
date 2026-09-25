@@ -1,16 +1,19 @@
 import { Show, createMemo, onCleanup } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
 
+// Cmd+Option+P. Match on event.code: with Option held, macOS reports
+// event.key as "π". (Cmd+E is taken: the Rust side registers it as a global
+// show/hide-window shortcut.)
 const isToggleShortcut = (event: KeyboardEvent) =>
-  (event.key === "e" || event.key === "E") &&
+  event.code === "KeyP" &&
   event.metaKey &&
+  event.altKey &&
   !event.shiftKey &&
-  !event.altKey &&
   !event.ctrlKey;
 
 /**
  * Edit / Preview switch shown in the workspace header while a markdown file
- * tab is active. Cmd+E toggles between the two (same key as Obsidian).
+ * tab is active. Cmd+Option+P toggles between the two.
  */
 export function MarkdownViewToggle() {
   const app = useAppContext();
@@ -29,7 +32,7 @@ export function MarkdownViewToggle() {
     if (!isToggleShortcut(event)) return;
     const tab = activeMarkdown();
     if (!tab) return;
-    // Capture phase: runs before Monaco's own Cmd+E (find with selection).
+    // Capture phase: runs before Monaco sees the key.
     event.preventDefault();
     event.stopPropagation();
     app.toggleMarkdownViewMode(tab.id);
@@ -45,7 +48,7 @@ export function MarkdownViewToggle() {
             type="button"
             class={mode() === "source" ? "active" : ""}
             aria-pressed={mode() === "source"}
-            title="Edit markdown (⌘E)"
+            title="Edit markdown (⌥⌘P)"
             onClick={() => app.setMarkdownViewMode(tab().id, "source")}
           >
             Edit
@@ -54,7 +57,7 @@ export function MarkdownViewToggle() {
             type="button"
             class={mode() === "preview" ? "active" : ""}
             aria-pressed={mode() === "preview"}
-            title="Preview markdown (⌘E)"
+            title="Preview markdown (⌥⌘P)"
             onClick={() => app.setMarkdownViewMode(tab().id, "preview")}
           >
             Preview
