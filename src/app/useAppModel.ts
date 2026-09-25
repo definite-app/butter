@@ -549,6 +549,9 @@ export function useAppModel() {
     { kind: AgentKind; agentSessionId: string | null; writtenAt: number }
   > = {};
   const codexIdCache: Record<string, string> = {};
+  // Terminals whose codexIdCache entry is exact: read from Codex's thread lock,
+  // or carried over from a trusted restore/reopen (seedCodexId).
+  const codexIdExact = new Set<string>();
   const isAgentLive = (state?: string) => state === "working" || state === "idle";
 
   // Codex conversation ids per terminal. Resolved from the running codex
@@ -583,8 +586,18 @@ export function useAppModel() {
       if (r.thread_id) {
         codexThreadCache[sid] = { id: r.thread_id, cwd: r.cwd, at: nowMs };
         codexIdCache[sid] = r.thread_id;
+        codexIdExact.add(sid);
       }
     }
+  }
+
+  // Remember the conversation a restored/reopened Codex terminal is resuming.
+  // Until the resumed codex takes its thread lock (or while its resume picker
+  // is open) this keeps the known id instead of overwriting it with a guess.
+  function seedCodexId(sessionId: string, agentSessionId: string | null) {
+    if (!agentSessionId) return;
+    codexIdCache[sessionId] = agentSessionId;
+    codexIdExact.add(sessionId);
   }
 
   async function resolveCodexSessionId(
@@ -592,25 +605,30 @@ export function useAppModel() {
     cwd: string | null,
     curr: string | undefined,
     prev: string | undefined
-  ): Promise<string | null> {
+  ): Promise<{ id: string | null; exact: boolean }> {
     const fromLock = codexThreadCache[sessionId];
-    if (fromLock) return fromLock.id;
-    if (!cwd) return codexIdCache[sessionId] ?? null;
-    // Fallback: newest interactive rollout in this cwd that no other terminal
-    // already owns. Re-resolve on the rising edge (a freshly launched codex),
-    // otherwise reuse the cached id to avoid scanning the rollout logs.
+    if (fromLock) return { id: fromLock.id, exact: true };
+    const cached = () => ({
+      id: codexIdCache[sessionId] ?? null,
+      exact: codexIdExact.has(sessionId),
+    });
+    if (!cwd || codexIdExact.has(sessionId)) return cached();
+    // Fallback for Codex builds without thread locks (the backend returns
+    // null when locks exist): newest interactive rollout in this cwd that no
+    // other terminal already owns. Re-resolve on the rising edge (a freshly
+    // launched codex), otherwise reuse the cached id to avoid rescanning.
     const risingEdge = isAgentLive(curr) && !isAgentLive(prev);
-    if (codexIdCache[sessionId] && !risingEdge) return codexIdCache[sessionId];
+    if (codexIdCache[sessionId] && !risingEdge) return cached();
     const exclude = Object.entries(codexIdCache)
       .filter(([sid]) => sid !== sessionId)
       .map(([, id]) => id);
     try {
       const id = await invoke<string | null>("codex_latest_session_id", { cwd, exclude });
       if (id) codexIdCache[sessionId] = id;
-      return id ?? codexIdCache[sessionId] ?? null;
     } catch {
-      return codexIdCache[sessionId] ?? null;
+      // keep the cached id
     }
+    return cached();
   }
 
   async function persistAgentSnapshots(
@@ -625,6 +643,7 @@ export function useAppModel() {
       const sid = session.id;
       let kind: AgentKind | null = null;
       let agentSessionId: string | null = null;
+      let agentIdExact = false;
       let cwd = session.directory ?? null;
       // A live codex process wins over a Claude id left in the hook log by an
       // earlier Claude run in the same shell; that stale id used to make
@@ -635,12 +654,14 @@ export function useAppModel() {
           agentSessionIds[sid] ?? persistedAgentCache[sid]?.agentSessionId ?? null;
       } else if (isAgentLive(codexStates[sid])) {
         kind = "codex";
-        agentSessionId = await resolveCodexSessionId(
+        const resolved = await resolveCodexSessionId(
           sid,
           session.directory ?? null,
           codexStates[sid],
           prevCodex[sid]
         );
+        agentSessionId = resolved.id;
+        agentIdExact = resolved.exact;
         cwd = codexThreadCache[sid]?.cwd ?? cwd;
       } else if (agentSessionIds[sid]) {
         kind = "claude";
@@ -666,6 +687,7 @@ export function useAppModel() {
             agent_session_id: agentSessionId,
             agent_cwd: cwd,
             agent_last_seen_at: nowSec,
+            agent_id_exact: agentIdExact,
           },
         });
       } catch {
@@ -673,6 +695,7 @@ export function useAppModel() {
       }
     }
   }
+  const AGENT_LIVE_AT_CLOSE_SECS = 90;
   const [idleTick, setIdleTick] = createSignal(0);
   const [presets, setPresets] = createSignal<TerminalPreset[]>([]);
   const [appConfig, setAppConfig] = createSignal<AppConfig | null>(null);
@@ -4416,12 +4439,13 @@ export function useAppModel() {
     if (!reopened) return null;
 
     try {
-      const dbSession = await invoke<DbSession | null>("db_get_session", { id });
+      const dbSession = await invoke<DbSession | null>("db_reopen_candidate", { id });
       if (!dbSession || dbSession.is_closed) {
         await refreshRecentlyClosedSessions();
         return null;
       }
 
+      queueAgentResumeOnReopen(dbSession);
       const session = mapDbSessionToWebSession(dbSession);
       const existingIndex = sessions.findIndex((entry) => entry.id === id);
       if (existingIndex === -1) {
@@ -4445,6 +4469,30 @@ export function useAppModel() {
       await refreshRecentlyClosedSessions();
       return null;
     }
+  }
+
+  // A terminal closed while its agent was running reopens into that agent's
+  // conversation (claude --resume / codex resume) instead of re-running the
+  // launch command, which would start a new conversation.
+  function queueAgentResumeOnReopen(dbSession: DbSession) {
+    const kind = dbSession.agent_kind;
+    if (kind !== "claude" && kind !== "codex") return;
+    // Only terminals launched as that agent: their launch command would
+    // otherwise start a fresh conversation. Plain shells reopen as shells.
+    const launch = dbSession.command?.trim().split(/\s+/)[0] ?? "";
+    if (launch !== kind) return;
+    const lastSeen = dbSession.agent_last_seen_at ?? 0;
+    const closedAt = dbSession.closed_at ?? 0;
+    // The agent snapshot is refreshed at least every 30s while it runs.
+    if (!lastSeen || (closedAt && closedAt - lastSeen > AGENT_LIVE_AT_CLOSE_SECS)) return;
+    if (kind === "codex") seedCodexId(dbSession.id, dbSession.agent_session_id);
+    pendingAgentResume.set(dbSession.id, {
+      kind,
+      agentSessionId: dbSession.agent_session_id,
+      cwd: dbSession.agent_cwd ?? dbSession.directory,
+      lastSeenAt: lastSeen,
+      command: dbSession.command,
+    });
   }
 
   async function reopenLastClosedSession() {
@@ -6124,6 +6172,9 @@ export function useAppModel() {
       }
       if (firstId === null) firstId = dbSession.id;
       if (sel.restartAgent && dbSession.agent_kind) {
+        if (dbSession.agent_kind === "codex") {
+          seedCodexId(dbSession.id, dbSession.agent_session_id);
+        }
         pendingAgentResume.set(dbSession.id, {
           kind: dbSession.agent_kind as AgentKind,
           agentSessionId: dbSession.agent_session_id,
