@@ -23,6 +23,7 @@ import { buildFooterCommand } from "../utils/shell";
 import { captureScrollback, getLastLinesFromBuffer } from "../utils/terminal";
 import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree";
 import { buildAgentResumeCommand } from "../utils/agentResume";
+import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import type {
   AppView,
@@ -2053,6 +2054,12 @@ export function useAppModel() {
         label: "Exit Quick Input View",
         description: "Return to focused terminal view",
         action: () => setQuickInputActive(false),
+      },
+      {
+        id: "compose",
+        label: "Compose",
+        description: "Write a prompt in the composer dock and send it to this terminal (⌘I)",
+        action: () => toggleComposer(),
       },
       {
         id: "scratchpad",
@@ -5550,6 +5557,116 @@ export function useAppModel() {
     );
   };
 
+  // ===== Composer dock (Cmd+I) =====
+  // Per-session open state; the draft itself lives in a file (see composer.rs).
+  const [composerOpenBySession, setComposerOpenBySession] = createSignal<Record<string, boolean>>({});
+  let composerFocusHandler: (() => void) | undefined;
+
+  const registerComposerFocus = (fn?: () => void) => {
+    composerFocusHandler = fn;
+  };
+
+  const isComposerOpen = (sessionId: string | null | undefined) =>
+    !!sessionId && !!composerOpenBySession()[sessionId];
+
+  const composerHasFocus = () => {
+    const el = document.activeElement;
+    return !!(el && el instanceof HTMLElement && el.closest(".composer-dock"));
+  };
+
+  const refitAfterLayout = (sessionId: string) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => fitTerminalSession(sessionId)));
+  };
+
+  const setComposerOpen = (sessionId: string, open: boolean) => {
+    setComposerOpenBySession((prev) => {
+      const next = { ...prev };
+      if (open) next[sessionId] = true;
+      else delete next[sessionId];
+      return next;
+    });
+    refitAfterLayout(sessionId);
+    if (!open && activeSessionId() === sessionId) {
+      requestAnimationFrame(() => focusTerminal(sessionId));
+    }
+  };
+
+  /** Cmd+I: open (and focus) the dock; focused -> hide it; open but unfocused -> focus it. */
+  const toggleComposer = () => {
+    const sessionId = activeSessionId();
+    if (!sessionId || appView() !== "terminal") return;
+    if (quickInputActive()) setQuickInputActive(false);
+    if (activeWorkspaceTabKind() !== "terminal") {
+      setActiveWorkspaceTabForSession(sessionId, TERMINAL_WORKSPACE_TAB_ID);
+    }
+    const open = isComposerOpen(sessionId);
+    if (open && !composerHasFocus()) {
+      composerFocusHandler?.();
+      return;
+    }
+    setComposerOpen(sessionId, !open);
+  };
+
+  const sessionAgentKind = (sessionId: string): AgentKindName => {
+    if (isAgentLive(claudeState()[sessionId])) return "claude";
+    if (isAgentLive(codexState()[sessionId])) return "codex";
+    const command = sessions.find((s) => s.id === sessionId)?.command ?? "";
+    if (/\bclaude\b/.test(command)) return "claude";
+    if (/\bcodex\b/.test(command)) return "codex";
+    return "shell";
+  };
+
+  const sessionAgentLabel = (sessionId: string): string => {
+    const kind = sessionAgentKind(sessionId);
+    if (kind === "claude") return "Claude Code";
+    if (kind === "codex") return "Codex";
+    const command = sessions.find((s) => s.id === sessionId)?.command?.trim();
+    if (command && /^\s*(?:\S*\/)?(ssh|mosh)\s/.test(command)) return "ssh";
+    return "Shell";
+  };
+
+  const getSessionCwd = async (sessionId: string): Promise<string | null> => {
+    const ptyId = ptyBySession()[sessionId];
+    if (ptyId) {
+      try {
+        const cwd = await invoke<string>("get_pty_cwd", { id: ptyId });
+        if (cwd) return cwd;
+      } catch {
+        // fall through to the session's launch directory
+      }
+    }
+    return sessions.find((s) => s.id === sessionId)?.directory ?? null;
+  };
+
+  /**
+   * Send composer text to a session: ONE bracketed paste (xterm `paste()`,
+   * the same path as Cmd+V), then optionally a separate CR after a short
+   * delay so TUIs like Claude Code see it as Enter, not as part of the paste.
+   */
+  const sendComposerText = async (
+    sessionId: string,
+    text: string,
+    pressEnter: boolean
+  ): Promise<boolean> => {
+    const steps = planSend(text, pressEnter, sessionAgentKind(sessionId));
+    if (!steps.length) return false;
+    if (!ptyBySession()[sessionId] && !terminalInstances.get(sessionId)) {
+      await ensureTerminal(sessionId, { focus: false });
+    }
+    for (const step of steps) {
+      if (step.kind === "paste") {
+        const ok = await pasteTextToSession(sessionId, step.text);
+        if (!ok) return false;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+        const ptyId = ptyBySession()[sessionId];
+        if (!ptyId) return false;
+        await invoke("pty_write", { id: ptyId, data: "\r" });
+      }
+    }
+    return true;
+  };
+
   const setFooterPresetSelection = (presetId: string) => {
     setFooterPresetId(presetId);
     localStorage.setItem(FOOTER_PRESET_STORAGE_KEY, presetId);
@@ -6638,6 +6755,23 @@ export function useAppModel() {
     };
     window.addEventListener("keydown", handleQuickInputShortcut, true); // capture phase
 
+    // Cmd+I toggles the composer dock for the active terminal
+    const handleComposerShortcut = (event: KeyboardEvent) => {
+      const isCmdI =
+        (event.key === "i" || event.key === "I" || event.code === "KeyI") &&
+        event.metaKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.ctrlKey;
+      if (!isCmdI) return;
+      if (appView() !== "terminal") return;
+      if (showCommandPalette()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleComposer();
+    };
+    window.addEventListener("keydown", handleComposerShortcut, true);
+
     // Cmd+Shift+N to toggle Scratchpad
     const handleScratchpadShortcut = (event: KeyboardEvent) => {
       const isCmdShiftN =
@@ -7532,5 +7666,14 @@ export function useAppModel() {
     openPathExternally,
     startScreenRecording,
     stopScreenRecording,
+    composerOpenBySession,
+    isComposerOpen,
+    setComposerOpen,
+    toggleComposer,
+    registerComposerFocus,
+    sessionAgentKind,
+    sessionAgentLabel,
+    getSessionCwd,
+    sendComposerText,
   };
 }

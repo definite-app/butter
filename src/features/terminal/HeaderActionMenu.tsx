@@ -167,6 +167,16 @@ export function HeaderActionMenu() {
           }
         },
       });
+      const composerOpen = app.isComposerOpen(sessionId);
+      items.push({
+        kind: "action",
+        id: "toggle-composer",
+        label: composerOpen ? "Hide composer" : "Compose",
+        shortcut: "⌘I",
+        active: composerOpen,
+        icon: EditIcon,
+        onSelect: () => app.toggleComposer(),
+      });
       items.push({
         kind: "action",
         id: "copy-terminal-output",

@@ -21,11 +21,7 @@ import "monaco-editor/esm/vs/editor/contrib/indentation/browser/indentation";
 import "monaco-editor/esm/vs/editor/contrib/cursorUndo/browser/cursorUndo";
 import "monaco-editor/esm/vs/editor/contrib/caretOperations/browser/caretOperations";
 import "monaco-editor/esm/vs/editor/contrib/bracketMatching/browser/bracketMatching";
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
-import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
-import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { ensureMonacoEnvironment } from "./monacoEnv";
 import "monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution";
 import "monaco-editor/esm/vs/basic-languages/go/go.contribution";
 import "monaco-editor/esm/vs/basic-languages/ini/ini.contribution";
@@ -40,28 +36,6 @@ import "monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution";
 import "monaco-editor/min/vs/editor/editor.main.css";
 import { useAppContext } from "../../app/context/AppContext";
 import type { WorkspaceFileTab, WorkspaceTextFileTab } from "../../app/types";
-
-let monacoConfigured = false;
-
-const ensureMonacoEnvironment = () => {
-  if (monacoConfigured) return;
-  const globalScope = globalThis as typeof globalThis & {
-    MonacoEnvironment?: {
-      getWorker(_: string, label: string): Worker;
-    };
-  };
-  globalScope.MonacoEnvironment = {
-    getWorker(_: string, label: string) {
-      if (label === "json") return new jsonWorker();
-      if (label === "css" || label === "scss" || label === "less") return new cssWorker();
-      if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
-      if (label === "typescript" || label === "javascript") return new tsWorker();
-      return new editorWorker();
-    },
-  };
-  monacoConfigured = true;
-};
-
 
 const languageIdForPath = (path: string) => {
   const lower = path.toLowerCase();
