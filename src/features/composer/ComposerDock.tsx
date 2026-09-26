@@ -20,6 +20,7 @@ import {
   currentWord,
   isRemoteCommand,
   matchSessions,
+  poolBySection,
   prefixCompletion,
   relativeTime,
   stripSigil,
@@ -449,9 +450,13 @@ export function ComposerDock(props: { sessionId: string }) {
         value: h.text,
       }));
 
+    // Earlier words on the line ("mna" in "mna todo") boost matching rows.
+    const contextWords = wordsOf(before).filter((w) => w !== query.toLowerCase()).slice(-6);
+
     const publish = (candidates: Suggestion[]) => {
       if (seq !== suggestSeq) return null;
-      const ranked = capBySection([...sendRows, ...rankCandidatesLocally(candidates, query)]);
+      const pool = [...sendRows, ...rankCandidatesLocally(candidates, query, contextWords, false)];
+      const ranked = capBySection(pool);
       if (!ranked.length) {
         setRows([]);
         setListPos(null);
@@ -467,7 +472,7 @@ export function ComposerDock(props: { sessionId: string }) {
       }
       ctxSuggest?.set(true);
       positionList(pos.lineNumber, start + 1);
-      return ranked;
+      return pool;
     };
 
     // Local rows first (instant), then files, then the optional Jev rerank.
@@ -484,14 +489,15 @@ export function ComposerDock(props: { sessionId: string }) {
     }
     const localRows = publish([...fileRows, ...actionRows, ...draftRows]);
     if (!localRows || localRows.length < 2 || !jevOn()) return;
-    const result = await jevRanker.rank(localRows, {
+    // Jev sees a wider pool than the list shows, so it can promote a row the local cap hid.
+    const result = await jevRanker.rank(poolBySection(localRows), {
       draft: model.getValue(),
       query,
       workspace: dir ?? "",
     });
     if (seq !== suggestSeq || result.rankedBy !== "jev") return;
     if (!navigated()) {
-      setRows(result.rows);
+      setRows(capBySection(result.rows));
       setRankedBy("jev");
     }
   };
