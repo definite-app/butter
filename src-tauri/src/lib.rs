@@ -308,22 +308,73 @@ struct AgentSessionActivity {
     session_id: Option<String>,
 }
 
+/// Clients that carry a terminal to another machine. A child of the shell whose
+/// command line mentions `claude` or `codex` but is one of these (for example
+/// `ssh -t box "tmux new -A -s x codex"`) runs the agent remotely: there is no
+/// local process, hook log or rollout to track, and a local
+/// `claude --resume` / `codex resume` would be wrong. Reopening such a terminal
+/// re-runs its command, which reattaches to the remote session instead.
+const REMOTE_TRANSPORTS: &[&str] = &[
+    "ssh",
+    "autossh",
+    "mosh",
+    "mosh-client",
+    "et",
+    "tailscale",
+    "aws",
+    "session-manager-plugin",
+];
+
+/// True if `comm` (a `ps -o comm=` value, path or bare name) is a remote
+/// transport rather than a local agent.
+fn is_remote_transport(comm: &str) -> bool {
+    let name = comm.trim().rsplit('/').next().unwrap_or("");
+    REMOTE_TRANSPORTS.contains(&name)
+}
+
+/// Check if a process whose command line mentions `needle` is running as a
+/// local child of the given shell PID. Remote transports (ssh and friends)
+/// whose arguments merely name the agent do not count.
+fn is_agent_child_running(shell_pid: u32, needle: &str) -> bool {
+    let Ok(out) = std::process::Command::new("pgrep")
+        .args(["-P", &shell_pid.to_string(), "-f", needle])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if pids.is_empty() {
+        return false;
+    }
+    let Ok(ps) = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pids.join(",")])
+        .output()
+    else {
+        // Cannot tell what the match is; keep the old behavior.
+        return true;
+    };
+    // Every match was a remote transport, or ps printed nothing because the
+    // process exited between the two calls: not a local agent either way.
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|comm| !is_remote_transport(comm))
+}
+
 /// Check if a `claude` process is running as a child of the given shell PID.
 fn is_claude_running(shell_pid: u32) -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-P", &shell_pid.to_string(), "-f", "claude"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    is_agent_child_running(shell_pid, "claude")
 }
 
 /// Check if a `codex` process is running as a child of the given shell PID.
 fn is_codex_running(shell_pid: u32) -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-P", &shell_pid.to_string(), "-f", "codex"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    is_agent_child_running(shell_pid, "codex")
 }
 
 static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2055,4 +2106,26 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod agent_detection_tests {
+    use super::is_remote_transport;
+
+    #[test]
+    fn remote_transports_are_not_local_agents() {
+        assert!(is_remote_transport("ssh"));
+        assert!(is_remote_transport("/usr/bin/ssh"));
+        assert!(is_remote_transport("/opt/homebrew/bin/mosh-client\n"));
+        assert!(is_remote_transport("/usr/local/bin/session-manager-plugin"));
+    }
+
+    #[test]
+    fn local_agents_are_not_remote_transports() {
+        assert!(!is_remote_transport("claude"));
+        assert!(!is_remote_transport("/Users/me/.local/bin/claude"));
+        assert!(!is_remote_transport("node"));
+        assert!(!is_remote_transport("/opt/homebrew/bin/codex"));
+        assert!(!is_remote_transport(""));
+    }
 }
