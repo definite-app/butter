@@ -29,6 +29,15 @@ import {
 import { jevRanker, jevStatus, rankCandidatesLocally, type RankerName } from "./ranker";
 import "./ComposerDock.css";
 
+/** One keycap per key, so symbols like ⌘ ⇧ ↵ stay legible instead of running together. */
+function Keys(props: { keys: string[] }) {
+  return (
+    <span class="composer-keys">
+      <For each={props.keys}>{(k) => <kbd>{k}</kbd>}</For>
+    </span>
+  );
+}
+
 interface HistoryEntry {
   session_id: string;
   session_title: string;
@@ -1016,7 +1025,7 @@ export function ComposerDock(props: { sessionId: string }) {
               </button>
               <div class="composer-empty-text">
                 <span>
-                  Hold <kbd>fn</kbd> <kbd>⇧</kbd> to talk
+                  Hold <Keys keys={["fn", "⇧"]} /> to talk
                 </span>
                 <span class="sub">or click the mic · Wispr Flow · or start typing</span>
               </div>
@@ -1084,7 +1093,7 @@ export function ComposerDock(props: { sessionId: string }) {
             fallback={
               <>
                 <MicIcon size={13} stroke="currentColor" />
-                Dictate <kbd>fn⇧</kbd>
+                Dictate <Keys keys={["fn", "⇧"]} />
               </>
             }
           >
@@ -1096,7 +1105,7 @@ export function ComposerDock(props: { sessionId: string }) {
         </button>
         <span class="composer-spacer" />
         <span class="composer-status" title={draftPath()}>
-          <Show when={statusText()} fallback={<><kbd>⌘I</kbd> hides · draft is kept</>}>
+          <Show when={statusText()} fallback={<><Keys keys={["⌘", "I"]} /> hides · draft is kept</>}>
             {statusText()}
           </Show>
         </span>
@@ -1108,7 +1117,7 @@ export function ComposerDock(props: { sessionId: string }) {
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void send(false)}
         >
-          Insert <kbd>⇧⌘↵</kbd>
+          Insert <Keys keys={["⇧", "⌘", "↵"]} />
         </button>
         <button
           type="button"
@@ -1117,7 +1126,7 @@ export function ComposerDock(props: { sessionId: string }) {
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void send(pressEnter())}
         >
-          Send <kbd>⌘↵</kbd>
+          Send <Keys keys={["⌘", "↵"]} />
         </button>
       </div>
 
@@ -1185,13 +1194,13 @@ export function ComposerDock(props: { sessionId: string }) {
             </For>
             <div class="composer-suggest-footer">
               <span>
-                <kbd>tab</kbd> accept
+                <Keys keys={["tab"]} /> accept
               </span>
               <span>
-                <kbd>↑↓</kbd> choose
+                <Keys keys={["↑", "↓"]} /> choose
               </span>
               <span>
-                <kbd>esc</kbd> dismiss
+                <Keys keys={["esc"]} /> dismiss
               </span>
               <span class="composer-spacer" />
               <span title={jevOn() ? "TypeSafe Jev reranks within ~300 ms when it answers in time" : "Set [typesafe] api_key in config.toml to rank with Jev"}>
