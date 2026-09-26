@@ -37,3 +37,9 @@ cd src-tauri && cargo tauri build --bundles app
 - `src-tauri/target/release/bundle/macos/Butter.app`
 
 (We do not build the DMG.)
+
+## Composer Dock (Cmd+I)
+- `src/features/composer/` (UI + pure logic in `logic.ts`, tests in `scripts/composer-logic.test.ts`, run `npm run test:composer`); backend in `src-tauri/src/composer.rs`.
+- Drafts are files under the flavor data dir (`~/.butter/drafts`, `~/.butter-dev/drafts`); sent drafts move to `drafts/sent/` and `drafts/history.jsonl`.
+- Send = one bracketed paste via xterm `paste()`, then a separate `\r` after a short delay (`ENTER_DELAY_MS`).
+- Optional TypeSafe Jev reranking: `[typesafe] api_key = "..."` in `config.toml` (or env `TYPESAFE_API_KEY`); `timeout_ms` (default 300). The key never reaches the webview.

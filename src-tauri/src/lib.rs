@@ -3,6 +3,7 @@ mod browser;
 mod cc_search;
 mod clipboard_history;
 mod codex_session;
+mod composer;
 mod config;
 mod database;
 mod http_server;
@@ -1171,11 +1172,17 @@ fn db_delete_scrollback(session_id: String, db: State<Arc<AgentDatabase>>) -> Re
 
 #[tauri::command]
 fn get_config() -> Result<config::Config, String> {
-    config::load_config()
+    // The webview never sees the TypeSafe key.
+    let mut cfg = config::load_config()?;
+    cfg.typesafe = cfg.typesafe.map(|t| t.redacted());
+    Ok(cfg)
 }
 
 #[tauri::command]
-fn save_config(config: config::Config) -> Result<(), String> {
+fn save_config(mut config: config::Config) -> Result<(), String> {
+    // The webview only has a redacted copy of `[typesafe]`; keep the section
+    // that is on disk so a save from the UI never drops the key.
+    config.typesafe = config::load_config().ok().and_then(|c| c.typesafe);
     config::save_config(&config)
 }
 
@@ -2000,6 +2007,16 @@ pub fn run() {
             db_save_scrollback,
             db_get_scrollback,
             db_delete_scrollback,
+            // Composer dock
+            composer::composer_load_draft,
+            composer::composer_save_draft,
+            composer::composer_record_sent,
+            composer::composer_history,
+            composer::composer_list_actions,
+            composer::composer_jev_status,
+            composer::composer_jev_rank,
+            composer::dictation_available,
+            composer::dictation_hands_free,
             // Config commands
             get_config,
             save_config,
