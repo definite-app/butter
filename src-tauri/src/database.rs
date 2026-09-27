@@ -30,6 +30,10 @@ pub struct Session {
     pub agent_cwd: Option<String>,
     /// Unix seconds when the agent was last observed running.
     pub agent_last_seen_at: Option<i64>,
+    /// True when `agent_session_id` was read from the running agent itself
+    /// (Codex's per-thread writer lock), not guessed from rollouts by cwd.
+    #[serde(default)]
+    pub agent_id_exact: bool,
     /// Id of the app run (launch) that last had this terminal open. Used to
     /// pre-select only the terminals that were open in the most recent run.
     pub run_id: Option<String>,
@@ -62,6 +66,9 @@ pub struct SessionAgentUpdate {
     pub agent_session_id: Option<String>,
     pub agent_cwd: Option<String>,
     pub agent_last_seen_at: Option<i64>,
+    /// See `Session::agent_id_exact`.
+    #[serde(default)]
+    pub agent_id_exact: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +268,24 @@ fn now() -> i64 {
 }
 
 /// Columns selected for a full `Session`, in the order `row_to_session` expects.
-const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at, run_id";
+const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at, run_id, agent_id_exact";
+
+/// Older builds guessed Codex ids from the newest rollout in the cwd, so
+/// several terminals got the same (mostly wrong) id. A guessed id shared by
+/// more than one terminal can't be trusted; drop it so resume opens Codex's
+/// picker in the agent cwd instead. Ids read from Codex's thread lock are exact
+/// and kept even when shared (e.g. the same conversation resumed in two tabs).
+fn drop_untrusted_codex_id(session: &mut Session, shared_codex_ids: &HashSet<String>) {
+    if session.agent_kind.as_deref() == Some("codex")
+        && !session.agent_id_exact
+        && session
+            .agent_session_id
+            .as_ref()
+            .is_some_and(|id| shared_codex_ids.contains(id))
+    {
+        session.agent_session_id = None;
+    }
+}
 
 /// Build a `Session` from a row selecting `SESSION_COLUMNS`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -279,6 +303,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         agent_cwd: row.get(10)?,
         agent_last_seen_at: row.get(11)?,
         run_id: row.get(12)?,
+        agent_id_exact: row.get::<_, Option<i32>>(13)?.unwrap_or(0) != 0,
     })
 }
 
@@ -826,6 +851,7 @@ impl AgentDatabase {
             "agent_cwd TEXT",
             "agent_last_seen_at INTEGER",
             "run_id TEXT",
+            "agent_id_exact INTEGER",
         ] {
             let sql = format!("ALTER TABLE sessions ADD COLUMN {}", column);
             if let Err(err) = conn.execute(&sql, []) {
@@ -1846,7 +1872,8 @@ impl AgentDatabase {
              SET agent_kind = ?2,
                  agent_session_id = ?3,
                  agent_cwd = ?4,
-                 agent_last_seen_at = ?5
+                 agent_last_seen_at = ?5,
+                 agent_id_exact = ?6
              WHERE id = ?1",
             params![
                 req.session_id,
@@ -1854,6 +1881,7 @@ impl AgentDatabase {
                 req.agent_session_id,
                 req.agent_cwd,
                 req.agent_last_seen_at,
+                req.agent_id_exact as i32,
             ],
         )
         .map_err(|e| format!("Failed to set session agent: {}", e))?;
@@ -3015,21 +3043,21 @@ impl AgentDatabase {
             .into_iter()
             .map(|mut session| {
                 let preselect = preselect(&session);
-                // Older builds guessed Codex ids from the newest rollout in the
-                // cwd, so several terminals got the same (mostly wrong) id. An
-                // id shared by more than one terminal can't be trusted; drop it
-                // so resume opens Codex's picker in the agent cwd instead.
-                if session.agent_kind.as_deref() == Some("codex")
-                    && session
-                        .agent_session_id
-                        .as_ref()
-                        .is_some_and(|id| shared_codex_ids.contains(id))
-                {
-                    session.agent_session_id = None;
-                }
+                drop_untrusted_codex_id(&mut session, &shared_codex_ids);
                 RestoreCandidate { session, preselect }
             })
             .collect())
+    }
+
+    /// A closed terminal for Recently Closed reopen, with an untrusted Codex id
+    /// dropped the same way the startup picker does.
+    pub fn reopen_candidate(&self, id: &str) -> Result<Option<Session>, String> {
+        let Some(mut session) = self.get_session(id)? else {
+            return Ok(None);
+        };
+        let shared_codex_ids = self.shared_codex_session_ids()?;
+        drop_untrusted_codex_id(&mut session, &shared_codex_ids);
+        Ok(Some(session))
     }
 
     /// Codex conversation ids recorded on more than one session row (open or
@@ -3661,6 +3689,7 @@ mod tests {
                 agent_session_id: Some(agent_id.to_string()),
                 agent_cwd: Some("/Users/me/mike3".to_string()),
                 agent_last_seen_at: Some(1),
+                agent_id_exact: false,
             })
             .unwrap();
         };
@@ -3699,6 +3728,46 @@ mod tests {
             .find(|c| c.session.id == "unique")
             .unwrap();
         assert_eq!(unique.session.agent_session_id.as_deref(), Some("01a0-unique"));
+    }
+
+    #[test]
+    fn exact_codex_ids_survive_being_shared() {
+        let db = make_db();
+        for id in ["aws-billing", "old-guess", "reopen-me"] {
+            open_terminal(&db, id);
+        }
+        let set = |sid: &str, exact: bool| {
+            db.set_session_agent(&SessionAgentUpdate {
+                session_id: sid.to_string(),
+                agent_kind: Some("codex".to_string()),
+                agent_session_id: Some("01a0d2e2-shared".to_string()),
+                agent_cwd: Some("/Users/me/mike3".to_string()),
+                agent_last_seen_at: Some(1),
+                agent_id_exact: exact,
+            })
+            .unwrap();
+        };
+        // Read from Codex's thread lock in this tab; an old cwd guess on
+        // another row happens to carry the same id.
+        set("aws-billing", true);
+        set("old-guess", false);
+        set("reopen-me", false);
+        db.close_session("reopen-me").unwrap();
+        let by_id: std::collections::HashMap<String, RestoreCandidate> = db
+            .restore_candidates()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.session.id.clone(), c))
+            .collect();
+        assert_eq!(
+            by_id["aws-billing"].session.agent_session_id.as_deref(),
+            Some("01a0d2e2-shared")
+        );
+        assert!(by_id["aws-billing"].session.agent_id_exact);
+        assert_eq!(by_id["old-guess"].session.agent_session_id, None);
+        // Recently Closed reopen applies the same rule.
+        let reopened = db.reopen_candidate("reopen-me").unwrap().unwrap();
+        assert_eq!(reopened.agent_session_id, None);
     }
 
     #[test]

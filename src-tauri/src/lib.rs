@@ -1098,6 +1098,14 @@ fn db_get_session(id: String, db: State<Arc<AgentDatabase>>) -> Result<Option<Se
 }
 
 #[tauri::command]
+fn db_reopen_candidate(
+    id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Option<Session>, String> {
+    db.reopen_candidate(&id)
+}
+
+#[tauri::command]
 fn db_close_session(id: String, db: State<Arc<AgentDatabase>>) -> Result<(), String> {
     db.close_session(&id)
 }
@@ -1970,6 +1978,7 @@ pub fn run() {
             db_create_session,
             db_update_session,
             db_set_session_agent,
+            db_reopen_candidate,
             db_get_app_state,
             db_set_app_state,
             team_list_users,
