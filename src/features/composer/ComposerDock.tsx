@@ -165,6 +165,14 @@ export function ComposerDock(props: { sessionId: string }) {
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let suggestSeq = 0;
   let dismissedAt: string | null = null;
+  // A dismissal holds only for the same word: same line, same start, and the
+  // same text before it. Otherwise clearing the draft and typing a new line
+  // ("aws bill" after dismissing "mna todo", both words at column 4) stayed
+  // suppressed forever.
+  const dismissKey = (lineNumber: number, before: string) => {
+    const { start } = currentWord(before);
+    return `${lineNumber}:${start}:${before.slice(0, start)}`;
+  };
   let loaded = false;
   let applyingProgrammaticEdit = false;
   const disposables: monaco.IDisposable[] = [];
@@ -394,7 +402,7 @@ export function ComposerDock(props: { sessionId: string }) {
     const before = line.slice(0, pos.column - 1);
     const { word, start } = currentWord(before);
     const query = stripSigil(word);
-    const key = `${pos.lineNumber}:${start}`;
+    const key = dismissKey(pos.lineNumber, before);
     if (query.length < 2 || dismissedAt === key) {
       closeSuggestions();
       return;
@@ -527,7 +535,7 @@ export function ComposerDock(props: { sessionId: string }) {
     const pos = editor.getPosition();
     if (pos) {
       const before = model?.getLineContent(pos.lineNumber).slice(0, pos.column - 1) ?? "";
-      dismissedAt = `${pos.lineNumber}:${currentWord(before).start}`;
+      dismissedAt = dismissKey(pos.lineNumber, before);
     }
     closeSuggestions();
     switch (row.section) {
@@ -679,7 +687,7 @@ export function ComposerDock(props: { sessionId: string }) {
       const pos = editor?.getPosition();
       if (pos && model) {
         const before = model.getLineContent(pos.lineNumber).slice(0, pos.column - 1);
-        dismissedAt = `${pos.lineNumber}:${currentWord(before).start}`;
+        dismissedAt = dismissKey(pos.lineNumber, before);
       }
       closeSuggestions();
       return;
