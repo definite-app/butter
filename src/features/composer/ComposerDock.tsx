@@ -20,6 +20,7 @@ import {
   currentWord,
   isRemoteCommand,
   matchSessions,
+  poolBySection,
   prefixCompletion,
   relativeTime,
   stripSigil,
@@ -28,6 +29,15 @@ import {
 } from "./logic";
 import { jevRanker, jevStatus, rankCandidatesLocally, type RankerName } from "./ranker";
 import "./ComposerDock.css";
+
+/** One keycap per key, so symbols like ⌘ ⇧ ↵ stay legible instead of running together. */
+function Keys(props: { keys: string[] }) {
+  return (
+    <span class="composer-keys">
+      <For each={props.keys}>{(k) => <kbd>{k}</kbd>}</For>
+    </span>
+  );
+}
 
 interface HistoryEntry {
   session_id: string;
@@ -155,6 +165,14 @@ export function ComposerDock(props: { sessionId: string }) {
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let suggestSeq = 0;
   let dismissedAt: string | null = null;
+  // A dismissal holds only for the same word: same line, same start, and the
+  // same text before it. Otherwise clearing the draft and typing a new line
+  // ("aws bill" after dismissing "mna todo", both words at column 4) stayed
+  // suppressed forever.
+  const dismissKey = (lineNumber: number, before: string) => {
+    const { start } = currentWord(before);
+    return `${lineNumber}:${start}:${before.slice(0, start)}`;
+  };
   let loaded = false;
   let applyingProgrammaticEdit = false;
   const disposables: monaco.IDisposable[] = [];
@@ -384,7 +402,7 @@ export function ComposerDock(props: { sessionId: string }) {
     const before = line.slice(0, pos.column - 1);
     const { word, start } = currentWord(before);
     const query = stripSigil(word);
-    const key = `${pos.lineNumber}:${start}`;
+    const key = dismissKey(pos.lineNumber, before);
     if (query.length < 2 || dismissedAt === key) {
       closeSuggestions();
       return;
@@ -440,9 +458,13 @@ export function ComposerDock(props: { sessionId: string }) {
         value: h.text,
       }));
 
+    // Earlier words on the line ("mna" in "mna todo") boost matching rows.
+    const contextWords = wordsOf(before).filter((w) => w !== query.toLowerCase()).slice(-6);
+
     const publish = (candidates: Suggestion[]) => {
       if (seq !== suggestSeq) return null;
-      const ranked = capBySection([...sendRows, ...rankCandidatesLocally(candidates, query)]);
+      const pool = [...sendRows, ...rankCandidatesLocally(candidates, query, contextWords, false)];
+      const ranked = capBySection(pool);
       if (!ranked.length) {
         setRows([]);
         setListPos(null);
@@ -458,7 +480,7 @@ export function ComposerDock(props: { sessionId: string }) {
       }
       ctxSuggest?.set(true);
       positionList(pos.lineNumber, start + 1);
-      return ranked;
+      return pool;
     };
 
     // Local rows first (instant), then files, then the optional Jev rerank.
@@ -475,14 +497,15 @@ export function ComposerDock(props: { sessionId: string }) {
     }
     const localRows = publish([...fileRows, ...actionRows, ...draftRows]);
     if (!localRows || localRows.length < 2 || !jevOn()) return;
-    const result = await jevRanker.rank(localRows, {
+    // Jev sees a wider pool than the list shows, so it can promote a row the local cap hid.
+    const result = await jevRanker.rank(poolBySection(localRows), {
       draft: model.getValue(),
       query,
       workspace: dir ?? "",
     });
     if (seq !== suggestSeq || result.rankedBy !== "jev") return;
     if (!navigated()) {
-      setRows(result.rows);
+      setRows(capBySection(result.rows));
       setRankedBy("jev");
     }
   };
@@ -512,7 +535,7 @@ export function ComposerDock(props: { sessionId: string }) {
     const pos = editor.getPosition();
     if (pos) {
       const before = model?.getLineContent(pos.lineNumber).slice(0, pos.column - 1) ?? "";
-      dismissedAt = `${pos.lineNumber}:${currentWord(before).start}`;
+      dismissedAt = dismissKey(pos.lineNumber, before);
     }
     closeSuggestions();
     switch (row.section) {
@@ -664,7 +687,7 @@ export function ComposerDock(props: { sessionId: string }) {
       const pos = editor?.getPosition();
       if (pos && model) {
         const before = model.getLineContent(pos.lineNumber).slice(0, pos.column - 1);
-        dismissedAt = `${pos.lineNumber}:${currentWord(before).start}`;
+        dismissedAt = dismissKey(pos.lineNumber, before);
       }
       closeSuggestions();
       return;
@@ -1016,7 +1039,7 @@ export function ComposerDock(props: { sessionId: string }) {
               </button>
               <div class="composer-empty-text">
                 <span>
-                  Hold <kbd>fn</kbd> <kbd>⇧</kbd> to talk
+                  Hold <Keys keys={["fn", "⇧"]} /> to talk
                 </span>
                 <span class="sub">or click the mic · Wispr Flow · or start typing</span>
               </div>
@@ -1084,7 +1107,7 @@ export function ComposerDock(props: { sessionId: string }) {
             fallback={
               <>
                 <MicIcon size={13} stroke="currentColor" />
-                Dictate <kbd>fn⇧</kbd>
+                Dictate <Keys keys={["fn", "⇧"]} />
               </>
             }
           >
@@ -1096,7 +1119,7 @@ export function ComposerDock(props: { sessionId: string }) {
         </button>
         <span class="composer-spacer" />
         <span class="composer-status" title={draftPath()}>
-          <Show when={statusText()} fallback={<><kbd>⌘I</kbd> hides · draft is kept</>}>
+          <Show when={statusText()} fallback={<><Keys keys={["⌘", "I"]} /> hides · draft is kept</>}>
             {statusText()}
           </Show>
         </span>
@@ -1108,7 +1131,7 @@ export function ComposerDock(props: { sessionId: string }) {
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void send(false)}
         >
-          Insert <kbd>⇧⌘↵</kbd>
+          Insert <Keys keys={["⇧", "⌘", "↵"]} />
         </button>
         <button
           type="button"
@@ -1117,7 +1140,7 @@ export function ComposerDock(props: { sessionId: string }) {
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void send(pressEnter())}
         >
-          Send <kbd>⌘↵</kbd>
+          Send <Keys keys={["⌘", "↵"]} />
         </button>
       </div>
 
@@ -1185,13 +1208,13 @@ export function ComposerDock(props: { sessionId: string }) {
             </For>
             <div class="composer-suggest-footer">
               <span>
-                <kbd>tab</kbd> accept
+                <Keys keys={["tab"]} /> accept
               </span>
               <span>
-                <kbd>↑↓</kbd> choose
+                <Keys keys={["↑", "↓"]} /> choose
               </span>
               <span>
-                <kbd>esc</kbd> dismiss
+                <Keys keys={["esc"]} /> dismiss
               </span>
               <span class="composer-spacer" />
               <span title={jevOn() ? "TypeSafe Jev reranks within ~300 ms when it answers in time" : "Set [typesafe] api_key in config.toml to rank with Jev"}>

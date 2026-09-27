@@ -21,8 +21,12 @@ export interface Ranker {
 }
 
 /** Always-on local ranking: fuzzy score + recency (see logic.ts `rankLocal`). */
-export const rankCandidatesLocally = (candidates: readonly Suggestion[], query: string): Suggestion[] =>
-  rankLocal(candidates, query, Date.now());
+export const rankCandidatesLocally = (
+  candidates: readonly Suggestion[],
+  query: string,
+  context: readonly string[] = [],
+  cap = true
+): Suggestion[] => rankLocal(candidates, query, Date.now(), context, cap);
 
 /** The local ranker keeps the order `rankCandidatesLocally` produced. */
 export const localRanker: Ranker = {

@@ -134,17 +134,48 @@ export function recencyBoost(timestamp: number | undefined, now: number, halfLif
 export function rankLocal(
   candidates: readonly Suggestion[],
   query: string,
-  now: number
+  now: number,
+  context: readonly string[] = [],
+  cap = true
 ): Suggestion[] {
   const q = stripSigil(query);
+  const ctx = [...new Set(context.map((w) => w.toLowerCase()))].filter((w) => w.length >= 2 && w !== q.toLowerCase());
   const scored: Suggestion[] = [];
   for (const c of candidates) {
     const fuzzy = q ? matchScore(q, c) : 0;
     if (q && fuzzy < minScoreFor(q)) continue;
-    const score = fuzzy + recencyBoost(c.timestamp, now) * 40;
+    const score = fuzzy + contextBoost(ctx, c) + recencyBoost(c.timestamp, now) * 40;
     scored.push({ ...c, score });
   }
-  return capBySection(scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0)));
+  const sorted = scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return cap ? capBySection(sorted) : sorted;
+}
+
+/**
+ * Boost for the other words already typed on the line: "mna todo" should put
+ * data/mna/TODO.md above data/todos/, so every earlier word found in the
+ * candidate's path or description adds to its score (more at a word start).
+ */
+export function contextBoost(context: readonly string[], c: Pick<Suggestion, "matchText" | "extraText">): number {
+  if (!context.length) return 0;
+  const text = `${c.matchText ?? ""} ${c.extraText ?? ""}`.toLowerCase();
+  let boost = 0;
+  for (const w of context) {
+    const idx = text.indexOf(w);
+    if (idx < 0) continue;
+    const atWordStart = idx === 0 || /[^\p{L}\p{N}]/u.test(text[idx - 1] ?? "");
+    boost += atWordStart ? 180 : 60;
+  }
+  return boost;
+}
+
+/** Wider slice of the ranked list (before display caps) for an external reranker. */
+export function poolBySection(sorted: readonly Suggestion[], perSection = 8, total = 30): Suggestion[] {
+  const out: Suggestion[] = [];
+  for (const section of SECTION_ORDER) {
+    out.push(...sorted.filter((s) => s.section === section).slice(0, perSection));
+  }
+  return out.slice(0, total);
 }
 
 /**

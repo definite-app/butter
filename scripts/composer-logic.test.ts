@@ -13,6 +13,7 @@ import {
   planSend,
   prefixCompletion,
   rankLocal,
+  poolBySection,
   recencyBoost,
   type Suggestion,
 } from "../src/features/composer/logic.ts";
@@ -148,4 +149,17 @@ test("rankLocal hides weak matches for short queries", () => {
   assert.deepEqual(rankLocal(rows, "th", NOW).map((r) => r.id), [], "2 chars never match draft bodies");
   assert.deepEqual(rankLocal(rows, "oth", NOW).map((r) => r.id), ["d"], "3 chars: word-start substring in body");
   assert.ok(minScoreFor("ab") > minScoreFor("abc") && minScoreFor("abc") > minScoreFor("abcd"));
+});
+
+test("rankLocal boosts rows that match earlier words on the line", () => {
+  const f = (path: string) => ({ id: path, section: "files" as const, label: `@${path}`, hint: "", matchText: path, value: path });
+  const rows = [f("data/todos/"), f("data/todos/todos.db"), f("BUTTER_TODO.md"), f("data/mna/TODO.md")];
+  assert.equal(rankLocal(rows, "todo", NOW)[0].id !== "data/mna/TODO.md", true, "without context mna/TODO.md is not first");
+  assert.equal(rankLocal(rows, "todo", NOW, ["mna"])[0].id, "data/mna/TODO.md", "'mna todo' puts data/mna/TODO.md first");
+});
+
+test("poolBySection keeps more rows than the display caps", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ id: `f${i}`, section: "files" as const, label: "", hint: "", matchText: "", value: "" }));
+  assert.equal(poolBySection(rows).length, 8);
+  assert.equal(poolBySection(rows, 20, 10).length, 10);
 });
