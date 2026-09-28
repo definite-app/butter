@@ -2536,10 +2536,31 @@
   margin-left: -1.4em;
 }
 
+/* Custom task-list boxes: the native box is disabled in the preview, and
+   WebKit fades a disabled accent-colored box to a pale yellow blob with a
+   white tick that is hard to see on the dark background. */
 .butter-markdown-preview-content input[type="checkbox"] {
-  margin: 0 0.5em 0 0;
-  vertical-align: -0.1em;
-  accent-color: var(--accent-primary);
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 15px;
+  height: 15px;
+  margin: 0 0.6em 0 0;
+  vertical-align: -0.15em;
+  border: 1.5px solid #6e6e76;
+  border-radius: 4px;
+  background: transparent;
+  opacity: 1;
+  cursor: default;
+}
+
+.butter-markdown-preview-content input[type="checkbox"]:checked {
+  border-color: var(--accent-primary);
+  background-color: var(--accent-primary);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%231a1a1c' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-size: 12px 12px;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 .butter-markdown-preview-content table {
