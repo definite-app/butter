@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri:smoke": "node scripts/tauri-smoke.cjs",
     "test:composer": "node --test scripts/composer-logic.test.ts",
-    "build:dev-app": "cd src-tauri && cargo tauri build --bundles app --config tauri.dev.conf.json"
+    "build:dev-app": "cd src-tauri && cargo tauri build --bundles app --config tauri.dev.conf.json",
+    "install:app": "scripts/install-app.sh",
+    "install:dev-app": "scripts/install-app.sh --dev"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",
