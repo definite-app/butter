@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal, createEffect, onCleanup } from "solid-js";
+import { For, Show, createMemo, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { homeDir } from "@tauri-apps/api/path";
 import { useAppContext } from "../../app/context/AppContext";
 
@@ -138,16 +138,21 @@ export function TerminalSwitcher() {
 
   const isOpen = () => app.showCommandPalette() && app.commandPaletteMode() === "switcher";
 
-  // Focus input + reset state + refresh agent transcripts whenever the switcher opens
-  createEffect(() => {
-    if (isOpen()) {
+  // Focus input + reset state + refresh agent transcripts when the switcher opens.
+  // Track ONLY isOpen: refreshLastAgentTurnsForActiveSessions() reads codexState()
+  // and agentSessionIdBySession() synchronously, and those update about every
+  // second, which re-ran this reset while open (selection jumped back to the top,
+  // the search box and filter were cleared).
+  createEffect(
+    on(isOpen, (open) => {
+      if (!open) return;
       requestAnimationFrame(() => inputRef?.focus());
       app.setCommandQuery("");
       app.setSwitcherIndex(0);
       setFilter("all");
       void app.refreshLastAgentTurnsForActiveSessions();
-    }
-  });
+    })
+  );
 
   // Force re-evaluation of relative timestamps while open
   const [tick, setTick] = createSignal(0);
