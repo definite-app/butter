@@ -848,6 +848,8 @@ export function useAppModel() {
   const terminalHostCleanup = new Map<string, () => void>();
   const lastPtySizeBySession = new Map<string, { rows: number; cols: number }>();
   const commandRunFor = new Set<string>();
+  // CLI prompts go into the child process command, never through terminal input.
+  const pendingCliCommands = new Map<string, string>();
   // Sessions that should relaunch/resume their agent on next terminal spawn.
   // Populated by the reopen picker; consumed once in ensureTerminal.
   const pendingAgentResume = new Map<string, SessionAgentInfo>();
@@ -4979,6 +4981,7 @@ export function useAppModel() {
     let ptyId = ptyBySession()[id];
     const createdPty = !ptyId;
     if (!ptyId) {
+      const cliCommand = pendingCliCommands.get(id);
       ptyId = await invoke<string>("pty_create", {
         id,
         rows: term.rows,
@@ -4986,8 +4989,12 @@ export function useAppModel() {
         // Resuming an agent: start the shell where the agent ran, so Codex
         // (and Claude, whose history is per project dir) sees the same cwd.
         cwd: pendingAgentResume.get(id)?.cwd || session?.directory || null,
-        command: null,
+        command: cliCommand ?? null,
       });
+      if (cliCommand !== undefined) {
+        pendingCliCommands.delete(id);
+        commandRunFor.add(id);
+      }
       setPtyBySession((prev) => ({ ...prev, [id]: ptyId }));
     } else {
       void updatePtySize(id);
@@ -6106,9 +6113,10 @@ export function useAppModel() {
     preset?: TerminalPreset,
     commandOverride?: string,
     directoryOverride?: string,
-    titleOverride?: string
+    titleOverride?: string,
+    idOverride?: string
   ): string {
-    const id = crypto.randomUUID();
+    const id = idOverride ?? crypto.randomUUID();
     const now = Date.now();
     const title = titleOverride ?? (preset?.name || `Terminal ${sessions.length + 1}`);
     const directory = directoryOverride ?? preset?.directory;
@@ -7005,6 +7013,32 @@ export function useAppModel() {
       }
     }
 
+    // Local CLI requests reuse the ordinary tab/PTY creation path. The backend
+    // confirms success to the caller only after this request's PTY exists.
+    let cliPollBusy = false;
+    const cliPoll = setInterval(async () => {
+      if (cliPollBusy || restoreDecision() === "pending") return;
+      cliPollBusy = true;
+      try {
+        const requests = await invoke<Array<{ id: string; directory: string; command: string; title: string }>>(
+          "session_cli_pending",
+        );
+        // Admit one request at a time: the active tab must acquire its PTY
+        // before another request changes selection. Stable IDs prevent duplicates.
+        const request = requests[0];
+        if (request && !sessions.some((session) => session.id === request.id)) {
+          setAppView("terminal");
+          pendingCliCommands.set(request.id, request.command);
+          createSession(undefined, request.command, request.directory, request.title, request.id);
+          await invoke("focus_manager_window");
+        }
+      } catch (error) {
+        console.error("CLI session poll failed:", error);
+      } finally {
+        cliPollBusy = false;
+      }
+    }, 500);
+
     const unlisten = await listen<{ id: string; data: string }>(
       "pty-data",
       (event) => {
@@ -7222,6 +7256,7 @@ export function useAppModel() {
 
     onCleanup(() => {
       recorderShuttingDown = true;
+      clearInterval(cliPoll);
       if (recorderInstance && recorderInstance.state !== "inactive") {
         try {
           recorderInstance.stop();

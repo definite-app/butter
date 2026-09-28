@@ -1661,6 +1661,7 @@ usage() {
   if [ "$code" -eq 0 ]; then
     cat <<'EOF'
 Usage:
+  butter-cli session create --directory <path> --agent <claude|codex> [--prompt-stdin | --prompt <text>]
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
@@ -1679,6 +1680,7 @@ EOF
   else
     cat >&2 <<'EOF'
 Usage:
+  butter-cli session create --directory <path> --agent <claude|codex> [--prompt-stdin | --prompt <text>]
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
@@ -1726,6 +1728,9 @@ shift || true
 case "$root" in
   help|-h|--help)
     usage 0
+    ;;
+  session)
+    exec "$(dirname "$0")/butter-session-cli" "$@"
     ;;
   team)
     ;;
