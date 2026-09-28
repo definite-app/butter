@@ -9,6 +9,7 @@ mod database;
 mod http_server;
 mod paths;
 mod pty;
+mod session_cli;
 
 use agent_types::*;
 use browser::{
@@ -1937,6 +1938,7 @@ pub fn run() {
             )
         })
         .invoke_handler(tauri::generate_handler![
+            session_cli::session_cli_pending,
             focus_manager_window,
             set_window_width,
             minimize_manager_window,
@@ -2064,6 +2066,7 @@ pub fn run() {
             app.manage(db.clone());
             clipboard_history::spawn_watcher(app.handle().clone(), db);
             app.manage(PtyManager::new(app.handle().clone()));
+            app.manage(session_cli::SessionCli::install().map_err(std::io::Error::other)?);
             app.manage(Arc::new(cc_search::CcSearch::default()));
             let browser_manager = Arc::new(BrowserManager::new(app.handle().clone()));
             let http_listener =
