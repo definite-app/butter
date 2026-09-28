@@ -2382,10 +2382,12 @@
   --md-muted: var(--text-secondary);
   --md-rule: rgba(255, 255, 255, 0.08);
   --md-code-bg: rgba(255, 255, 255, 0.05);
-  max-width: 72ch;
+  /* Full width of the pane: text runs close to the edges, not a 72ch column. */
+  max-width: none;
   width: 100%;
+  box-sizing: border-box;
   height: fit-content;
-  padding: 56px 32px 120px;
+  padding: 40px 48px 120px;
   color: var(--md-text);
   font-family: var(--font-sans);
   font-size: 15px;
@@ -2551,13 +2553,22 @@
 .butter-markdown-preview-content th,
 .butter-markdown-preview-content td {
   border-bottom: 1px solid var(--md-rule);
-  padding: 7px 16px 7px 0;
+  padding: 8px 20px 8px 0;
   text-align: left;
   vertical-align: top;
-  overflow-wrap: anywhere;
+  /* break-word (not anywhere) keeps whole words together, so a short column
+     like "When" never collapses to one letter per line. */
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.butter-markdown-preview-content th:last-child,
+.butter-markdown-preview-content td:last-child {
+  padding-right: 0;
 }
 
 .butter-markdown-preview-content th {
+  white-space: nowrap;
   font-weight: 600;
   color: var(--md-muted);
   border-bottom-color: var(--border-strong);
