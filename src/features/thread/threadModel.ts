@@ -96,24 +96,47 @@ interface ThreadLaunchFiles {
   attachments_dir: string;
 }
 
+const threadPresetAgentCommand = (preset: TerminalPreset): string | null => {
+  const launch = threadPresetLaunch(preset);
+  if (!launch.ok) throw new Error(launch.reason);
+  return launch.agentCommand;
+};
+
 export type ThreadAgentKind = "claude" | "codex";
 
 export const threadAgentKind = (agentCommand: string | null | undefined): ThreadAgentKind =>
   /^codex(\s|$)/.test(agentCommand?.trim() ?? "") ? "codex" : "claude";
 
+export type ThreadPresetLaunch =
+  /** `agentCommand` null means plain Claude Code in the preset's folder. */
+  | { ok: true; agentCommand: string | null }
+  | { ok: false; label: string; reason: string };
+
 /**
- * The agent command a preset runs, without any `${input}` placeholder, or
- * null when the preset doesn't start Claude Code or interactive Codex locally
- * (ssh, plain shells, `codex exec`), which 1thread can't drive.
+ * How a preset starts a thread. Claude and interactive Codex presets keep
+ * their command (minus any `${input}` placeholder) and flags. Any other
+ * preset (an empty command, a log tail, `caffeinate`) starts Claude Code in
+ * its folder. Presets that run an agent some other way (over ssh, or
+ * `codex exec`) can't reply to Butter, so they're unavailable.
  */
-export function threadAgentCommandForPreset(preset: TerminalPreset): string | null {
+export function threadPresetLaunch(preset: TerminalPreset): ThreadPresetLaunch {
   const command = (preset.command ?? "")
     .replace(/(["']?)\$\{input\}\1/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (/^claude(\s|$)/.test(command)) return command;
-  if (/^codex(\s|$)/.test(command) && codexLaunchFlags(command) !== null) return command;
-  return null;
+  if (/^claude(\s|$)/.test(command)) return { ok: true, agentCommand: command };
+  if (/^codex(\s|$)/.test(command)) {
+    return codexLaunchFlags(command) !== null
+      ? { ok: true, agentCommand: command }
+      : { ok: false, label: "Unavailable", reason: "Only interactive Codex can reply in 1thread" };
+  }
+  if (/^(ssh|mosh|et)(\s|$)/.test(command)) {
+    return { ok: false, label: "Remote", reason: "Agents on another machine can't reply to 1thread yet" };
+  }
+  if (/(^|[\s'"/])(claude|codex)(\s|$|['"])/.test(command)) {
+    return { ok: false, label: "Unavailable", reason: "1thread can only start Claude or Codex directly" };
+  }
+  return { ok: true, agentCommand: null };
 }
 
 // The prompt and instructions are read from staged files so the typed command
@@ -394,7 +417,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
       presetId: preset?.id ?? null,
       presetName: preset?.name ?? null,
       directory: preset?.directory ?? null,
-      agentCommand: preset ? threadAgentCommandForPreset(preset) : null,
+      agentCommand: preset ? threadPresetAgentCommand(preset) : null,
     });
     setThreads((prev) => [record, ...prev.filter((t) => t.session_id !== record.session_id)]);
     const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, title, sessionId);

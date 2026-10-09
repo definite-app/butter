@@ -705,6 +705,15 @@ button.ot-target.picker.open svg {
   white-space: nowrap;
 }
 
+.ot-preset-item.unavailable {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ot-preset-item.unavailable:hover {
+  background: transparent;
+}
+
 .ot-preset-kind {
   margin-left: 6px;
   color: var(--text-muted);

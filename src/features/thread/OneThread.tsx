@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
-import { threadAgentCommandForPreset, threadAgentKind } from "./threadModel";
+import { threadAgentKind, threadPresetLaunch } from "./threadModel";
 import type { ThreadMessage } from "./threadModel";
 import "./OneThread.css";
 
@@ -175,8 +175,11 @@ export function OneThread() {
   };
   const [presetId, setPresetId] = createSignal<string | null>(readStoredPresetId());
   const [presetMenuOpen, setPresetMenuOpen] = createSignal(false);
-  const threadPresets = createMemo(() => app.presets().filter((p) => threadAgentCommandForPreset(p)));
-  const selectedPreset = () => threadPresets().find((p) => p.id === presetId()) ?? null;
+  const threadPresets = createMemo(() =>
+    app.presets().map((preset) => ({ preset, launch: threadPresetLaunch(preset) }))
+  );
+  const selectedPreset = () =>
+    threadPresets().find((p) => p.launch.ok && p.preset.id === presetId())?.preset ?? null;
   const choosePreset = (preset: TerminalPreset | null) => {
     setPresetId(preset?.id ?? null);
     try {
@@ -756,19 +759,26 @@ export function OneThread() {
                       </Show>
                     </button>
                     <For each={threadPresets()}>
-                      {(preset) => (
+                      {({ preset, launch }) => (
                         <button
                           type="button"
                           role="option"
                           aria-selected={selectedPreset()?.id === preset.id}
-                          class="ot-preset-item"
-                          onClick={() => choosePreset(preset)}
+                          aria-disabled={!launch.ok}
+                          class={`ot-preset-item ${launch.ok ? "" : "unavailable"}`}
+                          title={launch.ok ? undefined : launch.reason}
+                          onClick={() => launch.ok && choosePreset(preset)}
                         >
                           <span class="ot-preset-text">
                             <span class="ot-preset-name">
                               {preset.name}
-                              <Show when={threadAgentKind(threadAgentCommandForPreset(preset)) === "codex"}>
-                                <span class="ot-preset-kind">Codex</span>
+                              <Show
+                                when={launch.ok}
+                                fallback={<span class="ot-preset-kind">{launch.ok ? "" : launch.label}</span>}
+                              >
+                                <Show when={launch.ok && threadAgentKind(launch.agentCommand) === "codex"}>
+                                  <span class="ot-preset-kind">Codex</span>
+                                </Show>
                               </Show>
                             </span>
                             <span class="ot-preset-dir" title={preset.directory}>
