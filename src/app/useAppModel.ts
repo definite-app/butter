@@ -5019,7 +5019,7 @@ export function useAppModel() {
       pendingAgentResume.delete(id);
       // 1thread sessions resume with their reply instructions, which the
       // transcript doesn't keep; everything else uses the plain resume.
-      const isThread = resumeInfo.kind === "claude" && (terminalTags()[id] || []).includes(THREAD_TAG);
+      const isThread = (resumeInfo.kind === "claude" || resumeInfo.kind === "codex") && (terminalTags()[id] || []).includes(THREAD_TAG);
       const resumePtyId = ptyId;
       void (async () => {
         let resumeCmd = buildAgentResumeCommand(resumeInfo);

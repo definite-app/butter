@@ -32,8 +32,9 @@ pub struct ThreadRecord {
     /// The Butter preset the thread was started from; None for the default.
     pub preset_id: Option<String>,
     pub preset_name: Option<String>,
-    /// The preset's Claude command (e.g. `claude --dangerously-skip-permissions`),
-    /// reused for every launch and resume of this thread. None means plain `claude`.
+    /// The preset's agent command (e.g. `claude --dangerously-skip-permissions`
+    /// or `codex --search`), reused for every launch and resume of this thread.
+    /// None means plain `claude`.
     pub agent_command: Option<String>,
 }
 
@@ -413,7 +414,10 @@ pub struct ThreadLaunchFiles {
     /// None when resuming without a new message (e.g. from the restore picker).
     pub prompt_path: Option<String>,
     pub instructions_path: String,
-    /// The thread's base Claude command (see `ThreadRecord::agent_command`).
+    /// The same instructions as a TOML string, for Codex's
+    /// `-c developer_instructions=...` (Codex has no --append-system-prompt).
+    pub instructions_toml_path: String,
+    /// The thread's base agent command (see `ThreadRecord::agent_command`).
     pub agent_command: Option<String>,
     /// Where pasted images live; passed to Claude with `--add-dir` so a thread
     /// running in a preset's folder can still read them.
@@ -451,11 +455,17 @@ pub fn thread_stage_launch(
         eprintln!("[thread] could not pre-trust the threads folder for Claude: {err}");
     }
     let instructions_path = dir.join("instructions.txt");
-    std::fs::write(&instructions_path, instructions)
+    std::fs::write(&instructions_path, &instructions)
+        .map_err(|e| format!("Failed to write instructions: {e}"))?;
+    // A JSON string is also a valid TOML basic string.
+    let instructions_toml_path = dir.join("instructions.toml-string");
+    let toml_string = serde_json::to_string(&instructions).map_err(|e| e.to_string())?;
+    std::fs::write(&instructions_toml_path, toml_string)
         .map_err(|e| format!("Failed to write instructions: {e}"))?;
     Ok(ThreadLaunchFiles {
         prompt_path,
         instructions_path: instructions_path.to_string_lossy().to_string(),
+        instructions_toml_path: instructions_toml_path.to_string_lossy().to_string(),
         agent_command,
         attachments_dir: attachments_dir.to_string_lossy().to_string(),
     })
@@ -506,6 +516,127 @@ fn ensure_claude_trusts_threads() -> Result<(), String> {
     std::fs::rename(&tmp_path, &config_path).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadCodexStatus {
+    /// PTY id.
+    pub id: String,
+    pub alive: bool,
+    /// The Codex conversation the terminal's codex holds open.
+    pub thread_id: Option<String>,
+    /// A turn has started and not yet completed or been aborted.
+    pub working: bool,
+    /// From the latest `task_complete` event.
+    pub last_agent_message: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// Codex turn state for each PTY, read from the conversation's rollout log
+/// (`task_started` / `task_complete` / `turn_aborted`). Butter's own Codex
+/// hook is optional, so this doesn't depend on it.
+#[tauri::command(async)]
+pub fn thread_codex_status(ids: Vec<String>, manager: State<'_, PtyManager>) -> Vec<ThreadCodexStatus> {
+    let pids: Vec<(String, Option<u32>)> = ids
+        .into_iter()
+        .map(|id| {
+            let pid = manager.get_pid(&id).ok().flatten();
+            (id, pid)
+        })
+        .collect();
+    let shell_pids: Vec<u32> = pids.iter().filter_map(|(_, pid)| *pid).collect();
+    let threads = crate::codex_session::resolve_codex_threads(&shell_pids);
+    pids.into_iter()
+        .map(|(id, pid)| {
+            let alive = pid.is_some_and(crate::is_codex_running);
+            let thread_id = pid.and_then(|p| threads.get(&p)).map(|t| t.thread_id.clone());
+            let turn = thread_id.as_deref().and_then(codex_turn_state);
+            ThreadCodexStatus {
+                id,
+                alive,
+                thread_id,
+                working: alive && turn.as_ref().is_some_and(|t| t.working),
+                last_agent_message: turn.as_ref().and_then(|t| t.last_agent_message.clone()),
+                completed_at: turn.and_then(|t| t.completed_at),
+            }
+        })
+        .collect()
+}
+
+struct CodexTurnState {
+    working: bool,
+    last_agent_message: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn codex_rollout_path(thread_id: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(path) = cache.lock().ok()?.get(thread_id).filter(|p| p.exists()) {
+        return Some(path.clone());
+    }
+    let root = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?
+        .join("sessions");
+    let suffix = format!("{thread_id}.jsonl");
+    let path = crate::cc_search::list_codex_jsonls_newest_first(&root, 500)
+        .into_iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix)))?;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(thread_id.to_string(), path.clone());
+    }
+    Some(path)
+}
+
+/// The latest turn event in a Codex rollout. Reads the tail of the file
+/// first, since rollouts grow large and the event is near the end.
+fn codex_turn_state(thread_id: &str) -> Option<CodexTurnState> {
+    codex_turn_state_from_file(&codex_rollout_path(thread_id)?, 256 * 1024)
+}
+
+fn codex_turn_state_from_file(path: &std::path::Path, tail_bytes: u64) -> Option<CodexTurnState> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    for window in [tail_bytes, len] {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        // When reading from mid-file, the first line may be partial.
+        let lines = text.lines().skip(usize::from(start > 0));
+        for line in lines.collect::<Vec<_>>().into_iter().rev() {
+            if !line.contains("\"event_msg\"") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let payload = &value["payload"];
+            match payload["type"].as_str() {
+                Some("task_started") => {
+                    return Some(CodexTurnState { working: true, last_agent_message: None, completed_at: None })
+                }
+                Some("task_complete") | Some("turn_aborted") => {
+                    return Some(CodexTurnState {
+                        working: false,
+                        last_agent_message: payload["last_agent_message"].as_str().map(str::to_string),
+                        completed_at: value["timestamp"].as_str().map(str::to_string),
+                    })
+                }
+                _ => {}
+            }
+        }
+        if start == 0 {
+            break;
+        }
+    }
+    None
+}
+
 /// Whether a `claude` process is running under each PTY's shell. Unlike
 /// `get_claude_activity`, this does not depend on hook events (which go stale
 /// after 5 minutes), so the follow-up scheduler can tell "idle for a while"
@@ -518,7 +649,7 @@ pub fn thread_agent_alive(ids: Vec<String>, manager: State<'_, PtyManager>) -> V
                 .get_pid(&id)
                 .ok()
                 .flatten()
-                .map(crate::is_claude_running)
+                .map(|pid| crate::is_claude_running(pid) || crate::is_codex_running(pid))
                 .unwrap_or(false);
             ThreadAgentAlive { id, alive }
         })
@@ -554,5 +685,29 @@ mod tests {
         assert_eq!(with_image.attachments, vec!["/tmp/a.png".to_string()]);
         assert!(get_thread(&db, "missing").unwrap().is_none());
         assert!(validate_thread_id("../etc").is_err());
+    }
+
+    #[test]
+    fn codex_turn_state_reads_latest_turn_event() {
+        let dir = std::env::temp_dir().join(format!("butter-codex-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        let started = r#"{"timestamp":"t1","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let complete = r#"{"timestamp":"t2","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}"#;
+        let filler = r#"{"timestamp":"t3","type":"response_item","payload":{"type":"message","role":"assistant","content":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#;
+
+        std::fs::write(&path, format!("{started}\n{complete}\n{filler}\n")).unwrap();
+        // A tail window smaller than the file falls back to a full read.
+        let state = codex_turn_state_from_file(&path, 40).unwrap();
+        assert!(!state.working);
+        assert_eq!(state.last_agent_message.as_deref(), Some("done"));
+        assert_eq!(state.completed_at.as_deref(), Some("t2"));
+
+        std::fs::write(&path, format!("{started}\n{complete}\n{started}\n{filler}\n")).unwrap();
+        assert!(codex_turn_state_from_file(&path, 1024).unwrap().working);
+
+        std::fs::write(&path, format!("{filler}\n")).unwrap();
+        assert!(codex_turn_state_from_file(&path, 1024).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -705,6 +705,12 @@ button.ot-target.picker.open svg {
   white-space: nowrap;
 }
 
+.ot-preset-kind {
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .ot-preset-dir {
   color: var(--text-muted);
   font-size: 11px;

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
-import { threadAgentCommandForPreset } from "./threadModel";
+import { threadAgentCommandForPreset, threadAgentKind } from "./threadModel";
 import type { ThreadMessage } from "./threadModel";
 import "./OneThread.css";
 
@@ -765,7 +765,12 @@ export function OneThread() {
                           onClick={() => choosePreset(preset)}
                         >
                           <span class="ot-preset-text">
-                            <span class="ot-preset-name">{preset.name}</span>
+                            <span class="ot-preset-name">
+                              {preset.name}
+                              <Show when={threadAgentKind(threadAgentCommandForPreset(preset)) === "codex"}>
+                                <span class="ot-preset-kind">Codex</span>
+                              </Show>
+                            </span>
                             <span class="ot-preset-dir" title={preset.directory}>
                               {(preset.directory || "~").replace(/^\/Users\/[^/]+(?=\/|$)/, "~")}
                             </span>

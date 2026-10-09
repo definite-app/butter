@@ -4,11 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DbSession, TerminalPreset, WebSession } from "../../app/types";
 import { shellEscape } from "../../utils/shell";
+import { codexLaunchFlags, shellQuoteWord } from "../../utils/agentResume";
 
 // ===== 1thread =====
 // A chat stream where each thread is a real Butter terminal session running
-// Claude Code. User messages are typed into the terminal; the agent answers by
-// running `butter-cli thread reply`, which arrives as a "thread-message" event.
+// Claude Code or Codex. User messages are typed into the terminal; the agent
+// answers by running `butter-cli thread reply`, which arrives as a
+// "thread-message" event.
 
 export interface ThreadRecord {
   session_id: string;
@@ -61,7 +63,7 @@ export interface ThreadModelDeps {
 export const THREAD_TAG = "thread";
 
 const THREAD_INSTRUCTIONS =
-  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; look at them with the Read tool.";
+  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; open them to see them.";
 
 // Pre-approve the reply command so the agent never blocks on a permission
 // prompt the user can't see. `--allowedTools` is variadic, so it must be
@@ -89,26 +91,35 @@ export function agentTextForMessage(message: Pick<ThreadMessage, "body" | "attac
 interface ThreadLaunchFiles {
   prompt_path: string | null;
   instructions_path: string;
+  instructions_toml_path: string;
   agent_command: string | null;
   attachments_dir: string;
 }
 
+export type ThreadAgentKind = "claude" | "codex";
+
+export const threadAgentKind = (agentCommand: string | null | undefined): ThreadAgentKind =>
+  /^codex(\s|$)/.test(agentCommand?.trim() ?? "") ? "codex" : "claude";
+
 /**
- * The Claude command a preset runs, without any `${input}` placeholder, or
- * null when the preset doesn't start Claude locally (Codex, ssh, plain shells),
- * which 1thread can't drive yet.
+ * The agent command a preset runs, without any `${input}` placeholder, or
+ * null when the preset doesn't start Claude Code or interactive Codex locally
+ * (ssh, plain shells, `codex exec`), which 1thread can't drive.
  */
 export function threadAgentCommandForPreset(preset: TerminalPreset): string | null {
   const command = (preset.command ?? "")
     .replace(/(["']?)\$\{input\}\1/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  return /^claude(\s|$)/.test(command) ? command : null;
+  if (/^claude(\s|$)/.test(command)) return command;
+  if (/^codex(\s|$)/.test(command) && codexLaunchFlags(command) !== null) return command;
+  return null;
 }
 
 // The prompt and instructions are read from staged files so the typed command
 // stays well under the tty's canonical line limit (see thread_stage_launch).
-export function buildThreadClaudeCommand(files: ThreadLaunchFiles, resumeId?: string | null): string {
+export function buildThreadAgentCommand(files: ThreadLaunchFiles, resumeId?: string | null): string {
+  if (threadAgentKind(files.agent_command) === "codex") return buildThreadCodexCommand(files, resumeId);
   const parts = [files.agent_command?.trim() || "claude"];
   if (resumeId) parts.push("--resume", shellEscape(resumeId));
   parts.push(
@@ -123,10 +134,22 @@ export function buildThreadClaudeCommand(files: ThreadLaunchFiles, resumeId?: st
   return parts.join(" ");
 }
 
+// `codex [resume <id>] <preset flags> -c developer_instructions=... "<prompt>"`.
+// The preset's own flags (e.g. --dangerously-bypass-approvals-and-sandbox)
+// decide whether `butter-cli thread reply` can run without an approval.
+function buildThreadCodexCommand(files: ThreadLaunchFiles, resumeId?: string | null): string {
+  const parts = ["codex"];
+  if (resumeId) parts.push("resume", shellEscape(resumeId));
+  parts.push(...(codexLaunchFlags(files.agent_command) ?? []).map(shellQuoteWord));
+  parts.push("-c", `"developer_instructions=$(cat ${shellEscape(files.instructions_toml_path)})"`);
+  if (files.prompt_path) parts.push(`"$(cat ${shellEscape(files.prompt_path)})"`);
+  return parts.join(" ");
+}
+
 /**
- * Resume a thread's Claude with the 1thread instructions but no new message,
- * e.g. from the restore picker. Plain `claude --resume` would drop the
- * instructions, which aren't stored in the transcript.
+ * Resume a thread's agent with the 1thread instructions but no new message,
+ * e.g. from the restore picker. A plain resume would drop the instructions,
+ * which aren't stored in the transcript.
  */
 export async function buildThreadResumeCommand(threadId: string, resumeId: string | null): Promise<string> {
   const files = await invoke<ThreadLaunchFiles>("thread_stage_launch", {
@@ -134,7 +157,7 @@ export async function buildThreadResumeCommand(threadId: string, resumeId: strin
     prompt: null,
     instructions: THREAD_INSTRUCTIONS,
   });
-  return buildThreadClaudeCommand(files, resumeId);
+  return buildThreadAgentCommand(files, resumeId);
 }
 
 export function threadTitleFromMessage(text: string): string {
@@ -157,6 +180,16 @@ interface ThreadRuntime {
 interface LastAssistantTurn {
   text: string;
   timestamp: string | null;
+}
+
+interface CodexStatus {
+  /** PTY id. */
+  id: string;
+  alive: boolean;
+  thread_id: string | null;
+  working: boolean;
+  last_agent_message: string | null;
+  completed_at: string | null;
 }
 
 export function createThreadModel(deps: ThreadModelDeps) {
@@ -187,6 +220,49 @@ export function createThreadModel(deps: ThreadModelDeps) {
   });
 
   const isThread = (id: string) => Boolean(threadById()[id]);
+  const kindOf = (id: string) => threadAgentKind(threadById()[id]?.agent_command);
+
+  // Codex turn state per thread, polled from its rollout log (Butter's Codex
+  // hook is optional, so get_codex_activity can't tell working from idle).
+  const [codexStatus, setCodexStatus] = createSignal<Record<string, CodexStatus>>({});
+  const pollCodexStatus = async () => {
+    const ptys = deps.ptyBySession();
+    const ids = threads()
+      .filter((t) => threadAgentKind(t.agent_command) === "codex" && ptys[t.session_id])
+      .map((t) => t.session_id);
+    if (ids.length === 0) return;
+    try {
+      const results = await invoke<CodexStatus[]>("thread_codex_status", { ids: ids.map((id) => ptys[id]) });
+      const byPty = new Map(results.map((r) => [r.id, r]));
+      setCodexStatus((prev) => {
+        const next = { ...prev };
+        for (const id of ids) {
+          const status = byPty.get(ptys[id]);
+          if (status) next[id] = status;
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error("[thread] codex status failed", err);
+    }
+  };
+
+  /** "working" | "idle" | "unknown" per thread, from hooks (Claude) or the rollout log (Codex). */
+  const agentStates = createMemo(() => {
+    const claude = deps.claudeState();
+    const codex = codexStatus();
+    const states: Record<string, string> = {};
+    for (const t of threads()) {
+      const id = t.session_id;
+      if (threadAgentKind(t.agent_command) === "codex") {
+        const status = codex[id];
+        if (status) states[id] = status.working ? "working" : status.alive ? "idle" : "unknown";
+      } else if (claude[id]) {
+        states[id] = claude[id];
+      }
+    }
+    return states;
+  });
 
   const upsertMessage = (message: ThreadMessage) => {
     setMessages((prev) => {
@@ -274,7 +350,10 @@ export function createThreadModel(deps: ThreadModelDeps) {
   };
 
   const resolveAgentSessionId = async (threadId: string): Promise<string | null> => {
-    const live = deps.agentSessionIdBySession()[threadId];
+    const live =
+      kindOf(threadId) === "codex"
+        ? codexStatus()[threadId]?.thread_id
+        : deps.agentSessionIdBySession()[threadId];
     if (live) return live;
     try {
       const session = await invoke<DbSession | null>("db_get_session", { id: threadId });
@@ -290,13 +369,13 @@ export function createThreadModel(deps: ThreadModelDeps) {
     await invoke("pty_write", { id: ptyId, data: `${command}\n` });
   };
 
-  const launchClaude = async (threadId: string, prompt: string, resumeId: string | null) => {
+  const launchAgent = async (threadId: string, prompt: string, resumeId: string | null) => {
     const files = await invoke<ThreadLaunchFiles>("thread_stage_launch", {
       sessionId: threadId,
       prompt,
       instructions: THREAD_INSTRUCTIONS,
     });
-    await writeCommand(threadId, buildThreadClaudeCommand(files, resumeId));
+    await writeCommand(threadId, buildThreadAgentCommand(files, resumeId));
   };
 
   // ----- Starting a thread -----
@@ -326,7 +405,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
     entry.awaitingWork = true;
     try {
       await deps.startSessionTerminal(id);
-      await launchClaude(id, agentTextForMessage(message), null);
+      await launchAgent(id, agentTextForMessage(message), null);
     } catch (err) {
       console.error("[thread] failed to launch thread terminal", err);
     }
@@ -367,7 +446,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
         }
         await deps.startSessionTerminal(threadId);
         const resumeId = await resolveAgentSessionId(threadId);
-        await launchClaude(threadId, wrapButterMessage(combined), resumeId);
+        await launchAgent(threadId, wrapButterMessage(combined), resumeId);
         entry.lastLaunchAt = Date.now();
         entry.awaitingWork = true;
         entry.aliveSince = null;
@@ -376,7 +455,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
       }
 
       if (now - entry.lastLaunchAt < LAUNCH_GRACE_MS) return;
-      const state = deps.claudeState()[threadId];
+      const state = agentStates()[threadId];
       if (state === "working") return;
       if (entry.awaitingWork && now - entry.lastLaunchAt < AWAIT_WORK_MS) return;
 
@@ -395,9 +474,9 @@ export function createThreadModel(deps: ThreadModelDeps) {
       } else {
         entry.aliveSince = null;
         if (now - entry.lastLaunchAt < CLAUDE_BOOT_GRACE_MS) return;
-        // Shell is alive but Claude exited: resume it with the message.
+        // Shell is alive but the agent exited: resume it with the message.
         const resumeId = await resolveAgentSessionId(threadId);
-        await launchClaude(threadId, wrapButterMessage(combined), resumeId);
+        await launchAgent(threadId, wrapButterMessage(combined), resumeId);
       }
       entry.lastLaunchAt = Date.now();
       entry.awaitingWork = true;
@@ -418,12 +497,18 @@ export function createThreadModel(deps: ThreadModelDeps) {
     if (!lastUser) return;
     const lastAgent = [...threadMessages].reverse().find((m) => m.role === "agent");
     if (lastAgent && lastAgent.created_at > lastUser.created_at) return;
-    const agentSessionId = await resolveAgentSessionId(threadId);
-    if (!agentSessionId) return;
     try {
-      const turn = await invoke<LastAssistantTurn | null>("cc_last_assistant_turn", {
-        agentSessionId,
-      });
+      let turn: LastAssistantTurn | null = null;
+      if (kindOf(threadId) === "codex") {
+        const status = codexStatus()[threadId];
+        if (status?.last_agent_message) {
+          turn = { text: status.last_agent_message, timestamp: status.completed_at };
+        }
+      } else {
+        const agentSessionId = await resolveAgentSessionId(threadId);
+        if (!agentSessionId) return;
+        turn = await invoke<LastAssistantTurn | null>("cc_last_assistant_turn", { agentSessionId });
+      }
       const text = turn?.text?.trim();
       if (!text) return;
       if (lastAgent && lastAgent.body.trim() === text) return;
@@ -441,9 +526,9 @@ export function createThreadModel(deps: ThreadModelDeps) {
     }
   };
 
-  // React to Claude activity transitions for thread sessions.
+  // React to agent activity transitions for thread sessions.
   createEffect(
-    on(deps.claudeState, (states) => {
+    on(agentStates, (states) => {
       for (const t of threads()) {
         const id = t.session_id;
         const prev = prevStates[id];
@@ -480,6 +565,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
         .map((m) => m.session_id)
     );
     for (const id of ids) void deliverQueued(id);
+    void pollCodexStatus();
   }, 2_000);
 
   let disposed = false;
@@ -537,7 +623,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
     );
   };
 
-  const isWorking = (threadId: string) => deps.claudeState()[threadId] === "working";
+  const isWorking = (threadId: string) => agentStates()[threadId] === "working";
 
   return {
     threads,
