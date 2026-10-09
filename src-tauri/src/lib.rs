@@ -2064,6 +2064,7 @@ pub fn run() {
             thread::thread_mark_viewed,
             thread::thread_agent_alive,
             thread::thread_stage_launch,
+            thread::thread_save_clipboard_image,
             app_flavor,
         ])
         .setup(|app| {

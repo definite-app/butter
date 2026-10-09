@@ -31,6 +31,8 @@ export interface ThreadMessage {
   source: "composer" | "cli" | "transcript" | null;
   status: ThreadMessageStatus | null;
   created_at: number;
+  /** Absolute paths of attached images, inside the thread's folder. */
+  attachments: string[];
 }
 
 export interface ThreadModelDeps {
@@ -56,7 +58,7 @@ export interface ThreadModelDeps {
 export const THREAD_TAG = "thread";
 
 const THREAD_INSTRUCTIONS =
-  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags.";
+  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; look at them with the Read tool.";
 
 // Pre-approve the reply command so the agent never blocks on a permission
 // prompt the user can't see. `--allowedTools` is variadic, so it must be
@@ -74,6 +76,12 @@ const AWAIT_WORK_MS = 20_000;
 const FALLBACK_DELAY_MS = 5_000;
 
 export const wrapButterMessage = (text: string) => `<butter_message>${text}</butter_message>`;
+
+/** What the agent receives for a message: its text plus one line per attached image. */
+export function agentTextForMessage(message: Pick<ThreadMessage, "body" | "attachments">): string {
+  const lines = message.attachments.map((path) => `[Image: ${path}]`);
+  return [message.body.trim(), ...lines].filter(Boolean).join("\n");
+}
 
 interface ThreadLaunchFiles {
   prompt_path: string | null;
@@ -230,7 +238,8 @@ export function createThreadModel(deps: ThreadModelDeps) {
     role: ThreadMessageRole,
     body: string,
     source: ThreadMessage["source"],
-    status: ThreadMessageStatus | null
+    status: ThreadMessageStatus | null,
+    attachments: string[] = []
   ) => {
     const message = await invoke<ThreadMessage>("thread_add_message", {
       sessionId: threadId,
@@ -238,6 +247,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
       body,
       source,
       status,
+      attachments,
     });
     upsertMessage(message);
     return message;
@@ -270,10 +280,10 @@ export function createThreadModel(deps: ThreadModelDeps) {
   };
 
   // ----- Starting a thread -----
-  const startThread = async (text: string) => {
+  const startThread = async (text: string, attachments: string[] = []) => {
     const body = text.trim();
-    if (!body) return null;
-    const title = threadTitleFromMessage(body);
+    if (!body && attachments.length === 0) return null;
+    const title = body ? threadTitleFromMessage(body) : "image";
     // Create the session without a stored command: if the app restarts, the
     // restored shell must not replay the first prompt as a new conversation.
     // Resume goes through the persisted agent snapshot instead.
@@ -282,13 +292,13 @@ export function createThreadModel(deps: ThreadModelDeps) {
     setThreads((prev) => [record, ...prev.filter((t) => t.session_id !== record.session_id)]);
     const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, title, sessionId);
     deps.tagSession(id, THREAD_TAG);
-    await addMessage(id, "user", body, "composer", "delivered");
+    const message = await addMessage(id, "user", body, "composer", "delivered", attachments);
     const entry = rt(id);
     entry.lastLaunchAt = Date.now();
     entry.awaitingWork = true;
     try {
       await deps.startSessionTerminal(id);
-      await launchClaude(id, body, null);
+      await launchClaude(id, agentTextForMessage(message), null);
     } catch (err) {
       console.error("[thread] failed to launch thread terminal", err);
     }
@@ -296,10 +306,10 @@ export function createThreadModel(deps: ThreadModelDeps) {
   };
 
   // ----- Follow-ups -----
-  const sendReply = async (threadId: string, text: string) => {
+  const sendReply = async (threadId: string, text: string, attachments: string[] = []) => {
     const body = text.trim();
-    if (!body) return;
-    await addMessage(threadId, "user", body, "composer", "queued");
+    if (!body && attachments.length === 0) return;
+    await addMessage(threadId, "user", body, "composer", "queued", attachments);
     void deliverQueued(threadId);
   };
 
@@ -314,7 +324,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
     try {
       const entry = rt(threadId);
       const now = Date.now();
-      const combined = queued.map((m) => m.body).join("\n\n");
+      const combined = queued.map(agentTextForMessage).join("\n\n");
       const session = deps.sessions.find((s) => s.id === threadId);
 
       if (!session || !deps.ptyBySession()[threadId]) {

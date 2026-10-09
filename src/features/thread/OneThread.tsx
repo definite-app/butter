@@ -1,5 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "../../app/context/AppContext";
+import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { ThreadMessage } from "./threadModel";
 import "./OneThread.css";
 
@@ -97,10 +99,62 @@ function Icon(props: { name: IconName; filled?: boolean }) {
   );
 }
 
+/** A local image file, loaded as a blob URL (the webview can't read file paths). */
+function LocalImage(props: { path: string; class?: string; onClick?: () => void }) {
+  const [src, setSrc] = createSignal<string | null>(null);
+  const [failed, setFailed] = createSignal(false);
+  createEffect(
+    on(
+      () => props.path,
+      (path) => {
+        let url: string | null = null;
+        let cancelled = false;
+        setSrc(null);
+        setFailed(false);
+        invoke<number[]>("read_file_binary", { path })
+          .then((bytes) => {
+            if (cancelled) return;
+            const type = inferImageMimeType(path) ?? "image/png";
+            url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type }));
+            setSrc(url);
+          })
+          .catch((err) => {
+            if (cancelled) return;
+            console.warn("[thread] failed to load image", path, err);
+            setFailed(true);
+          });
+        onCleanup(() => {
+          cancelled = true;
+          if (url) URL.revokeObjectURL(url);
+        });
+      }
+    )
+  );
+  return (
+    <Show
+      when={src()}
+      fallback={<div class={`${props.class ?? ""} ot-image-placeholder`}>{failed() ? "Image unavailable" : ""}</div>}
+    >
+      {(url) => (
+        <img
+          class={props.class}
+          src={url()}
+          alt=""
+          draggable={false}
+          onClick={() => props.onClick?.()}
+        />
+      )}
+    </Show>
+  );
+}
+
 export function OneThread() {
   const app = useAppContext();
   const model = app.thread;
   const [draft, setDraft] = createSignal("");
+  // Pasted images waiting to be sent, as paths in the pending attachments folder.
+  const [pendingImages, setPendingImages] = createSignal<string[]>([]);
+  const [pasteError, setPasteError] = createSignal<string | null>(null);
   const [sending, setSending] = createSignal(false);
   // Message id whose ⋯ menu is open.
   const [menuFor, setMenuFor] = createSignal<string | null>(null);
@@ -241,18 +295,23 @@ export function OneThread() {
     inputRef.style.height = `${Math.min(inputRef.scrollHeight, 140)}px`;
   };
 
+  const canSend = () => (draft().trim().length > 0 || pendingImages().length > 0) && !sending();
+
   const send = async () => {
     const text = draft().trim();
-    if (!text || sending()) return;
+    const images = pendingImages();
+    if (!canSend()) return;
     setSending(true);
     try {
       const target = focusedId() ?? replyTarget();
       if (target) {
-        await model.sendReply(target, text);
+        await model.sendReply(target, text, images);
       } else {
-        await model.startThread(text);
+        await model.startThread(text, images);
       }
       setDraft("");
+      setPendingImages([]);
+      setPasteError(null);
       model.setReplyTargetId(null);
       stickToBottom = true;
       requestAnimationFrame(resizeInput);
@@ -262,6 +321,31 @@ export function OneThread() {
       setSending(false);
       inputRef?.focus();
     }
+  };
+
+  // Images are saved from the native clipboard, like terminal paste, because
+  // the webview's clipboard data isn't reliable for screenshots.
+  const handlePaste = async (event: ClipboardEvent) => {
+    const data = event.clipboardData;
+    if (!data) return;
+    const hasImage =
+      Array.from(data.items).some((item) => item.type.startsWith("image/")) ||
+      Boolean(extractImageFromClipboard(data));
+    if (!hasImage) return;
+    event.preventDefault();
+    setPasteError(null);
+    try {
+      const path = await invoke<string>("thread_save_clipboard_image");
+      setPendingImages((prev) => [...prev, path]);
+    } catch (err) {
+      console.error("[thread] image paste failed", err);
+      setPasteError("Couldn't paste that image");
+    }
+  };
+
+  const removePendingImage = (path: string) => {
+    setPendingImages((prev) => prev.filter((p) => p !== path));
+    inputRef?.focus();
   };
 
   const openTerminal = async (threadId: string) => {
@@ -477,11 +561,28 @@ export function OneThread() {
                     return (
                       <div class={`ot-row ${m().role}`}>
                         <div class="ot-bubble-line">
-                          <div
-                            class={`ot-bubble ${m().role} ${m().source === "transcript" ? "transcript" : ""}`}
-                            title={m().source === "transcript" ? "From the session transcript" : undefined}
-                          >
-                            {m().body}
+                          <div class="ot-bubble-stack">
+                            <Show when={m().attachments?.length}>
+                              <div class="ot-bubble-images">
+                                <For each={m().attachments}>
+                                  {(path) => (
+                                    <LocalImage
+                                      path={path}
+                                      class="ot-bubble-image"
+                                      onClick={() => void app.openPathExternally(path)}
+                                    />
+                                  )}
+                                </For>
+                              </div>
+                            </Show>
+                            <Show when={m().body}>
+                              <div
+                                class={`ot-bubble ${m().role} ${m().source === "transcript" ? "transcript" : ""}`}
+                                title={m().source === "transcript" ? "From the session transcript" : undefined}
+                              >
+                                {m().body}
+                              </div>
+                            </Show>
                           </div>
                           <div class={`ot-hover-actions ${menuFor() === m().id ? "open" : ""}`}>
                             <Show when={!focusedId()}>
@@ -514,10 +615,12 @@ export function OneThread() {
                             </button>
                             <Show when={menuFor() === m().id}>
                               <div class={`ot-menu ${menuUp() ? "up" : ""}`} role="menu">
-                                <button role="menuitem" onClick={fromMenu(() => void copyMessage(m().body))}>
-                                  <Icon name="copy" />
-                                  Copy message
-                                </button>
+                                <Show when={m().body}>
+                                  <button role="menuitem" onClick={fromMenu(() => void copyMessage(m().body))}>
+                                    <Icon name="copy" />
+                                    Copy message
+                                  </button>
+                                </Show>
                                 <Show when={!focusedId()}>
                                   <button role="menuitem" onClick={fromMenu(() => startReply(m().session_id))}>
                                     <Icon name="reply" />
@@ -591,6 +694,29 @@ export function OneThread() {
               </span>
             )}
           </Show>
+          <Show when={pendingImages().length > 0 || pasteError()}>
+            <div class="ot-attachments">
+              <For each={pendingImages()}>
+                {(path) => (
+                  <div class="ot-attachment">
+                    <LocalImage path={path} class="ot-attachment-image" />
+                    <button
+                      type="button"
+                      class="ot-attachment-remove"
+                      onClick={() => removePendingImage(path)}
+                      aria-label="Remove image"
+                      title="Remove image"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+              </For>
+              <Show when={pasteError()}>
+                {(error) => <span class="ot-attachment-error">{error()}</span>}
+              </Show>
+            </div>
+          </Show>
           <textarea
             ref={inputRef}
             class="ot-input"
@@ -601,6 +727,7 @@ export function OneThread() {
               setDraft(e.currentTarget.value);
               resizeInput();
             }}
+            onPaste={(e) => void handlePaste(e)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.isComposing) {
                 e.preventDefault();
@@ -611,7 +738,7 @@ export function OneThread() {
           <button
             type="submit"
             class="ot-send"
-            disabled={!draft().trim() || sending()}
+            disabled={!canSend()}
             aria-label="Send"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

@@ -915,6 +915,8 @@ impl AgentDatabase {
             "#,
         )
         .map_err(|e| format!("Failed to initialize thread schema: {}", e))?;
+        // Added after the first 1thread build; fails harmlessly once the column exists.
+        let _ = conn.execute("ALTER TABLE thread_messages ADD COLUMN attachments TEXT", []);
 
         if let Err(err) = conn.execute_batch(
             r#"

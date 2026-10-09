@@ -770,7 +770,7 @@ async fn thread_reply(
         Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a 1thread session"),
         Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
-    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None) {
+    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None, &[]) {
         Ok(message) => {
             let _ = state
                 .browser
