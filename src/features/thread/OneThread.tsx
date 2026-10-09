@@ -258,9 +258,9 @@ export function OneThread() {
           <Show
             when={focused()}
             fallback={
-              <div class="ot-brand">
-                <span class="ot-mark">1</span>
-                <span class="ot-title">One Thread</span>
+              <div class="ot-brand" role="heading" aria-level="1" aria-label="1thread">
+                <span class="ot-mark" aria-hidden="true">1</span>
+                <span class="ot-title" aria-hidden="true">thread</span>
               </div>
             }
           >

@@ -104,9 +104,9 @@ butter-cli team channel set --name planning --display-name planning --descriptio
 - Mention-triggered agent runs should post replies in the original message thread.
 - `butter-browser` remains separate; use `butter-cli` for Team Mode communication only.
 
-## One Thread
+## 1thread
 
-If you were started from Butter's One Thread chat, the user only sees messages you send with `butter-cli thread reply`, never your terminal. The thread id is `$BUTTER_SESSION_ID`.
+If you were started from Butter's 1thread chat, the user only sees messages you send with `butter-cli thread reply`, never your terminal. The thread id is `$BUTTER_SESSION_ID`.
 
 ```bash
 butter-cli thread reply "Done. I fixed the login bug and pushed it to the fix-login branch."

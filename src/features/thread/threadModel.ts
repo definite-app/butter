@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { DbSession, TerminalPreset, WebSession } from "../../app/types";
 import { shellEscape } from "../../utils/shell";
 
-// ===== One Thread =====
+// ===== 1thread =====
 // A chat stream where each thread is a real Butter terminal session running
 // Claude Code. User messages are typed into the terminal; the agent answers by
 // running `butter-cli thread reply`, which arrives as a "thread-message" event.
@@ -56,7 +56,7 @@ export interface ThreadModelDeps {
 export const THREAD_TAG = "thread";
 
 const THREAD_INSTRUCTIONS =
-  "You were started from Butter's One Thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags.";
+  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags.";
 
 // Pre-approve the reply command so the agent never blocks on a permission
 // prompt the user can't see. `--allowedTools` is variadic, so it must be
@@ -96,7 +96,7 @@ export function buildThreadClaudeCommand(files: ThreadLaunchFiles, resumeId?: st
 }
 
 /**
- * Resume a thread's Claude with the One Thread instructions but no new message,
+ * Resume a thread's Claude with the 1thread instructions but no new message,
  * e.g. from the restore picker. Plain `claude --resume` would drop the
  * instructions, which aren't stored in the transcript.
  */

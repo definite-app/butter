@@ -2133,7 +2133,7 @@ export function useAppModel() {
       },
       {
         id: "open-thread-view",
-        label: "Open One Thread",
+        label: "Open 1thread",
         description: "Chat with Claude Code sessions in one message stream",
         action: () => setAppViewMode("thread"),
       },
@@ -4455,7 +4455,7 @@ export function useAppModel() {
       }
 
       // Load tags before the session mounts: its terminal's resume command
-      // depends on them (One Thread sessions resume with extra flags).
+      // depends on them (1thread sessions resume with extra flags).
       try {
         const tagsForSession = await invoke<string[]>("db_get_session_tags", { sessionId: id });
         setTerminalTags((prev) => ({ ...prev, [id]: tagsForSession }));
@@ -5017,7 +5017,7 @@ export function useAppModel() {
     if (resumeInfo && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       pendingAgentResume.delete(id);
-      // One Thread sessions resume with their reply instructions, which the
+      // 1thread sessions resume with their reply instructions, which the
       // transcript doesn't keep; everything else uses the plain resume.
       const isThread = resumeInfo.kind === "claude" && (terminalTags()[id] || []).includes(THREAD_TAG);
       const resumePtyId = ptyId;
@@ -5084,7 +5084,7 @@ export function useAppModel() {
   };
 
   // Hidden hosts let a session's xterm + PTY start while no terminal view is
-  // mounted (One Thread). The xterm element moves to the real host once the
+  // mounted (1thread). The xterm element moves to the real host once the
   // terminal view registers one; the buffer, and so the scrollback, carries over.
   const offscreenTerminalHosts = new Map<string, HTMLDivElement>();
   let offscreenTerminalContainer: HTMLDivElement | null = null;

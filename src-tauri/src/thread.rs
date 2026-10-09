@@ -1,4 +1,4 @@
-//! One Thread: an iMessage-style chat stream where every thread is backed by a
+//! 1thread: an iMessage-style chat stream where every thread is backed by a
 //! real Butter terminal session running Claude Code. The agent replies to the
 //! chat via `butter-cli thread reply`, which hits the HTTP server and lands here.
 //!

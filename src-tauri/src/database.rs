@@ -887,7 +887,7 @@ impl AgentDatabase {
             }
         }
 
-        // One Thread: chat threads backed by terminal sessions (timestamps in ms).
+        // 1thread: chat threads backed by terminal sessions (timestamps in ms).
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS threads (

@@ -66,7 +66,7 @@ pub async fn start_server(
         .route("/team/:id/users/set", post(team_user_set))
         .route("/team/:id/channels", get(team_channels))
         .route("/team/:id/channels/set", post(team_channel_set))
-        // One Thread CLI routes
+        // 1thread CLI routes
         .route("/thread/:id/reply", post(thread_reply))
         // Agent routes
         .route("/agents", get(list_agents))
@@ -767,7 +767,7 @@ async fn thread_reply(
     }
     match crate::thread::get_thread(&state.db, &id) {
         Ok(Some(_)) => {}
-        Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a One Thread session"),
+        Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a 1thread session"),
         Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
     match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None) {
