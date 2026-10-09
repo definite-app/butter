@@ -18,6 +18,9 @@ export interface ThreadRecord {
   created_at: number;
   last_activity_at: number;
   last_viewed_at: number | null;
+  preset_id: string | null;
+  preset_name: string | null;
+  agent_command: string | null;
 }
 
 export type ThreadMessageRole = "user" | "agent";
@@ -86,14 +89,31 @@ export function agentTextForMessage(message: Pick<ThreadMessage, "body" | "attac
 interface ThreadLaunchFiles {
   prompt_path: string | null;
   instructions_path: string;
+  agent_command: string | null;
+  attachments_dir: string;
+}
+
+/**
+ * The Claude command a preset runs, without any `${input}` placeholder, or
+ * null when the preset doesn't start Claude locally (Codex, ssh, plain shells),
+ * which 1thread can't drive yet.
+ */
+export function threadAgentCommandForPreset(preset: TerminalPreset): string | null {
+  const command = (preset.command ?? "")
+    .replace(/(["']?)\$\{input\}\1/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return /^claude(\s|$)/.test(command) ? command : null;
 }
 
 // The prompt and instructions are read from staged files so the typed command
 // stays well under the tty's canonical line limit (see thread_stage_launch).
 export function buildThreadClaudeCommand(files: ThreadLaunchFiles, resumeId?: string | null): string {
-  const parts = ["claude"];
+  const parts = [files.agent_command?.trim() || "claude"];
   if (resumeId) parts.push("--resume", shellEscape(resumeId));
   parts.push(
+    "--add-dir",
+    shellEscape(files.attachments_dir),
     "--allowedTools",
     shellEscape(THREAD_ALLOWED_TOOLS),
     "--append-system-prompt",
@@ -280,7 +300,8 @@ export function createThreadModel(deps: ThreadModelDeps) {
   };
 
   // ----- Starting a thread -----
-  const startThread = async (text: string, attachments: string[] = []) => {
+  /** Start a thread, in `preset`'s folder with its Claude flags when given. */
+  const startThread = async (text: string, attachments: string[] = [], preset: TerminalPreset | null = null) => {
     const body = text.trim();
     if (!body && attachments.length === 0) return null;
     const title = body ? threadTitleFromMessage(body) : "image";
@@ -288,7 +309,14 @@ export function createThreadModel(deps: ThreadModelDeps) {
     // restored shell must not replay the first prompt as a new conversation.
     // Resume goes through the persisted agent snapshot instead.
     const sessionId = crypto.randomUUID();
-    const record = await invoke<ThreadRecord>("thread_create", { sessionId, title });
+    const record = await invoke<ThreadRecord>("thread_create", {
+      sessionId,
+      title,
+      presetId: preset?.id ?? null,
+      presetName: preset?.name ?? null,
+      directory: preset?.directory ?? null,
+      agentCommand: preset ? threadAgentCommandForPreset(preset) : null,
+    });
     setThreads((prev) => [record, ...prev.filter((t) => t.session_id !== record.session_id)]);
     const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, title, sessionId);
     deps.tagSession(id, THREAD_TAG);

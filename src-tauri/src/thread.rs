@@ -16,8 +16,7 @@ use tauri::State;
 /// Event emitted to the webview when an agent reply arrives over HTTP.
 pub const THREAD_MESSAGE_EVENT: &str = "thread-message";
 
-const THREAD_COLUMNS: &str =
-    "session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at";
+const THREAD_COLUMNS: &str = "session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at, preset_id, preset_name, agent_command";
 const MESSAGE_COLUMNS: &str =
     "id, session_id, role, body, source, status, created_at, attachments";
 
@@ -30,6 +29,12 @@ pub struct ThreadRecord {
     pub created_at: i64,
     pub last_activity_at: i64,
     pub last_viewed_at: Option<i64>,
+    /// The Butter preset the thread was started from; None for the default.
+    pub preset_id: Option<String>,
+    pub preset_name: Option<String>,
+    /// The preset's Claude command (e.g. `claude --dangerously-skip-permissions`),
+    /// reused for every launch and resume of this thread. None means plain `claude`.
+    pub agent_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +77,9 @@ fn row_to_thread(row: &Row) -> rusqlite::Result<ThreadRecord> {
         created_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
         last_activity_at: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
         last_viewed_at: row.get(6)?,
+        preset_id: row.get(7)?,
+        preset_name: row.get(8)?,
+        agent_command: row.get(9)?,
     })
 }
 
@@ -184,19 +192,35 @@ pub fn add_message(
 pub fn thread_create(
     session_id: String,
     title: String,
+    preset_id: Option<String>,
+    preset_name: Option<String>,
+    directory: Option<String>,
+    agent_command: Option<String>,
     db: State<Arc<AgentDatabase>>,
 ) -> Result<ThreadRecord, String> {
     validate_thread_id(&session_id)?;
-    let dir = threads_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create threads dir: {e}"))?;
-    let cwd = dir.to_string_lossy().to_string();
+    let shared = threads_dir()?;
+    std::fs::create_dir_all(&shared).map_err(|e| format!("Failed to create threads dir: {e}"))?;
+    let cwd = match directory.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let expanded = crate::expand_path(dir);
+            if !std::path::Path::new(&expanded).is_dir() {
+                return Err(format!("Preset folder not found: {expanded}"));
+            }
+            expanded
+        }
+        None => shared.to_string_lossy().to_string(),
+    };
     let now = now_ms();
     db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO threads (session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4)
-             ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, cwd = excluded.cwd",
-            params![session_id, title, cwd, now],
+            "INSERT INTO threads (session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at,
+                                  preset_id, preset_name, agent_command)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, cwd = excluded.cwd,
+                 preset_id = excluded.preset_id, preset_name = excluded.preset_name,
+                 agent_command = excluded.agent_command",
+            params![session_id, title, cwd, now, preset_id, preset_name, agent_command],
         )
         .map_err(|e| format!("Failed to create thread: {e}"))?;
         get_thread_conn(conn, &session_id)?.ok_or_else(|| "Thread not found after insert".to_string())
@@ -389,6 +413,11 @@ pub struct ThreadLaunchFiles {
     /// None when resuming without a new message (e.g. from the restore picker).
     pub prompt_path: Option<String>,
     pub instructions_path: String,
+    /// The thread's base Claude command (see `ThreadRecord::agent_command`).
+    pub agent_command: Option<String>,
+    /// Where pasted images live; passed to Claude with `--add-dir` so a thread
+    /// running in a preset's folder can still read them.
+    pub attachments_dir: String,
 }
 
 /// Stage the prompt + system-prompt text in files so the command typed into the
@@ -400,9 +429,14 @@ pub fn thread_stage_launch(
     session_id: String,
     prompt: Option<String>,
     instructions: String,
+    db: State<Arc<AgentDatabase>>,
 ) -> Result<ThreadLaunchFiles, String> {
     // Staging files stay out of the agent's cwd.
     validate_thread_id(&session_id)?;
+    let agent_command = get_thread(&db, &session_id)?.and_then(|t| t.agent_command);
+    let attachments_dir = threads_dir()?.join("attachments");
+    std::fs::create_dir_all(&attachments_dir)
+        .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
     let dir = crate::paths::butter_home()?.join("thread-launch").join(&session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create launch dir: {e}"))?;
     let prompt_path = match prompt {
@@ -422,6 +456,8 @@ pub fn thread_stage_launch(
     Ok(ThreadLaunchFiles {
         prompt_path,
         instructions_path: instructions_path.to_string_lossy().to_string(),
+        agent_command,
+        attachments_dir: attachments_dir.to_string_lossy().to_string(),
     })
 }
 

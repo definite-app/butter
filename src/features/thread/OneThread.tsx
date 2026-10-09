@@ -2,6 +2,8 @@ import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, o
 import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
+import type { TerminalPreset } from "../../app/types";
+import { threadAgentCommandForPreset } from "./threadModel";
 import type { ThreadMessage } from "./threadModel";
 import "./OneThread.css";
 
@@ -51,7 +53,7 @@ function formatSeparator(at: number): string {
   return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
-type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open";
+type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron";
 
 // Inline stroke icons (16px, currentColor) for the bubble actions and menu.
 function Icon(props: { name: IconName; filled?: boolean }) {
@@ -88,6 +90,12 @@ function Icon(props: { name: IconName; filled?: boolean }) {
         <Match when={props.name === "terminal"}>
           <path d="m5 8 4 4-4 4" />
           <path d="M12 16h7" />
+        </Match>
+        <Match when={props.name === "check"}>
+          <path d="M20 6 9 17l-5-5" />
+        </Match>
+        <Match when={props.name === "chevron"}>
+          <path d="m18 15-6-6-6 6" />
         </Match>
         <Match when={props.name === "open"}>
           <path d="M14 4h6v6" />
@@ -155,6 +163,31 @@ export function OneThread() {
   // Pasted images waiting to be sent, as paths in the pending attachments folder.
   const [pendingImages, setPendingImages] = createSignal<string[]>([]);
   const [pasteError, setPasteError] = createSignal<string | null>(null);
+  // Which preset new threads start in; null is plain Claude Code in the
+  // shared threads folder. Remembered per viewer.
+  const PRESET_STORAGE_KEY = "butter.1thread.presetId";
+  const readStoredPresetId = () => {
+    try {
+      return localStorage.getItem(PRESET_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  };
+  const [presetId, setPresetId] = createSignal<string | null>(readStoredPresetId());
+  const [presetMenuOpen, setPresetMenuOpen] = createSignal(false);
+  const threadPresets = createMemo(() => app.presets().filter((p) => threadAgentCommandForPreset(p)));
+  const selectedPreset = () => threadPresets().find((p) => p.id === presetId()) ?? null;
+  const choosePreset = (preset: TerminalPreset | null) => {
+    setPresetId(preset?.id ?? null);
+    try {
+      if (preset) localStorage.setItem(PRESET_STORAGE_KEY, preset.id);
+      else localStorage.removeItem(PRESET_STORAGE_KEY);
+    } catch {
+      // Storage unavailable: the choice lasts for this session only.
+    }
+    setPresetMenuOpen(false);
+    inputRef?.focus();
+  };
   const [sending, setSending] = createSignal(false);
   // Message id whose ⋯ menu is open.
   const [menuFor, setMenuFor] = createSignal<string | null>(null);
@@ -307,7 +340,7 @@ export function OneThread() {
       if (target) {
         await model.sendReply(target, text, images);
       } else {
-        await model.startThread(text, images);
+        await model.startThread(text, images, selectedPreset());
       }
       setDraft("");
       setPendingImages([]);
@@ -377,8 +410,11 @@ export function OneThread() {
   };
 
   const closeMenuOnOutsideClick = (event: MouseEvent) => {
-    if (!menuFor()) return;
     const target = event.target as HTMLElement | null;
+    if (presetMenuOpen() && !target?.closest(".ot-preset-menu, .ot-target.picker")) {
+      setPresetMenuOpen(false);
+    }
+    if (!menuFor()) return;
     if (target?.closest(".ot-menu, .ot-more-btn")) return;
     setMenuFor(null);
   };
@@ -386,6 +422,12 @@ export function OneThread() {
   const handleKeyDown = (event: KeyboardEvent) => {
     if (app.showCommandPalette()) return;
     if (event.key === "Escape") {
+      if (presetMenuOpen()) {
+        event.preventDefault();
+        setPresetMenuOpen(false);
+        inputRef?.focus();
+        return;
+      }
       if (menuFor()) {
         event.preventDefault();
         setMenuFor(null);
@@ -451,6 +493,7 @@ export function OneThread() {
               <div class="ot-focus-title">
                 <div class="ot-focus-name">{thread().title}</div>
                 <div class={`ot-focus-status ${model.isWorking(thread().session_id) ? "working" : ""}`}>
+                  {thread().preset_name ? `${thread().preset_name} · ` : ""}
                   {model.isWorking(thread().session_id) ? "working…" : "idle"}
                 </div>
               </div>
@@ -678,7 +721,65 @@ export function OneThread() {
         >
           <Show
             when={!focused() && replyTarget()}
-            fallback={<span class="ot-target">Claude Code</span>}
+            fallback={
+              <Show
+                when={!focused()}
+                fallback={<span class="ot-target">{focused()?.preset_name ?? "Claude Code"}</span>}
+              >
+                <button
+                  type="button"
+                  class={`ot-target picker ${presetMenuOpen() ? "open" : ""}`}
+                  onClick={() => setPresetMenuOpen((open) => !open)}
+                  title="Where new threads start"
+                  aria-haspopup="listbox"
+                  aria-expanded={presetMenuOpen()}
+                >
+                  <span class="ot-target-label">{selectedPreset()?.name ?? "Claude Code"}</span>
+                  <Icon name="chevron" />
+                </button>
+                <Show when={presetMenuOpen()}>
+                  <div class="ot-preset-menu" role="listbox" aria-label="Start new threads in">
+                    <div class="ot-preset-heading">Start new threads in</div>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={!selectedPreset()}
+                      class="ot-preset-item"
+                      onClick={() => choosePreset(null)}
+                    >
+                      <span class="ot-preset-text">
+                        <span class="ot-preset-name">Claude Code</span>
+                        <span class="ot-preset-dir">1thread folder</span>
+                      </span>
+                      <Show when={!selectedPreset()}>
+                        <Icon name="check" />
+                      </Show>
+                    </button>
+                    <For each={threadPresets()}>
+                      {(preset) => (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={selectedPreset()?.id === preset.id}
+                          class="ot-preset-item"
+                          onClick={() => choosePreset(preset)}
+                        >
+                          <span class="ot-preset-text">
+                            <span class="ot-preset-name">{preset.name}</span>
+                            <span class="ot-preset-dir" title={preset.directory}>
+                              {(preset.directory || "~").replace(/^\/Users\/[^/]+(?=\/|$)/, "~")}
+                            </span>
+                          </span>
+                          <Show when={selectedPreset()?.id === preset.id}>
+                            <Icon name="check" />
+                          </Show>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </Show>
+            }
           >
             {(target) => (
               <span class="ot-target reply">

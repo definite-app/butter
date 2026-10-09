@@ -527,6 +527,7 @@
 }
 
 .ot-composer {
+  position: relative;
   flex-wrap: wrap;
 }
 
@@ -604,6 +605,112 @@
   max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+button.ot-target.picker {
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--text-sm);
+  gap: 3px;
+  padding: 0 8px 0 10px;
+}
+
+button.ot-target.picker:hover,
+button.ot-target.picker.open {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--text-primary);
+}
+
+button.ot-target.picker svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  opacity: 0.6;
+  transition: transform 0.12s ease;
+}
+
+button.ot-target.picker.open svg {
+  transform: rotate(180deg);
+}
+
+.ot-target-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ot-preset-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  width: 300px;
+  max-width: 100%;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-lg);
+}
+
+.ot-preset-heading {
+  padding: 6px 10px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ot-preset-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ot-preset-item:hover,
+.ot-preset-item:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+  outline: none;
+}
+
+.ot-preset-item svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--accent-primary);
+}
+
+.ot-preset-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.ot-preset-name {
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ot-preset-dir {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ot-target.reply {
