@@ -6,6 +6,7 @@ import { Sidebar } from "../features/sidebar/Sidebar";
 import { TerminalArea } from "../features/terminal/TerminalArea";
 import { CanvasView } from "../features/canvas/CanvasView";
 import { TeamMode } from "../features/team/TeamMode";
+import { OneThread } from "../features/thread/OneThread";
 import { FooterBar } from "../features/footer/FooterBar";
 import { CommandPalette } from "../features/overlays/CommandPalette";
 import { TerminalSwitcher } from "../features/overlays/TerminalSwitcher";
@@ -38,8 +39,9 @@ export function AppShell() {
   };
 
   onCleanup(() => clearTimeout(peekTimer));
-  const showAppSidebar = () => app.appView() !== "team" && !app.sidebarHidden() && !app.quickInputActive();
-  const showSidebarPeek = () => app.appView() !== "team" && app.sidebarHidden() && !app.quickInputActive();
+  const isFullscreenView = () => app.appView() === "team" || app.appView() === "thread";
+  const showAppSidebar = () => !isFullscreenView() && !app.sidebarHidden() && !app.quickInputActive();
+  const showSidebarPeek = () => !isFullscreenView() && app.sidebarHidden() && !app.quickInputActive();
 
   return (
     <div class="butter-web-shell">
@@ -97,6 +99,9 @@ export function AppShell() {
         <Switch>
           <Match when={app.appView() === "team"}>
             <TeamMode />
+          </Match>
+          <Match when={app.appView() === "thread"}>
+            <OneThread />
           </Match>
           <Match when={app.appView() === "canvas"}>
             <CanvasView />

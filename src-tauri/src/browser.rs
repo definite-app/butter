@@ -376,6 +376,10 @@ impl<R: Runtime> BrowserManager<R> {
         self.server_port.load(Ordering::Relaxed)
     }
 
+    pub fn app_handle(&self) -> &AppHandle<R> {
+        &self.app
+    }
+
     pub fn endpoint_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.server_port())
     }
@@ -1642,7 +1646,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1650,6 +1656,7 @@ Usage:
   butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
+  butter-cli thread reply <message>
   butter-cli help
 EOF
   else
@@ -1658,7 +1665,9 @@ Usage:
   butter-cli team send --channel <name> <message>
   butter-cli team send --to <username> <message>
   butter-cli team reply <message-id> <message>
-  butter-cli team inbox
+  butter-cli team inbox [--recent]
+  butter-cli team search <query>
+  butter-cli team search --advanced <query>
   butter-cli team read --channel <name>
   butter-cli team mark-read <message-id>
   butter-cli team mark-unread <message-id>
@@ -1666,6 +1675,7 @@ Usage:
   butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
+  butter-cli thread reply <message>
   butter-cli help
 EOF
   fi
@@ -1702,6 +1712,32 @@ case "$root" in
     usage 0
     ;;
   team)
+    ;;
+  thread)
+    need_env BUTTER_SESSION_ID
+    need_env BUTTER_TEAM_ENDPOINT
+    need_env BUTTER_TEAM_TOKEN
+    subcommand="${1:-}"
+    [ -n "$subcommand" ] || usage 1
+    shift || true
+    case "$subcommand" in
+      reply)
+        content="$(join_args "$@")"
+        if [ -z "$content" ] && [ ! -t 0 ]; then
+          content="$(cat)"
+        fi
+        [ -n "$content" ] || usage 1
+        curl -fsS -X POST \
+          --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
+          --data-urlencode "body=$content" \
+          "$BUTTER_TEAM_ENDPOINT/thread/$BUTTER_SESSION_ID/reply"
+        printf '\n'
+        exit 0
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
     ;;
   *)
     usage 1
@@ -1773,7 +1809,31 @@ case "$command" in
     post_form reply --data-urlencode "parent_message_id=$parent_id" --data-urlencode "content=$content"
     ;;
   inbox)
-    get_query inbox
+    case "${1:-}" in
+      "")
+        get_query inbox
+        ;;
+      --recent)
+        get_query inbox --data-urlencode "include_read=true"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    ;;
+  search)
+    advanced=""
+    if [ "${1:-}" = "--advanced" ]; then
+      advanced="true"
+      shift || true
+    fi
+    query="$(join_args "$@")"
+    [ -n "$query" ] || usage 1
+    if [ -n "$advanced" ]; then
+      get_query search --data-urlencode "q=$query" --data-urlencode "advanced=true"
+    else
+      get_query search --data-urlencode "q=$query"
+    fi
     ;;
   read)
     target_kind="${1:-}"

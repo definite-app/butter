@@ -39,12 +39,32 @@ butter-cli team reply <message-id> "I checked this and here is the result."
 
 Prefer `reply` when responding to a request. Team Mode uses Slack-style one-level threads, so agent replies to mentions should stay under the original message.
 
+## Search
+
+Search Team Mode messages:
+
+```bash
+butter-cli team search <query>
+```
+
+Use advanced trigram search for typo-tolerant nearest matches:
+
+```bash
+butter-cli team search --advanced <query>
+```
+
 ## Inbox
 
 List unread DMs, mentions, and thread replies:
 
 ```bash
 butter-cli team inbox
+```
+
+Review recent inbox items, including messages already marked read:
+
+```bash
+butter-cli team inbox --recent
 ```
 
 Mark a message read or unread:
@@ -83,3 +103,14 @@ butter-cli team channel set --name planning --display-name planning --descriptio
 - `cmd` is a template. Team Mode replaces `{user_msg}` with the triggering message before launching the agent.
 - Mention-triggered agent runs should post replies in the original message thread.
 - `butter-browser` remains separate; use `butter-cli` for Team Mode communication only.
+
+## One Thread
+
+If you were started from Butter's One Thread chat, the user only sees messages you send with `butter-cli thread reply`, never your terminal. The thread id is `$BUTTER_SESSION_ID`.
+
+```bash
+butter-cli thread reply "Done. I fixed the login bug and pushed it to the fix-login branch."
+echo "Need a decision: ship today or wait for review?" | butter-cli thread reply
+```
+
+Write like a text message: 1-3 short sentences, no code, logs, or markdown. Always reply before you stop. Follow-up messages from the user arrive wrapped in `<butter_message>` tags.

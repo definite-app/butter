@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::TcpListener;
+use tauri::Emitter;
 use std::sync::Arc;
 
 /// Shared state for the HTTP server
@@ -57,6 +58,7 @@ pub async fn start_server(
         .route("/team/:id/send", post(team_send))
         .route("/team/:id/reply", post(team_reply))
         .route("/team/:id/inbox", get(team_inbox))
+        .route("/team/:id/search", get(team_search))
         .route("/team/:id/read", post(team_read))
         .route("/team/:id/mark-read", post(team_mark_read))
         .route("/team/:id/mark-unread", post(team_mark_unread))
@@ -64,6 +66,8 @@ pub async fn start_server(
         .route("/team/:id/users/set", post(team_user_set))
         .route("/team/:id/channels", get(team_channels))
         .route("/team/:id/channels/set", post(team_channel_set))
+        // One Thread CLI routes
+        .route("/thread/:id/reply", post(thread_reply))
         // Agent routes
         .route("/agents", get(list_agents))
         .route("/agents/register", post(register_agent))
@@ -586,6 +590,25 @@ struct TeamReadForm {
 }
 
 #[derive(Deserialize)]
+struct TeamSearchQuery {
+    token: String,
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    advanced: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TeamInboxQuery {
+    token: String,
+    #[serde(default)]
+    include_read: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct TeamMessageIdForm {
     token: String,
     message_id: String,
@@ -632,6 +655,14 @@ fn team_author(actor_user_id: Option<String>) -> (String, Option<String>) {
     }) {
         Some(user_id) => ("agent".to_string(), Some(user_id)),
         None => ("human".to_string(), None),
+    }
+}
+
+fn team_message_error_status(error: &str) -> StatusCode {
+    if error.starts_with("message content is ") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -683,7 +714,7 @@ async fn team_send(
     };
     match state.db.create_team_message(&req) {
         Ok(message) => ok_json(message),
-        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => error_json(team_message_error_status(&err), err),
     }
 }
 
@@ -716,20 +747,76 @@ async fn team_reply(
     };
     match state.db.create_team_message(&req) {
         Ok(message) => ok_json(message),
-        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => error_json(team_message_error_status(&err), err),
+    }
+}
+
+#[derive(Deserialize)]
+struct ThreadReplyForm {
+    token: String,
+    body: String,
+}
+
+async fn thread_reply(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<ThreadReplyForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match crate::thread::get_thread(&state.db, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a One Thread session"),
+        Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None) {
+        Ok(message) => {
+            let _ = state
+                .browser
+                .app_handle()
+                .emit(crate::thread::THREAD_MESSAGE_EVENT, &message);
+            ok_json(message)
+        }
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
     }
 }
 
 async fn team_inbox(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<BrowserAuthQuery>,
+    Query(query): Query<TeamInboxQuery>,
 ) -> impl IntoResponse {
     if let Err(err) = state.browser.validate_token(&id, &query.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
     }
-    match state.db.get_team_inbox() {
+    match state
+        .db
+        .get_team_inbox(query.include_read.unwrap_or(false), query.limit)
+    {
         Ok(items) => ok_json(items),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn team_search(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<TeamSearchQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &query.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    if query.q.trim().is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "Expected search query");
+    }
+    let result = if query.advanced.unwrap_or(false) {
+        state.db.search_team_messages_advanced(&query.q, query.limit)
+    } else {
+        state.db.search_team_messages(&query.q, query.limit)
+    };
+    match result {
+        Ok(results) => ok_json(results),
         Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
