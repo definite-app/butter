@@ -295,7 +295,7 @@ pub fn thread_add_message(
 
 /// Pasted images wait here until their message is sent, because a new
 /// thread has no id until then.
-fn pending_attachments_dir() -> Result<PathBuf, String> {
+pub(crate) fn pending_attachments_dir() -> Result<PathBuf, String> {
     Ok(crate::paths::butter_home()?.join("thread-attachments-pending"))
 }
 

@@ -532,6 +532,8 @@
 }
 
 .ot-attachments {
+  /* Above the chip + input row, which stay on one line. */
+  order: -1;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -553,6 +555,36 @@
   object-fit: cover;
   display: block;
   background: rgba(255, 255, 255, 0.05);
+}
+
+.ot-attachment-edit {
+  position: relative;
+  display: block;
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.ot-attachment-edit-icon {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.ot-attachment-edit:hover .ot-attachment-edit-icon,
+.ot-attachment-edit:focus-visible .ot-attachment-edit-icon {
+  opacity: 1;
 }
 
 .ot-attachment-remove {

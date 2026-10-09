@@ -53,7 +53,7 @@ function formatSeparator(at: number): string {
   return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
-type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron";
+type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron" | "edit";
 
 // Inline stroke icons (16px, currentColor) for the bubble actions and menu.
 function Icon(props: { name: IconName; filled?: boolean }) {
@@ -91,6 +91,10 @@ function Icon(props: { name: IconName; filled?: boolean }) {
           <path d="m5 8 4 4-4 4" />
           <path d="M12 16h7" />
         </Match>
+        <Match when={props.name === "edit"}>
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+        </Match>
         <Match when={props.name === "check"}>
           <path d="M20 6 9 17l-5-5" />
         </Match>
@@ -108,13 +112,14 @@ function Icon(props: { name: IconName; filled?: boolean }) {
 }
 
 /** A local image file, loaded as a blob URL (the webview can't read file paths). */
-function LocalImage(props: { path: string; class?: string; onClick?: () => void }) {
+function LocalImage(props: { path: string; class?: string; version?: number; onClick?: () => void }) {
   const [src, setSrc] = createSignal<string | null>(null);
   const [failed, setFailed] = createSignal(false);
   createEffect(
     on(
-      () => props.path,
-      (path) => {
+      // `version` changes when the file is edited in place.
+      () => [props.path, props.version] as const,
+      ([path]) => {
         let url: string | null = null;
         let cancelled = false;
         setSrc(null);
@@ -163,6 +168,16 @@ export function OneThread() {
   // Pasted images waiting to be sent, as paths in the pending attachments folder.
   const [pendingImages, setPendingImages] = createSignal<string[]>([]);
   const [pasteError, setPasteError] = createSignal<string | null>(null);
+  // Bumped when the image editor closes, so edited thumbnails reload.
+  const [imageVersion, setImageVersion] = createSignal(0);
+  createEffect(
+    on(
+      () => app.imageEditorOpen(),
+      (open, wasOpen) => {
+        if (wasOpen && !open) setImageVersion((v) => v + 1);
+      }
+    )
+  );
   // Which preset new threads start in; null is plain Claude Code in the
   // shared threads folder. Remembered per viewer.
   const PRESET_STORAGE_KEY = "butter.1thread.presetId";
@@ -423,7 +438,7 @@ export function OneThread() {
   };
 
   const handleKeyDown = (event: KeyboardEvent) => {
-    if (app.showCommandPalette()) return;
+    if (app.showCommandPalette() || app.imageEditorOpen()) return;
     if (event.key === "Escape") {
       if (presetMenuOpen()) {
         event.preventDefault();
@@ -815,7 +830,18 @@ export function OneThread() {
               <For each={pendingImages()}>
                 {(path) => (
                   <div class="ot-attachment">
-                    <LocalImage path={path} class="ot-attachment-image" />
+                    <button
+                      type="button"
+                      class="ot-attachment-edit"
+                      onClick={() => app.openImageEditor(path, "Pasted image")}
+                      title="Draw or add text"
+                      aria-label="Edit image"
+                    >
+                      <LocalImage path={path} class="ot-attachment-image" version={imageVersion()} />
+                      <span class="ot-attachment-edit-icon" aria-hidden="true">
+                        <Icon name="edit" />
+                      </span>
+                    </button>
                     <button
                       type="button"
                       class="ot-attachment-remove"
