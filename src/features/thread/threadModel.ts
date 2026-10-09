@@ -76,7 +76,7 @@ const FALLBACK_DELAY_MS = 5_000;
 export const wrapButterMessage = (text: string) => `<butter_message>${text}</butter_message>`;
 
 interface ThreadLaunchFiles {
-  prompt_path: string;
+  prompt_path: string | null;
   instructions_path: string;
 }
 
@@ -89,10 +89,24 @@ export function buildThreadClaudeCommand(files: ThreadLaunchFiles, resumeId?: st
     "--allowedTools",
     shellEscape(THREAD_ALLOWED_TOOLS),
     "--append-system-prompt",
-    `"$(cat ${shellEscape(files.instructions_path)})"`,
-    `"$(cat ${shellEscape(files.prompt_path)})"`
+    `"$(cat ${shellEscape(files.instructions_path)})"`
   );
+  if (files.prompt_path) parts.push(`"$(cat ${shellEscape(files.prompt_path)})"`);
   return parts.join(" ");
+}
+
+/**
+ * Resume a thread's Claude with the One Thread instructions but no new message,
+ * e.g. from the restore picker. Plain `claude --resume` would drop the
+ * instructions, which aren't stored in the transcript.
+ */
+export async function buildThreadResumeCommand(threadId: string, resumeId: string | null): Promise<string> {
+  const files = await invoke<ThreadLaunchFiles>("thread_stage_launch", {
+    sessionId: threadId,
+    prompt: null,
+    instructions: THREAD_INSTRUCTIONS,
+  });
+  return buildThreadClaudeCommand(files, resumeId);
 }
 
 export function threadTitleFromMessage(text: string): string {

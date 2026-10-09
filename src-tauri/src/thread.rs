@@ -288,7 +288,8 @@ pub fn thread_mark_viewed(session_id: String, db: State<Arc<AgentDatabase>>) -> 
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadLaunchFiles {
-    pub prompt_path: String,
+    /// None when resuming without a new message (e.g. from the restore picker).
+    pub prompt_path: Option<String>,
     pub instructions_path: String,
 }
 
@@ -299,20 +300,26 @@ pub struct ThreadLaunchFiles {
 #[tauri::command]
 pub fn thread_stage_launch(
     session_id: String,
-    prompt: String,
+    prompt: Option<String>,
     instructions: String,
 ) -> Result<ThreadLaunchFiles, String> {
     // Reuse the thread dir validation, but keep staging files out of the agent's cwd.
     thread_dir(&session_id)?;
     let dir = crate::paths::butter_home()?.join("thread-launch").join(&session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create launch dir: {e}"))?;
-    let prompt_path = dir.join(format!("prompt-{}.txt", now_ms()));
+    let prompt_path = match prompt {
+        Some(prompt) => {
+            let path = dir.join(format!("prompt-{}.txt", now_ms()));
+            std::fs::write(&path, prompt).map_err(|e| format!("Failed to write prompt: {e}"))?;
+            Some(path.to_string_lossy().to_string())
+        }
+        None => None,
+    };
     let instructions_path = dir.join("instructions.txt");
-    std::fs::write(&prompt_path, prompt).map_err(|e| format!("Failed to write prompt: {e}"))?;
     std::fs::write(&instructions_path, instructions)
         .map_err(|e| format!("Failed to write instructions: {e}"))?;
     Ok(ThreadLaunchFiles {
-        prompt_path: prompt_path.to_string_lossy().to_string(),
+        prompt_path,
         instructions_path: instructions_path.to_string_lossy().to_string(),
     })
 }

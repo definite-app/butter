@@ -25,7 +25,7 @@ import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree"
 import { buildAgentResumeCommand } from "../utils/agentResume";
 import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
-import { createThreadModel } from "../features/thread/threadModel";
+import { buildThreadResumeCommand, createThreadModel, THREAD_TAG } from "../features/thread/threadModel";
 import type {
   AppView,
   AppConfig,
@@ -4454,6 +4454,15 @@ export function useAppModel() {
         return null;
       }
 
+      // Load tags before the session mounts: its terminal's resume command
+      // depends on them (One Thread sessions resume with extra flags).
+      try {
+        const tagsForSession = await invoke<string[]>("db_get_session_tags", { sessionId: id });
+        setTerminalTags((prev) => ({ ...prev, [id]: tagsForSession }));
+      } catch (err) {
+        console.error(`Failed to load tags for reopened session ${id}:`, err);
+      }
+
       queueAgentResumeOnReopen(dbSession);
       const session = mapDbSessionToWebSession(dbSession);
       const existingIndex = sessions.findIndex((entry) => entry.id === id);
@@ -4461,13 +4470,6 @@ export function useAppModel() {
         setSessions(sessions.length, session);
       } else {
         setSessions(existingIndex, session);
-      }
-
-      try {
-        const tagsForSession = await invoke<string[]>("db_get_session_tags", { sessionId: id });
-        setTerminalTags((prev) => ({ ...prev, [id]: tagsForSession }));
-      } catch (err) {
-        console.error(`Failed to load tags for reopened session ${id}:`, err);
       }
 
       selectSession(id);
@@ -5015,8 +5017,21 @@ export function useAppModel() {
     if (resumeInfo && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       pendingAgentResume.delete(id);
-      const resumeCmd = buildAgentResumeCommand(resumeInfo);
-      void invoke("pty_write", { id: ptyId, data: `${resumeCmd}\n` });
+      // One Thread sessions resume with their reply instructions, which the
+      // transcript doesn't keep; everything else uses the plain resume.
+      const isThread = resumeInfo.kind === "claude" && (terminalTags()[id] || []).includes(THREAD_TAG);
+      const resumePtyId = ptyId;
+      void (async () => {
+        let resumeCmd = buildAgentResumeCommand(resumeInfo);
+        if (isThread) {
+          try {
+            resumeCmd = await buildThreadResumeCommand(id, resumeInfo.agentSessionId ?? null);
+          } catch (err) {
+            console.warn("[thread] falling back to plain resume:", err);
+          }
+        }
+        await invoke("pty_write", { id: resumePtyId, data: `${resumeCmd}\n` });
+      })();
     } else if (command && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       void invoke("pty_write", { id: ptyId, data: `${command}\n` });
