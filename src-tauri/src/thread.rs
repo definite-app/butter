@@ -44,8 +44,8 @@ pub struct ThreadMessage {
     /// User messages only: "queued" | "delivered" | "seen"
     pub status: Option<String>,
     pub created_at: i64,
-    /// Absolute paths of images attached to the message, stored in the
-    /// thread's `attachments/` folder.
+    /// Absolute paths of images attached to the message, stored under
+    /// `threads/attachments/<thread id>/`.
     #[serde(default)]
     pub attachments: Vec<String>,
 }
@@ -101,8 +101,14 @@ fn get_thread_conn(conn: &Connection, session_id: &str) -> Result<Option<ThreadR
     .map_err(|e| format!("Failed to load thread: {e}"))
 }
 
-/// Scratch working directory for a thread: ~/.butter/threads/<session_id>/
-fn thread_dir(session_id: &str) -> Result<PathBuf, String> {
+/// The one working directory every thread's agent starts in: ~/.butter/threads.
+/// Sharing it means Claude's per-folder questions (trust, project MCP servers)
+/// come up once, not once per thread.
+fn threads_dir() -> Result<PathBuf, String> {
+    Ok(crate::paths::butter_home()?.join("threads"))
+}
+
+fn validate_thread_id(session_id: &str) -> Result<(), String> {
     if session_id.is_empty()
         || !session_id
             .chars()
@@ -110,7 +116,7 @@ fn thread_dir(session_id: &str) -> Result<PathBuf, String> {
     {
         return Err("Invalid thread id".to_string());
     }
-    Ok(crate::paths::butter_home()?.join("threads").join(session_id))
+    Ok(())
 }
 
 pub fn get_thread(db: &AgentDatabase, session_id: &str) -> Result<Option<ThreadRecord>, String> {
@@ -180,8 +186,9 @@ pub fn thread_create(
     title: String,
     db: State<Arc<AgentDatabase>>,
 ) -> Result<ThreadRecord, String> {
-    let dir = thread_dir(&session_id)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create thread dir: {e}"))?;
+    validate_thread_id(&session_id)?;
+    let dir = threads_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create threads dir: {e}"))?;
     let cwd = dir.to_string_lossy().to_string();
     let now = now_ms();
     db.with_conn(|conn| {
@@ -262,7 +269,7 @@ pub fn thread_add_message(
 }
 
 /// Pasted images wait here until their message is sent, because a new
-/// thread's folder doesn't exist until then.
+/// thread has no id until then.
 fn pending_attachments_dir() -> Result<PathBuf, String> {
     Ok(crate::paths::butter_home()?.join("thread-attachments-pending"))
 }
@@ -301,8 +308,8 @@ fn prune_pending_attachments(dir: &std::path::Path) {
     }
 }
 
-/// Move pasted images into the thread's folder so the agent can read them
-/// without leaving its working directory. Only files from the pending folder
+/// Move pasted images into threads/attachments/<id>/ so the agent can read
+/// them without leaving its working directory. Only files from the pending folder
 /// are accepted.
 fn adopt_pending_attachments(session_id: &str, paths: &[String]) -> Result<Vec<String>, String> {
     if paths.is_empty() {
@@ -310,7 +317,8 @@ fn adopt_pending_attachments(session_id: &str, paths: &[String]) -> Result<Vec<S
     }
     let pending = std::fs::canonicalize(pending_attachments_dir()?)
         .map_err(|e| format!("Attachments dir unavailable: {e}"))?;
-    let target_dir = thread_dir(session_id)?.join("attachments");
+    validate_thread_id(session_id)?;
+    let target_dir = threads_dir()?.join("attachments").join(session_id);
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| format!("Failed to create thread attachments dir: {e}"))?;
     let mut adopted = Vec::with_capacity(paths.len());
@@ -393,8 +401,8 @@ pub fn thread_stage_launch(
     prompt: Option<String>,
     instructions: String,
 ) -> Result<ThreadLaunchFiles, String> {
-    // Reuse the thread dir validation, but keep staging files out of the agent's cwd.
-    thread_dir(&session_id)?;
+    // Staging files stay out of the agent's cwd.
+    validate_thread_id(&session_id)?;
     let dir = crate::paths::butter_home()?.join("thread-launch").join(&session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create launch dir: {e}"))?;
     let prompt_path = match prompt {
@@ -419,10 +427,11 @@ pub fn thread_stage_launch(
 
 /// Claude Code asks "Do you trust this folder?" the first time it runs in a
 /// directory, which would stall every new thread on a prompt the user never
-/// sees. Outside a git repo Claude also accepts trust granted to a parent
-/// directory, so marking the threads folder trusted once covers every thread.
+/// sees. Marking the shared threads folder trusted once covers every thread
+/// (and threads created before it was shared, in subfolders, via Claude's
+/// parent-directory lookup).
 fn ensure_claude_trusts_threads() -> Result<(), String> {
-    let threads_dir = crate::paths::butter_home()?.join("threads");
+    let threads_dir = threads_dir()?;
     std::fs::create_dir_all(&threads_dir).map_err(|e| e.to_string())?;
     let key = threads_dir.to_string_lossy().to_string();
     let config_path = match std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -508,6 +517,6 @@ mod tests {
             add_message(&db, "t1", "user", "", None, None, &["/tmp/a.png".to_string()]).unwrap();
         assert_eq!(with_image.attachments, vec!["/tmp/a.png".to_string()]);
         assert!(get_thread(&db, "missing").unwrap().is_none());
-        assert!(thread_dir("../etc").is_err());
+        assert!(validate_thread_id("../etc").is_err());
     }
 }

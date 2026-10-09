@@ -31,7 +31,7 @@ export interface ThreadMessage {
   source: "composer" | "cli" | "transcript" | null;
   status: ThreadMessageStatus | null;
   created_at: number;
-  /** Absolute paths of attached images, inside the thread's folder. */
+  /** Absolute paths of attached images, under threads/attachments/<thread id>/. */
   attachments: string[];
 }
 
