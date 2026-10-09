@@ -49,11 +49,73 @@ function formatSeparator(at: number): string {
   return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
+type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open";
+
+// Inline stroke icons (16px, currentColor) for the bubble actions and menu.
+function Icon(props: { name: IconName; filled?: boolean }) {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <Switch>
+        <Match when={props.name === "reply"}>
+          <path d="M9 14 4 9l5-5" />
+          <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+        </Match>
+        <Match when={props.name === "pin"}>
+          <path d="M12 17v5" />
+          <path d="M9 3h6l-1 6 4 4H6l4-4-1-6z" fill={props.filled ? "currentColor" : "none"} />
+        </Match>
+        <Match when={props.name === "more"}>
+          <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+          <circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none" />
+        </Match>
+        <Match when={props.name === "copy"}>
+          <rect x="9" y="9" width="12" height="12" rx="2" />
+          <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+        </Match>
+        <Match when={props.name === "terminal"}>
+          <path d="m5 8 4 4-4 4" />
+          <path d="M12 16h7" />
+        </Match>
+        <Match when={props.name === "open"}>
+          <path d="M14 4h6v6" />
+          <path d="M20 4 11 13" />
+          <path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
+        </Match>
+      </Switch>
+    </svg>
+  );
+}
+
 export function OneThread() {
   const app = useAppContext();
   const model = app.thread;
   const [draft, setDraft] = createSignal("");
   const [sending, setSending] = createSignal(false);
+  // Message id whose ⋯ menu is open.
+  const [menuFor, setMenuFor] = createSignal<string | null>(null);
+  // Open the menu upward when there isn't room below it in the stream.
+  const [menuUp, setMenuUp] = createSignal(false);
+  const MENU_HEIGHT = 220;
+  const toggleMenu = (messageId: string, button: HTMLElement) => {
+    if (menuFor() === messageId) {
+      setMenuFor(null);
+      return;
+    }
+    const streamBottom = streamRef?.getBoundingClientRect().bottom ?? window.innerHeight;
+    setMenuUp(button.getBoundingClientRect().bottom + MENU_HEIGHT > streamBottom);
+    setMenuFor(messageId);
+  };
   let streamRef: HTMLDivElement | undefined;
   let inputRef: HTMLTextAreaElement | undefined;
   let stickToBottom = true;
@@ -216,9 +278,35 @@ export function OneThread() {
     inputRef?.focus();
   };
 
+  const copyMessage = async (body: string) => {
+    try {
+      await navigator.clipboard.writeText(body);
+    } catch (err) {
+      console.error("[thread] copy failed:", err);
+    }
+  };
+
+  // Run a menu action and close the menu.
+  const fromMenu = (action: () => void) => () => {
+    setMenuFor(null);
+    action();
+  };
+
+  const closeMenuOnOutsideClick = (event: MouseEvent) => {
+    if (!menuFor()) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".ot-menu, .ot-more-btn")) return;
+    setMenuFor(null);
+  };
+
   const handleKeyDown = (event: KeyboardEvent) => {
     if (app.showCommandPalette()) return;
     if (event.key === "Escape") {
+      if (menuFor()) {
+        event.preventDefault();
+        setMenuFor(null);
+        return;
+      }
       if (replyTarget()) {
         event.preventDefault();
         model.setReplyTargetId(null);
@@ -238,12 +326,16 @@ export function OneThread() {
 
   onMount(() => {
     window.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("mousedown", closeMenuOnOutsideClick);
     requestAnimationFrame(() => {
       scrollToBottom();
       inputRef?.focus();
     });
   });
-  onCleanup(() => window.removeEventListener("keydown", handleKeyDown));
+  onCleanup(() => {
+    window.removeEventListener("keydown", handleKeyDown);
+    document.removeEventListener("mousedown", closeMenuOnOutsideClick);
+  });
 
   const placeholder = () => {
     if (focused()) return `Message ${focused()?.title}`;
@@ -286,11 +378,13 @@ export function OneThread() {
             {(thread) => (
               <>
                 <button
-                  class={`ot-ghost-btn ${thread().pinned ? "active" : ""}`}
+                  class={`ot-ghost-btn ot-icon-btn ${thread().pinned ? "active" : ""}`}
                   onClick={() => void model.setPinned(thread().session_id, !thread().pinned)}
-                  title={thread().pinned ? "Unpin" : "Pin"}
+                  title={thread().pinned ? "Unpin thread" : "Pin thread"}
+                  aria-label={thread().pinned ? "Unpin thread" : "Pin thread"}
+                  aria-pressed={thread().pinned}
                 >
-                  {thread().pinned ? "Pinned" : "Pin"}
+                  <Icon name="pin" filled={thread().pinned} />
                 </button>
                 <button
                   class="ot-ghost-btn"
@@ -389,13 +483,65 @@ export function OneThread() {
                           >
                             {m().body}
                           </div>
-                          <div class="ot-hover-actions">
+                          <div class={`ot-hover-actions ${menuFor() === m().id ? "open" : ""}`}>
                             <Show when={!focusedId()}>
-                              <button onClick={() => startReply(m().session_id)}>Reply</button>
+                              <button
+                                onClick={() => startReply(m().session_id)}
+                                title="Reply in this thread"
+                                aria-label="Reply in this thread"
+                              >
+                                <Icon name="reply" />
+                              </button>
                             </Show>
-                            <button onClick={() => void model.setPinned(m().session_id, !pinned())}>
-                              {pinned() ? "Unpin" : "Pin"}
+                            <button
+                              class={pinned() ? "active" : ""}
+                              onClick={() => void model.setPinned(m().session_id, !pinned())}
+                              title={pinned() ? "Unpin thread" : "Pin thread"}
+                              aria-label={pinned() ? "Unpin thread" : "Pin thread"}
+                              aria-pressed={pinned()}
+                            >
+                              <Icon name="pin" filled={pinned()} />
                             </button>
+                            <button
+                              class="ot-more-btn"
+                              onClick={(e) => toggleMenu(m().id, e.currentTarget)}
+                              title="More"
+                              aria-label="More actions"
+                              aria-haspopup="menu"
+                              aria-expanded={menuFor() === m().id}
+                            >
+                              <Icon name="more" />
+                            </button>
+                            <Show when={menuFor() === m().id}>
+                              <div class={`ot-menu ${menuUp() ? "up" : ""}`} role="menu">
+                                <button role="menuitem" onClick={fromMenu(() => void copyMessage(m().body))}>
+                                  <Icon name="copy" />
+                                  Copy message
+                                </button>
+                                <Show when={!focusedId()}>
+                                  <button role="menuitem" onClick={fromMenu(() => startReply(m().session_id))}>
+                                    <Icon name="reply" />
+                                    Reply
+                                  </button>
+                                  <button role="menuitem" onClick={fromMenu(() => model.focusThread(m().session_id))}>
+                                    <Icon name="open" />
+                                    Open thread
+                                  </button>
+                                </Show>
+                                <button
+                                  role="menuitem"
+                                  onClick={fromMenu(() => void model.setPinned(m().session_id, !pinned()))}
+                                >
+                                  <Icon name="pin" filled={pinned()} />
+                                  {pinned() ? "Unpin thread" : "Pin thread"}
+                                </button>
+                                <div class="ot-menu-sep" role="separator" />
+                                <button role="menuitem" onClick={fromMenu(() => void openTerminal(m().session_id))}>
+                                  <Icon name="terminal" />
+                                  Open terminal
+                                </button>
+                              </div>
+                            </Show>
                           </div>
                         </div>
                         <Show when={it().receipt}>

@@ -302,31 +302,106 @@
 }
 
 .ot-hover-actions {
+  position: relative;
   display: flex;
+  align-items: center;
   gap: 2px;
   opacity: 0;
   transition: opacity 120ms ease;
   flex-shrink: 0;
 }
 
-.ot-bubble-line:hover .ot-hover-actions {
+.ot-bubble-line:hover .ot-hover-actions,
+.ot-hover-actions:focus-within,
+.ot-hover-actions.open {
   opacity: 1;
 }
 
-.ot-hover-actions button {
+.ot-hover-actions > button {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   background: transparent;
   color: var(--text-muted);
-  font: inherit;
-  font-size: var(--text-sm);
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
+  padding: 0;
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 
-.ot-hover-actions button:hover {
+.ot-hover-actions > button:hover,
+.ot-hover-actions.open > .ot-more-btn {
   background: var(--surface-hover);
   color: var(--text-primary);
+}
+
+.ot-hover-actions > button.active {
+  color: var(--accent-primary);
+}
+
+.ot-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ⋯ menu */
+.ot-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.ot-menu.up {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+.ot-row.user .ot-menu {
+  left: auto;
+  right: 0;
+}
+
+.ot-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-base);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ot-menu button svg {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.ot-menu button:hover {
+  background: var(--surface-selected);
+}
+
+.ot-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border-default);
 }
 
 .ot-receipt {
