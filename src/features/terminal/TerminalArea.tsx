@@ -2,6 +2,7 @@ import { For, Show, Suspense, createMemo, createSignal, lazy, onCleanup, onMount
 import type { JSX } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
 import { BrowserPane } from "../browser/BrowserPane";
+import { MarkdownViewToggle } from "../files/MarkdownViewToggle";
 import { HeaderActionMenu } from "./HeaderActionMenu";
 import { TerminalStack } from "./TerminalStack";
 
@@ -10,6 +11,10 @@ const MIN_BROWSER_PANEL_WIDTH = 360;
 const MIN_TERMINAL_COLUMN_WIDTH = 360;
 const BROWSER_RESIZER_WIDTH = 10;
 const BROWSER_PANEL_WIDTH_STORAGE_KEY = "butter.browser-pane-width";
+const ComposerDock = lazy(async () => {
+  const mod = await import("../composer/ComposerDock");
+  return { default: mod.ComposerDock };
+});
 const FileWorkspacePane = lazy(async () => {
   const mod = await import("../files/FileWorkspacePane");
   return { default: mod.FileWorkspacePane };
@@ -346,6 +351,7 @@ export function TerminalArea() {
               </Show>
             </div>
           </Show>
+          <MarkdownViewToggle />
           <HeaderActionMenu />
         </div>
       </div>
@@ -372,6 +378,21 @@ export function TerminalArea() {
             }
           >
             <TerminalStack />
+          </Show>
+          <Show
+            when={
+              app.activeWorkspaceTabKind() === "terminal" &&
+              !app.quickInputActive() &&
+              app.isComposerOpen(app.activeSessionId()) &&
+              app.activeSessionId()
+            }
+            keyed
+          >
+            {(sessionId) => (
+              <Suspense fallback={null}>
+                <ComposerDock sessionId={sessionId} />
+              </Suspense>
+            )}
           </Show>
         </div>
         <Show when={app.activeSessionId()} keyed>

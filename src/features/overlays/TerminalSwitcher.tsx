@@ -1,32 +1,34 @@
-import { For, Show, createMemo, createSignal, createEffect, onCleanup } from "solid-js";
+import { For, Show, createMemo, createSignal, createEffect, on, onCleanup } from "solid-js";
+import { homeDir } from "@tauri-apps/api/path";
 import { useAppContext } from "../../app/context/AppContext";
-import { renderMarkdownToSafeHtml } from "../../utils/markdown";
 
-const TRANSCRIPT_PREVIEW_CHARS = 2400;
+type FilterTab = "all" | "active" | "attention";
 
-type FilterTab = "all" | "active" | "attention" | "recent";
+type RowStatus = "active" | "attention" | "idle";
 
-interface TileData {
+type AgentKind = "claude" | "codex" | "shell";
+
+interface RowData {
   id: string;
   title: string;
   directory: string | null;
-  command: string | null;
-  tags: string[];
-  state: "working" | "idle" | "unknown";
+  status: RowStatus;
   seenAt: number | null;
-  previewLines: string[];
-  previewMarkdown: string | null;
-  previewSource: "transcript" | "scrollback" | "empty";
-  isActive: boolean;
-  agentKind: "claude" | "codex" | null;
-  agentSessionShort: string | null;
-  agentModel: string | null;
+  agentKind: AgentKind;
+  /** One line of plain text: last agent reply, else last terminal line. */
+  lastMessage: string | null;
+  /** Full plain text used for search only. */
+  searchText: string;
 }
 
-const TILE_PREVIEW_LINES = 5;
+const AGENT_META: Record<AgentKind, { mark: string; name: string }> = {
+  claude: { mark: "C", name: "Claude Code" },
+  codex: { mark: "Cx", name: "Codex" },
+  shell: { mark: "$", name: "Shell" },
+};
 
 function formatAgo(ms: number | null | undefined): string {
-  if (!ms) return "—";
+  if (!ms) return "";
   const diff = Math.max(0, Date.now() - ms);
   const s = Math.floor(diff / 1000);
   if (s < 5) return "just now";
@@ -34,19 +36,59 @@ function formatAgo(ms: number | null | undefined): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ${m % 60}m ago`;
+  if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   return `${d}d ago`;
 }
 
-function classifyPreviewLine(line: string): "error" | "success" | "muted" | "normal" {
-  const trimmed = line.trim();
-  if (!trimmed) return "muted";
-  if (/\b(error|fail|failed|denied|panic|fatal|❌|ECONN|EPERM|ENOENT)\b/i.test(trimmed))
-    return "error";
-  if (/\b(ok|success|passed|done|built|compiled|✓|✔|ready)\b/i.test(trimmed)) return "success";
-  if (/^[#>$]\s|^\s*\.{3,}\s*$|^\s*…\s*$/.test(trimmed)) return "muted";
-  return "normal";
+const ANSI_RE =
+  /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_RE, "");
+}
+
+/** Reduce one markdown line to plain text. Returns "" for structural-only lines. */
+function markdownLineToPlain(line: string): string {
+  let t = line.trim();
+  if (!t) return "";
+  if (/^(```|~~~)/.test(t)) return ""; // code fences
+  if (/^([-*_]\s*){3,}$/.test(t)) return ""; // horizontal rules
+  if (/^\|?[\s:|-]+\|[\s:|-]*$/.test(t)) return ""; // table separator rows
+  t = t
+    .replace(/^#{1,6}\s+/, "") // headings
+    .replace(/^>\s?/, "") // blockquote
+    .replace(/^[-*+]\s+\[[ xX]\]\s+/, "") // task list items
+    .replace(/^[-*+]\s+/, "") // bullets
+    .replace(/^\d+[.)]\s+/, "") // ordered list
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // links
+    .replace(/`+([^`]*)`+/g, "$1") // inline code
+    .replace(/(\*\*|__)(.+?)\1/g, "$2") // bold
+    .replace(/(^|[^\w*])[*_]([^*_\s][^*_]*?)[*_](?=[^\w*]|$)/g, "$1$2") // italic
+    .replace(/~~(.+?)~~/g, "$1") // strike
+    .replace(/^\|\s*/, "")
+    .replace(/\s*\|$/, "")
+    .replace(/\s*\|\s*/g, "  ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return t;
+}
+
+function lastNonEmptyLine(lines: string[], transform: (line: string) => string): string | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const plain = transform(lines[i]);
+    if (plain) return plain;
+  }
+  return null;
+}
+
+function shortenHome(path: string | null, home: string | null): string {
+  if (!path) return "~";
+  const h = home ? home.replace(/\/+$/, "") : null;
+  if (h && (path === h || path.startsWith(`${h}/`))) return `~${path.slice(h.length)}`;
+  // Fallback before homeDir() resolves: standard macOS home layout.
+  return path.replace(/^\/Users\/[^/]+(?=\/|$)/, "~");
 }
 
 /**
@@ -57,7 +99,7 @@ function classifyPreviewLine(line: string): "error" | "success" | "muted" | "nor
  *     Any other state value ("unknown" or empty) means nothing is running.
  *  2. Command intent — if the user explicitly launched `claude` or `codex`,
  *     show that even when the process is currently between turns.
- *  3. Historical Claude session id — useful for tiles whose transcript is
+ *  3. Historical Claude session id — useful for rows whose transcript is
  *     still relevant after the agent exited.
  *
  * The signal-vs-truthiness distinction matters: claudeState/codexState are
@@ -86,150 +128,139 @@ function detectAgentKind(
 export function TerminalSwitcher() {
   const app = useAppContext();
   const [filter, setFilter] = createSignal<FilterTab>("all");
+  const [home, setHome] = createSignal<string | null>(null);
   let inputRef: HTMLInputElement | undefined;
+  let bodyRef: HTMLDivElement | undefined;
 
-  // Focus input + reset state + refresh agent transcripts whenever the switcher opens
-  createEffect(() => {
-    if (app.showCommandPalette() && app.commandPaletteMode() === "switcher") {
+  void homeDir()
+    .then((h) => setHome(h))
+    .catch(() => undefined);
+
+  const isOpen = () => app.showCommandPalette() && app.commandPaletteMode() === "switcher";
+
+  // Focus input + reset state + refresh agent transcripts when the switcher opens.
+  // Track ONLY isOpen: refreshLastAgentTurnsForActiveSessions() reads codexState()
+  // and agentSessionIdBySession() synchronously, and those update about every
+  // second, which re-ran this reset while open (selection jumped back to the top,
+  // the search box and filter were cleared).
+  createEffect(
+    on(isOpen, (open) => {
+      if (!open) return;
       requestAnimationFrame(() => inputRef?.focus());
       app.setCommandQuery("");
       app.setSwitcherIndex(0);
       setFilter("all");
       void app.refreshLastAgentTurnsForActiveSessions();
-    }
-  });
+    })
+  );
 
-  // Force re-evaluation of timestamps every second while open
-  const [, setTick] = createSignal(0);
+  // Force re-evaluation of relative timestamps while open
+  const [tick, setTick] = createSignal(0);
   createEffect(() => {
-    if (!app.showCommandPalette() || app.commandPaletteMode() !== "switcher") return;
+    if (!isOpen()) return;
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     onCleanup(() => clearInterval(interval));
   });
 
-  const allTiles = createMemo<TileData[]>(() => {
+  const inboxSet = createMemo(() => new Set(app.inboxSessionIds()));
+
+  const allRows = createMemo<RowData[]>(() => {
     const tags = app.terminalTags();
     const seenAt = app.sessionSeenAt();
     const previews = app.sessionPreview();
     const claudeIds = app.agentSessionIdBySession();
     const codex = app.codexState();
-    const activeId = app.activeSessionId();
     const transcripts = app.lastAgentTurn();
     const claudeStates = app.claudeState();
+    const inbox = inboxSet();
     return app.sessions.map((s) => {
       const state = app.getSessionState(s.id);
-      const agentKind = detectAgentKind(
-        s.command,
-        claudeStates[s.id],
-        codex[s.id],
-        Boolean(claudeIds[s.id])
-      );
-      const fullAgentId = claudeIds[s.id] ?? null;
-      const agentSessionShort =
-        fullAgentId && fullAgentId.length > 0
-          ? fullAgentId.replace(/-/g, "").slice(-6)
-          : null;
+      const agentKind =
+        detectAgentKind(s.command, claudeStates[s.id], codex[s.id], Boolean(claudeIds[s.id])) ??
+        "shell";
 
-      const transcript = transcripts[s.id];
-      let previewLines: string[] = [];
-      let previewMarkdown: string | null = null;
-      let previewSource: TileData["previewSource"];
-      if (transcript && transcript.text.trim().length > 0) {
-        // Tail-cap by character count: marked needs whole markdown blocks to
-        // parse correctly, so we slice on chars (preserving block structure)
-        // rather than lines. CSS clips visually.
-        const text = transcript.text;
-        previewMarkdown =
-          text.length > TRANSCRIPT_PREVIEW_CHARS
-            ? text.slice(text.length - TRANSCRIPT_PREVIEW_CHARS)
-            : text;
-        previewSource = "transcript";
-      } else {
-        const tail = (previews[s.id] ?? []).slice(-TILE_PREVIEW_LINES);
-        previewLines = tail;
-        previewSource = tail.length > 0 ? "scrollback" : "empty";
+      const status: RowStatus =
+        state === "working" ? "active" : inbox.has(s.id) ? "attention" : "idle";
+
+      const transcriptText = transcripts[s.id]?.text ?? "";
+      const previewLines = (previews[s.id] ?? []).map(stripAnsi);
+      let lastMessage: string | null = null;
+      if (transcriptText.trim()) {
+        const plain = stripAnsi(transcriptText);
+        // Prefer prose: skip fenced code blocks, fall back to them if that is all there is.
+        const prose = plain.replace(/(```|~~~)[\s\S]*?(\1|$)/g, "\n");
+        lastMessage =
+          lastNonEmptyLine(prose.split(/\r?\n/), markdownLineToPlain) ??
+          lastNonEmptyLine(plain.split(/\r?\n/), markdownLineToPlain);
+      }
+      if (!lastMessage) {
+        lastMessage = lastNonEmptyLine(previewLines, (l) => l.replace(/\s+/g, " ").trim());
       }
 
+      const rowTags = tags[s.id] ?? [];
       return {
         id: s.id,
         title: s.title,
         directory: s.directory ?? null,
-        command: s.command ?? null,
-        tags: tags[s.id] ?? [],
-        state,
+        status,
         seenAt: seenAt[s.id] ?? s.createdAt,
-        previewLines,
-        previewMarkdown,
-        previewSource,
-        isActive: s.id === activeId,
         agentKind,
-        agentSessionShort,
-        agentModel: transcript?.model ?? null,
+        lastMessage,
+        searchText: [
+          s.title,
+          s.directory ?? "",
+          s.command ?? "",
+          rowTags.join(" "),
+          AGENT_META[agentKind].name,
+          transcriptText,
+          previewLines.join(" "),
+        ]
+          .join(" ")
+          .toLowerCase(),
       };
     });
   });
 
   const counts = createMemo(() => {
-    const tiles = allTiles();
-    const inbox = new Set(app.inboxSessionIds());
+    const rows = allRows();
     return {
-      all: tiles.length,
-      active: tiles.filter((t) => t.state === "working").length,
-      attention: tiles.filter((t) => inbox.has(t.id)).length,
-      recent: tiles.length,
+      all: rows.length,
+      active: rows.filter((r) => r.status === "active").length,
+      attention: rows.filter((r) => r.status === "attention").length,
     };
   });
 
-  const filteredByTab = createMemo<TileData[]>(() => {
+  // Visible order: needs-attention rows first, then everything else; both
+  // groups most-recent-activity first. Same order in every filter tab.
+  // Keyboard index and ⌘1–9 both index into this list.
+  const visibleRows = createMemo<RowData[]>(() => {
     const tab = filter();
-    const tiles = allTiles();
-    const inbox = new Set(app.inboxSessionIds());
-    switch (tab) {
-      case "active":
-        return tiles.filter((t) => t.state === "working");
-      case "attention":
-        return tiles.filter((t) => inbox.has(t.id));
-      case "recent":
-        return [...tiles].sort((a, b) => (b.seenAt ?? 0) - (a.seenAt ?? 0));
-      default:
-        return tiles;
+    const q = app.commandQuery().trim().toLowerCase();
+    const byRecent = (a: RowData, b: RowData) => (b.seenAt ?? 0) - (a.seenAt ?? 0);
+    const rows = allRows().filter((r) => {
+      if (tab === "active" && r.status !== "active") return false;
+      if (tab === "attention" && r.status !== "attention") return false;
+      return !q || r.searchText.includes(q);
+    });
+    const attention = rows.filter((r) => r.status === "attention").sort(byRecent);
+    const rest = rows.filter((r) => r.status !== "attention").sort(byRecent);
+    return [...attention, ...rest];
+  });
+
+  // Keep the selected index in range when the list shrinks.
+  createEffect(() => {
+    const len = visibleRows().length;
+    if (app.switcherIndex() > 0 && app.switcherIndex() >= len) {
+      app.setSwitcherIndex(Math.max(0, len - 1));
     }
   });
 
-  const searched = createMemo<TileData[]>(() => {
-    const q = app.commandQuery().trim().toLowerCase();
-    const tiles = filteredByTab();
-    if (!q) return tiles;
-    return tiles.filter((t) => {
-      const haystack = [
-        t.title,
-        t.directory ?? "",
-        t.command ?? "",
-        t.tags.join(" "),
-        t.previewLines.join(" "),
-        t.previewMarkdown ?? "",
-      ]
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(q);
-    });
-  });
-
-  // Partition into "Needs Attention" + "Recently Updated"
-  const sections = createMemo(() => {
-    const tiles = searched();
-    const inbox = new Set(app.inboxSessionIds());
-    const attention = tiles.filter((t) => inbox.has(t.id));
-    const other = tiles
-      .filter((t) => !inbox.has(t.id))
-      .sort((a, b) => (b.seenAt ?? 0) - (a.seenAt ?? 0));
-    return { attention, other };
-  });
-
-  // Flattened order for keyboard navigation
-  const flatOrder = createMemo<string[]>(() => {
-    const { attention, other } = sections();
-    return [...attention.map((t) => t.id), ...other.map((t) => t.id)];
+  // Keep the keyboard-selected row visible.
+  createEffect(() => {
+    const idx = app.switcherIndex();
+    if (!isOpen() || !bodyRef) return;
+    const el = bodyRef.querySelector<HTMLElement>(`[data-row-index="${idx}"]`);
+    el?.scrollIntoView({ block: "nearest" });
   });
 
   const close = () => {
@@ -238,11 +269,15 @@ export function TerminalSwitcher() {
   };
 
   const selectIdx = (idx: number) => {
-    const order = flatOrder();
-    const id = order[idx];
-    if (!id) return;
-    app.selectSession(id);
+    const row = visibleRows()[idx];
+    if (!row) return;
+    app.selectSession(row.id);
     close();
+  };
+
+  const setTab = (tab: FilterTab) => {
+    setFilter(tab);
+    app.setSwitcherIndex(0);
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -251,14 +286,14 @@ export function TerminalSwitcher() {
       close();
       return;
     }
-    const order = flatOrder();
-    if (order.length === 0) return;
+    const len = visibleRows().length;
+    if (len === 0) return;
 
     // Cmd+number jumps
     if (e.metaKey && /^[1-9]$/.test(e.key)) {
       e.preventDefault();
       const idx = parseInt(e.key, 10) - 1;
-      if (idx < order.length) selectIdx(idx);
+      if (idx < len) selectIdx(idx);
       return;
     }
 
@@ -267,63 +302,44 @@ export function TerminalSwitcher() {
       selectIdx(app.switcherIndex());
       return;
     }
-    if (e.key === "ArrowRight") {
-      e.preventDefault();
-      app.setSwitcherIndex((i) => Math.min(order.length - 1, i + 1));
-      return;
-    }
-    if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      app.setSwitcherIndex((i) => Math.max(0, i - 1));
-      return;
-    }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      const cols = currentColumns();
-      app.setSwitcherIndex((i) => Math.min(order.length - 1, i + cols));
+      app.setSwitcherIndex((i) => Math.min(len - 1, i + 1));
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
-      const cols = currentColumns();
-      app.setSwitcherIndex((i) => Math.max(0, i - cols));
+      app.setSwitcherIndex((i) => Math.max(0, i - 1));
       return;
     }
   };
 
-  // Cheap reactive lookup of how many columns the grid currently renders.
-  // We compute it off window width rather than measuring DOM each keystroke.
-  const currentColumns = () => {
-    const w = window.innerWidth;
-    if (w > 1700) return 5;
-    if (w > 1400) return 4;
-    if (w > 1100) return 3;
-    return 2;
-  };
-
   return (
-    <Show when={app.showCommandPalette() && app.commandPaletteMode() === "switcher"}>
+    <Show when={isOpen()}>
       <div class="switcher-overlay" onClick={close}>
         <div class="switcher-modal" onClick={(e) => e.stopPropagation()}>
-          {/* Header: search + keyboard hints */}
           <div class="switcher-header">
-            <div class="switcher-search">
+            <label class="switcher-search">
               <svg
                 class="switcher-search-icon"
-                width="14"
-                height="14"
+                width="18"
+                height="18"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
                 stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
               >
-                <circle cx="11" cy="11" r="8" />
-                <path d="m21 21-4.3-4.3" />
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
               </svg>
               <input
                 ref={(el) => (inputRef = el)}
                 class="switcher-search-input"
-                placeholder="Jump to a session, agent, tag, or command…"
+                aria-label="Search sessions"
+                placeholder="Jump to a session, agent or tag"
                 spellcheck={false}
                 value={app.commandQuery()}
                 onInput={(e) => {
@@ -332,158 +348,67 @@ export function TerminalSwitcher() {
                 }}
                 onKeyDown={onKeyDown}
               />
-            </div>
-            <div class="switcher-hints">
-              <span class="switcher-hint">
-                <kbd>↑</kbd>
-                <kbd>↓</kbd> Navigate
-              </span>
-              <span class="switcher-hint">
-                <kbd>⏎</kbd> Open
-              </span>
-              <span class="switcher-hint">
-                <kbd>⌘1–9</kbd> Jump
-              </span>
-              <span class="switcher-hint">
-                <kbd>⌘⇧K</kbd> Commands
-              </span>
-            </div>
-          </div>
+              <kbd class="switcher-kbd">esc</kbd>
+            </label>
 
-          {/* Filter tabs + sort controls */}
-          <div class="switcher-toolbar">
-            <div class="switcher-tabs">
-              <TabPill
-                label="All Sessions"
+            <div class="switcher-tabs" role="tablist">
+              <FilterPill
+                label="All"
                 count={counts().all}
                 active={filter() === "all"}
-                onClick={() => {
-                  setFilter("all");
-                  app.setSwitcherIndex(0);
-                }}
+                onClick={() => setTab("all")}
               />
-              <TabPill
+              <FilterPill
                 label="Active"
                 count={counts().active}
                 active={filter() === "active"}
-                tone="active"
-                onClick={() => {
-                  setFilter("active");
-                  app.setSwitcherIndex(0);
-                }}
+                onClick={() => setTab("active")}
               />
-              <TabPill
-                label="Needs Attention"
+              <FilterPill
+                label="Needs input"
                 count={counts().attention}
                 active={filter() === "attention"}
-                tone="attention"
-                onClick={() => {
-                  setFilter("attention");
-                  app.setSwitcherIndex(0);
-                }}
+                onClick={() => setTab("attention")}
               />
-              <TabPill
-                label="Recent"
-                count={counts().recent}
-                active={filter() === "recent"}
-                onClick={() => {
-                  setFilter("recent");
-                  app.setSwitcherIndex(0);
-                }}
-              />
-            </div>
-            <div class="switcher-controls">
-              <span class="switcher-meta">
-                {counts().all} sessions
-                <Show when={counts().active > 0}>
-                  <span class="switcher-meta-dim"> · {counts().active} active</span>
-                </Show>
-              </span>
             </div>
           </div>
 
-          {/* Grid sections */}
-          <div class="switcher-body">
-            <Show when={sections().attention.length > 0}>
-              <SwitcherSection
-                title="Needs Attention"
-                count={sections().attention.length}
-                tone="attention"
-              >
-                <For each={sections().attention}>
-                  {(tile) => (
-                    <SessionTile
-                      tile={tile}
-                      indexInFlat={flatOrder().indexOf(tile.id)}
-                      focusedIndex={app.switcherIndex()}
-                      onClick={() => {
-                        app.setSwitcherIndex(flatOrder().indexOf(tile.id));
-                        selectIdx(flatOrder().indexOf(tile.id));
-                      }}
-                      onHover={() =>
-                        app.setSwitcherIndex(flatOrder().indexOf(tile.id))
-                      }
-                    />
-                  )}
-                </For>
-              </SwitcherSection>
-            </Show>
+          <div class="switcher-body" ref={(el) => (bodyRef = el)}>
+            <For each={visibleRows()}>
+              {(row, index) => (
+                <SessionRow
+                  row={row}
+                  index={index()}
+                  selected={index() === app.switcherIndex()}
+                  home={home()}
+                  tick={tick()}
+                  onClick={() => selectIdx(index())}
+                />
+              )}
+            </For>
 
-            <Show when={sections().other.length > 0}>
-              <SwitcherSection
-                title={filter() === "recent" ? "Recently Updated" : "All Sessions"}
-                count={sections().other.length}
-              >
-                <For each={sections().other}>
-                  {(tile) => (
-                    <SessionTile
-                      tile={tile}
-                      indexInFlat={flatOrder().indexOf(tile.id)}
-                      focusedIndex={app.switcherIndex()}
-                      onClick={() => {
-                        app.setSwitcherIndex(flatOrder().indexOf(tile.id));
-                        selectIdx(flatOrder().indexOf(tile.id));
-                      }}
-                      onHover={() =>
-                        app.setSwitcherIndex(flatOrder().indexOf(tile.id))
-                      }
-                    />
-                  )}
-                </For>
-              </SwitcherSection>
-            </Show>
-
-            <Show when={flatOrder().length === 0}>
+            <Show when={visibleRows().length === 0}>
               <div class="switcher-empty">
-                <span>No sessions match "{app.commandQuery()}"</span>
+                <Show when={app.commandQuery().trim()} fallback={<span>No sessions</span>}>
+                  <span>No sessions match "{app.commandQuery()}"</span>
+                </Show>
               </div>
             </Show>
           </div>
 
-          {/* Footer */}
           <div class="switcher-footer">
-            <div class="switcher-footer-hints">
-              <kbd>↑</kbd>
-              <kbd>↓</kbd>
-              <kbd>←</kbd>
-              <kbd>→</kbd>
-              <span>navigate</span>
-              <span class="switcher-footer-sep">·</span>
-              <kbd>⏎</kbd>
-              <span>open</span>
-              <span class="switcher-footer-sep">·</span>
-              <kbd>esc</kbd>
-              <span>close</span>
-            </div>
-            <div class="switcher-footer-stats">
-              {counts().all} sessions
-              <Show when={counts().attention > 0}>
-                <span class="switcher-footer-attention">
-                  {" "}
-                  · {counts().attention} need attention
-                </span>
-              </Show>
-            </div>
+            <span class="switcher-footer-hint">
+              <kbd class="switcher-kbd">↑↓</kbd>navigate
+            </span>
+            <span class="switcher-footer-hint">
+              <kbd class="switcher-kbd">↵</kbd>open
+            </span>
+            <span class="switcher-footer-hint">
+              <kbd class="switcher-kbd">⌘1–9</kbd>jump
+            </span>
+            <span class="switcher-footer-hint">
+              <kbd class="switcher-kbd">⌘⇧K</kbd>commands
+            </span>
           </div>
         </div>
       </div>
@@ -491,196 +416,71 @@ export function TerminalSwitcher() {
   );
 }
 
-function TabPill(props: {
+function FilterPill(props: {
   label: string;
   count: number;
   active: boolean;
-  tone?: "active" | "attention";
   onClick: () => void;
 }) {
   return (
     <button
-      class={`switcher-tab ${props.active ? "active" : ""} ${
-        props.tone ? `tone-${props.tone}` : ""
-      }`}
+      type="button"
+      role="tab"
+      aria-selected={props.active}
+      class={`switcher-tab ${props.active ? "active" : ""}`}
       onClick={props.onClick}
     >
-      <span class="switcher-tab-label">{props.label}</span>
+      {props.label}
       <span class="switcher-tab-count">{props.count}</span>
     </button>
   );
 }
 
-function SwitcherSection(props: {
-  title: string;
-  count: number;
-  tone?: "attention";
-  children: any;
-}) {
-  return (
-    <div class="switcher-section">
-      <div class="switcher-section-header">
-        <Show when={props.tone === "attention"}>
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            class="switcher-section-icon attention"
-          >
-            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-            <line x1="12" y1="9" x2="12" y2="13" />
-            <line x1="12" y1="17" x2="12.01" y2="17" />
-          </svg>
-        </Show>
-        <span class="switcher-section-title">{props.title}</span>
-        <span class="switcher-section-count">{props.count}</span>
-      </div>
-      <div class="switcher-grid">{props.children}</div>
-    </div>
-  );
-}
-
-function SessionTile(props: {
-  tile: TileData;
-  indexInFlat: number;
-  focusedIndex: number;
+function SessionRow(props: {
+  row: RowData;
+  index: number;
+  selected: boolean;
+  home: string | null;
+  tick: number;
   onClick: () => void;
-  onHover: () => void;
 }) {
-  const focused = () => props.indexInFlat === props.focusedIndex;
-  const stateLabel = () => {
-    if (props.tile.state === "working") return "Active";
-    if (props.tile.state === "idle") return "Waiting";
-    return "Idle";
+  const agent = () => AGENT_META[props.row.agentKind];
+  const statusText = () => {
+    void props.tick; // re-evaluate relative time every second
+    if (props.row.status === "active") return "Working";
+    if (props.row.status === "attention") return "Needs input";
+    return formatAgo(props.row.seenAt);
   };
-  const stateTone = () => {
-    if (props.tile.state === "working") return "active";
-    if (props.tile.state === "idle") return "waiting";
-    return "idle";
-  };
-  const breadcrumb = () => {
-    const parts = props.tile.tags.slice(0, 3);
-    return parts.length > 0 ? parts.join(" · ") : "untagged";
-  };
+  const path = () => shortenHome(props.row.directory, props.home);
 
   return (
     <button
-      class={`switcher-tile tone-${stateTone()} ${focused() ? "focused" : ""} ${
-        props.tile.isActive ? "is-active-session" : ""
-      }`}
+      type="button"
+      class={`switcher-row status-${props.row.status} ${props.selected ? "selected" : ""}`}
+      data-row-index={props.index}
+      aria-pressed={props.selected}
       onClick={props.onClick}
-      onPointerEnter={props.onHover}
     >
-      {/* Top row: title + status pill */}
-      <div class="switcher-tile-top">
-        <span class="switcher-tile-title" title={props.tile.title}>
-          {props.tile.title}
+      <span class="switcher-row-title-cell">
+        <span class="switcher-row-dot" aria-hidden="true" />
+        <span class="switcher-row-title" title={props.row.title}>
+          {props.row.title}
         </span>
-        <span class={`switcher-tile-pill tone-${stateTone()}`}>
-          <span class="switcher-tile-pill-dot" />
-          {stateLabel()}
-        </span>
-      </div>
-
-      {/* Tag breadcrumb */}
-      <div class="switcher-tile-tags">{breadcrumb()}</div>
-
-      {/* Agent + model */}
-      <Show when={props.tile.agentKind}>
-        <div class="switcher-tile-agent">
-          <span
-            class={`switcher-tile-agent-avatar kind-${props.tile.agentKind}`}
-          >
-            {props.tile.agentKind === "claude" ? "C" : "Cx"}
-          </span>
-          <span class="switcher-tile-agent-name">
-            {props.tile.agentKind === "claude" ? "Claude Code" : "Codex"}
-            <Show when={props.tile.agentModel}>
-              <span class="switcher-tile-agent-sep"> · </span>
-              <span class="switcher-tile-agent-id">{props.tile.agentModel}</span>
-            </Show>
-            <Show when={props.tile.agentSessionShort}>
-              <span class="switcher-tile-agent-sep"> · </span>
-              <span class="switcher-tile-agent-id">
-                {props.tile.agentSessionShort}
-              </span>
-            </Show>
-          </span>
-        </div>
-      </Show>
-
-      {/* Directory */}
-      <Show when={props.tile.directory}>
-        <div class="switcher-tile-dir" title={props.tile.directory!}>
-          {props.tile.directory}
-        </div>
-      </Show>
-
-      {/* Command */}
-      <Show when={props.tile.command}>
-        <div class="switcher-tile-cmd" title={props.tile.command!}>
-          {props.tile.command}
-        </div>
-      </Show>
-
-      {/* Output preview — agent transcript when available, scrollback otherwise */}
-      <div class={`switcher-tile-preview source-${props.tile.previewSource}`}>
-        <div class="switcher-tile-preview-label">
-          {props.tile.previewSource === "transcript"
-            ? "Last reply"
-            : props.tile.previewSource === "scrollback"
-            ? "Terminal tail"
-            : ""}
-        </div>
-        <Show
-          when={props.tile.previewSource === "transcript" && props.tile.previewMarkdown}
-          fallback={
-            <div class="switcher-tile-preview-body">
-              <Show
-                when={props.tile.previewLines.length > 0}
-                fallback={
-                  <div class="switcher-tile-preview-empty">no recent output</div>
-                }
-              >
-                <For each={props.tile.previewLines}>
-                  {(line) => (
-                    <div
-                      class={`switcher-tile-preview-line line-${classifyPreviewLine(line)}`}
-                    >
-                      {line || " "}
-                    </div>
-                  )}
-                </For>
-              </Show>
-            </div>
-          }
-        >
-          <div
-            class="switcher-tile-preview-body switcher-tile-preview-markdown"
-            innerHTML={renderMarkdownToSafeHtml(props.tile.previewMarkdown!)}
-          />
-        </Show>
-      </div>
-
-      {/* Footer: updated time + sparkline stub + duration */}
-      <div class="switcher-tile-footer">
-        <span class={`switcher-tile-updated tone-${stateTone()}`}>
-          updated {formatAgo(props.tile.seenAt)}
-        </span>
-        <span class="switcher-tile-spark" aria-hidden="true">
-          {/* TODO: real bytes/sec sparkline once we sample pty output */}
-          <span style={{ height: "35%" }} />
-          <span style={{ height: "50%" }} />
-          <span style={{ height: "40%" }} />
-          <span style={{ height: "60%" }} />
-          <span style={{ height: "45%" }} />
-          <span style={{ height: "55%" }} />
-          <span style={{ height: "40%" }} />
-        </span>
-      </div>
+      </span>
+      <span class="switcher-row-agent">
+        <span class={`switcher-row-badge kind-${props.row.agentKind}`}>{agent().mark}</span>
+        {agent().name}
+      </span>
+      <span class="switcher-row-path" title={props.row.directory ?? undefined}>
+        {path()}
+      </span>
+      <span
+        class={`switcher-row-last ${props.row.lastMessage ? "" : "empty"}`}
+        title={props.row.lastMessage ?? undefined}
+      >
+        {props.row.lastMessage ?? "No output yet"}
+      </span>
+      <span class="switcher-row-status">{statusText()}</span>
     </button>
   );
 }

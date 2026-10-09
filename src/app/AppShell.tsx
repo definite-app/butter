@@ -1,6 +1,7 @@
 import "@xterm/xterm/css/xterm.css";
 import "../App.css";
-import { Match, Show, Switch, createSignal, onCleanup } from "solid-js";
+import { Match, Show, Switch, createSignal, onCleanup, onMount } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "./context/AppContext";
 import { Sidebar } from "../features/sidebar/Sidebar";
 import { TerminalArea } from "../features/terminal/TerminalArea";
@@ -22,6 +23,14 @@ import { ImageEditorModal } from "../features/overlays/ImageEditorModal";
 export function AppShell() {
   const app = useAppContext();
   const [sidebarPeeking, setSidebarPeeking] = createSignal(false);
+  // "Butter Dev" build flavor shows a DEV badge so it is never mistaken for
+  // the installed release app.
+  const [isDevFlavor, setIsDevFlavor] = createSignal(false);
+  onMount(() => {
+    invoke<string>("app_flavor")
+      .then((flavor) => setIsDevFlavor(flavor === "dev"))
+      .catch(() => setIsDevFlavor(false));
+  });
   let peekTimer: ReturnType<typeof setTimeout> | undefined;
 
   const startPeekTimer = () => {
@@ -122,6 +131,11 @@ export function AppShell() {
       <ScratchpadModal />
       <ImageEditorModal />
       <ConfirmModal />
+      <Show when={isDevFlavor()}>
+        <div class="butter-dev-badge" title="Butter Dev build (isolated data in ~/.butter-dev)">
+          DEV
+        </div>
+      </Show>
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import { Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
 import { extractImageFromClipboard } from "../../utils/clipboard";
 import { renderMarkdownToSafeHtml } from "../../utils/markdown";
 // Side-effect imports that register editor contributions (actions, widgets,
@@ -20,11 +21,7 @@ import "monaco-editor/esm/vs/editor/contrib/indentation/browser/indentation";
 import "monaco-editor/esm/vs/editor/contrib/cursorUndo/browser/cursorUndo";
 import "monaco-editor/esm/vs/editor/contrib/caretOperations/browser/caretOperations";
 import "monaco-editor/esm/vs/editor/contrib/bracketMatching/browser/bracketMatching";
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
-import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
-import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { ensureMonacoEnvironment } from "./monacoEnv";
 import "monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution";
 import "monaco-editor/esm/vs/basic-languages/go/go.contribution";
 import "monaco-editor/esm/vs/basic-languages/ini/ini.contribution";
@@ -39,28 +36,6 @@ import "monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution";
 import "monaco-editor/min/vs/editor/editor.main.css";
 import { useAppContext } from "../../app/context/AppContext";
 import type { WorkspaceFileTab, WorkspaceTextFileTab } from "../../app/types";
-
-let monacoConfigured = false;
-
-const ensureMonacoEnvironment = () => {
-  if (monacoConfigured) return;
-  const globalScope = globalThis as typeof globalThis & {
-    MonacoEnvironment?: {
-      getWorker(_: string, label: string): Worker;
-    };
-  };
-  globalScope.MonacoEnvironment = {
-    getWorker(_: string, label: string) {
-      if (label === "json") return new jsonWorker();
-      if (label === "css" || label === "scss" || label === "less") return new cssWorker();
-      if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
-      if (label === "typescript" || label === "javascript") return new tsWorker();
-      return new editorWorker();
-    },
-  };
-  monacoConfigured = true;
-};
-
 
 const languageIdForPath = (path: string) => {
   const lower = path.toLowerCase();
@@ -85,6 +60,39 @@ const languageIdForPath = (path: string) => {
 };
 
 const MD_IMAGE_LINK_RE = /!?\[[^\]]*\]\(([^)\s]+)\)/g;
+
+// Soft wrap is the default for every file tab. Long lines wrap at word
+// boundaries; Monaco falls back to breaking inside a token (e.g. a long URL)
+// when a single token is wider than the viewport, so there is no horizontal
+// scroll by default. Alt+Z (VS Code's binding) toggles it for the rest of the
+// app session. It is intentionally not persisted, so the default stays "on".
+let wordWrapEnabled = true;
+const wordWrapSetting = (): "on" | "off" => (wordWrapEnabled ? "on" : "off");
+
+const isExternalHref = (href: string) => /^(https?:|mailto:)/i.test(href);
+
+const resolveLocalHref = (href: string, fromFilePath: string): string | null => {
+  if (!href || href.startsWith("#")) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("file:")) return null;
+  let path = href.startsWith("file://") ? href.slice("file://".length) : href;
+  path = path.split("#")[0].split("?")[0];
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // keep raw path
+  }
+  if (!path) return null;
+  if (path.startsWith("/")) return path;
+  const baseDir = fromFilePath.slice(0, fromFilePath.lastIndexOf("/"));
+  const parts = `${baseDir}/${path}`.split("/");
+  const resolved: string[] = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") resolved.pop();
+    else resolved.push(part);
+  }
+  return `/${resolved.join("/")}`;
+};
 
 export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
   const app = useAppContext();
@@ -280,7 +288,8 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
       fontSize: 13,
-      wordWrap: "off",
+      wordWrap: wordWrapSetting(),
+      wrappingIndent: "same",
       renderWhitespace: "selection",
       readOnly: initialTab.loading,
     });
@@ -296,6 +305,11 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
       editor.setSelection(model.getFullModelRange());
     });
 
+    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.KeyZ, () => {
+      wordWrapEnabled = !wordWrapEnabled;
+      editor?.updateOptions({ wordWrap: wordWrapSetting() });
+    });
+
     app.registerFileTabFindHandler(initialTab.id, () => {
       editor?.focus();
       void editor?.getAction("actions.find")?.run();
@@ -305,6 +319,40 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
   });
 
   onCleanup(disposeEditor);
+
+  // Move focus with the view: the reading view gets focus so arrow keys and
+  // space scroll it; the editor gets it back when returning to source.
+  let previewRef: HTMLDivElement | undefined;
+  createEffect(() => {
+    const mode = markdownViewMode();
+    requestAnimationFrame(() => {
+      if (mode === "preview") previewRef?.focus({ preventScroll: true });
+      else editor?.focus();
+    });
+  });
+
+  // Links in the reading view must never navigate the app webview itself.
+  // Web links open in the default browser; local links open as Butter tabs.
+  const handlePreviewClick = (event: MouseEvent) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const anchor = target?.closest("a");
+    if (!anchor) return;
+    event.preventDefault();
+    const href = anchor.getAttribute("href") || "";
+    if (href.startsWith("#")) {
+      const id = decodeURIComponent(href.slice(1));
+      if (id) anchor.ownerDocument.getElementById(id)?.scrollIntoView({ block: "start" });
+      return;
+    }
+    if (isExternalHref(href)) {
+      void openExternalUrl(href).catch((err) =>
+        console.warn("[md-preview] failed to open link", href, err)
+      );
+      return;
+    }
+    const localPath = resolveLocalHref(href, props.tab.path);
+    if (localPath) void app.openFileInButter(localPath);
+  };
 
   // Tab switch: rebuild model when the underlying tab id changes.
   createEffect(() => {
@@ -365,7 +413,13 @@ export function FileWorkspacePane(props: { tab: WorkspaceFileTab }) {
             style={{ display: markdownViewMode() === "preview" ? "none" : "" }}
           />
           <Show when={isMarkdown() && markdownViewMode() === "preview"}>
-            <div class="butter-markdown-preview" data-butter-print-target="true">
+            <div
+              ref={(el) => (previewRef = el)}
+              class="butter-markdown-preview"
+              data-butter-print-target="true"
+              tabIndex={-1}
+              onClick={handlePreviewClick}
+            >
               <article class="butter-markdown-preview-content" innerHTML={renderedMarkdownHtml()} />
             </div>
           </Show>

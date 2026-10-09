@@ -18,7 +18,8 @@ import sys
 import time
 
 LOG_PATH = "/tmp/butter-codex-hook.log"
-DB_PATH = os.path.expanduser("~/.butter/agent.db")
+# Butter Dev shells export BUTTER_DB_PATH (~/.butter-dev/agent.db).
+DB_PATH = os.environ.get("BUTTER_DB_PATH") or os.path.expanduser("~/.butter/agent.db")
 SHELL_NAMES = {
     "bash",
     "zsh",

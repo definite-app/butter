@@ -101,8 +101,7 @@ fn thread_dir(session_id: &str) -> Result<PathBuf, String> {
     {
         return Err("Invalid thread id".to_string());
     }
-    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-    Ok(home.join(".butter").join("threads").join(session_id))
+    Ok(crate::paths::butter_home()?.join("threads").join(session_id))
 }
 
 pub fn get_thread(db: &AgentDatabase, session_id: &str) -> Result<Option<ThreadRecord>, String> {
@@ -305,8 +304,7 @@ pub fn thread_stage_launch(
 ) -> Result<ThreadLaunchFiles, String> {
     // Reuse the thread dir validation, but keep staging files out of the agent's cwd.
     thread_dir(&session_id)?;
-    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-    let dir = home.join(".butter").join("thread-launch").join(&session_id);
+    let dir = crate::paths::butter_home()?.join("thread-launch").join(&session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create launch dir: {e}"))?;
     let prompt_path = dir.join(format!("prompt-{}.txt", now_ms()));
     let instructions_path = dir.join("instructions.txt");

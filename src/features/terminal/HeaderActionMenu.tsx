@@ -121,6 +121,7 @@ export function HeaderActionMenu() {
         kind: "action",
         id: "preview",
         label: inPreview ? "Show source" : "Show preview",
+        shortcut: "⌥⌘P",
         active: inPreview,
         icon: inPreview ? EditIcon : EyeIcon,
         onSelect: () => app.toggleMarkdownViewMode(markdown.id),
@@ -165,6 +166,16 @@ export function HeaderActionMenu() {
             void app.openBrowserForSession(sessionId);
           }
         },
+      });
+      const composerOpen = app.isComposerOpen(sessionId);
+      items.push({
+        kind: "action",
+        id: "toggle-composer",
+        label: composerOpen ? "Hide composer" : "Compose",
+        shortcut: "⌘I",
+        active: composerOpen,
+        icon: EditIcon,
+        onSelect: () => app.toggleComposer(),
       });
       items.push({
         kind: "action",

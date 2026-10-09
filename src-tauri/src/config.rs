@@ -3,9 +3,11 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Get the config file path: ~/.config/butter/config.toml
+/// (~/.config/butter-dev/config.toml in the dev flavor).
 pub fn config_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".config").join("butter").join("config.toml")
+    crate::paths::butter_config_dir()
+        .expect("Could not find home directory")
+        .join("config.toml")
 }
 
 /// Main configuration structure
@@ -28,6 +30,68 @@ pub struct Config {
 
     #[serde(default)]
     pub tags: TagsConfig,
+
+    /// Optional TypeSafe (Jev) ranker for composer suggestions:
+    /// `[typesafe]` with `api_key`, `model`, `timeout_ms`, `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typesafe: Option<TypesafeConfig>,
+}
+
+/// `[typesafe]` section. `api_key` falls back to the `TYPESAFE_API_KEY`
+/// environment variable. Debug output redacts the key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TypesafeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    #[serde(default = "default_jev_model")]
+    pub model: String,
+
+    #[serde(default = "default_jev_timeout_ms")]
+    pub timeout_ms: u64,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
+
+fn default_jev_timeout_ms() -> u64 {
+    300
+}
+
+impl Default for TypesafeConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: default_jev_model(),
+            timeout_ms: default_jev_timeout_ms(),
+            enabled: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for TypesafeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypesafeConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl TypesafeConfig {
+    /// Copy without the secret, for handing config to the webview.
+    pub fn redacted(&self) -> Self {
+        Self {
+            api_key: None,
+            ..self.clone()
+        }
+    }
 }
 
 fn default_version() -> u32 {
@@ -307,6 +371,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             presets: PresetsConfig::default(),
             tags: TagsConfig::default(),
+            typesafe: None,
         }
     }
 }
@@ -354,4 +419,27 @@ pub fn save_config(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("Failed to write config file: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typesafe_section_roundtrips_and_redacts() {
+        let raw = "version = 1\n[typesafe]\napi_key = \"secret-value\"\ntimeout_ms = 450\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let ts = cfg.typesafe.clone().unwrap();
+        assert_eq!(ts.api_key.as_deref(), Some("secret-value"));
+        assert_eq!(ts.model, "jev-latest");
+        assert_eq!(ts.timeout_ms, 450);
+        assert!(ts.enabled);
+        assert!(!format!("{:?}", cfg).contains("secret-value"));
+        assert!(ts.redacted().api_key.is_none());
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        assert!(out.contains("[typesafe]"));
+        let none: Config = toml::from_str("version = 1\n").unwrap();
+        assert!(none.typesafe.is_none());
+        assert!(!toml::to_string_pretty(&none).unwrap().contains("typesafe"));
+    }
 }

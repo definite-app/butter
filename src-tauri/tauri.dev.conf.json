@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Butter Dev",
+  "identifier": "com.butter.app.dev",
+  "build": {
+    "features": ["dev-flavor"]
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Butter Dev",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "visible": true,
+        "center": true,
+        "maximized": true
+      }
+    ]
+  },
+  "bundle": {
+    "icon": [
+      "icons/dev/32x32.png",
+      "icons/dev/128x128.png",
+      "icons/dev/128x128@2x.png",
+      "icons/dev/icon.icns"
+    ]
+  }
+}

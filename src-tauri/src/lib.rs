@@ -2,11 +2,15 @@ mod agent_types;
 mod browser;
 mod cc_search;
 mod clipboard_history;
+mod codex_session;
+mod composer;
 mod config;
 mod database;
 mod http_server;
+mod paths;
 mod pty;
 mod thread;
+mod session_cli;
 
 use agent_types::*;
 use browser::{
@@ -14,7 +18,8 @@ use browser::{
     BrowserSessionState,
 };
 use database::{
-    AgentDatabase, ClipboardEntry, CreateSessionRequest, Session, SessionAgentUpdate,
+    AgentDatabase, ClipboardEntry, CreateSessionRequest, RestoreCandidate, Session,
+    SessionAgentUpdate,
     SessionScrollback, TeamAgentRun, TeamAgentRunInput, TeamAgentRunUpdate, TeamChannel,
     TeamChannelInput, TeamConversation, TeamInboxItem, TeamMessage, TeamMessageInput, TeamPin,
     TeamPinInput, TeamSearchResult, TeamUser, TeamUserInput, UpdateSessionRequest,
@@ -30,10 +35,11 @@ use std::sync::Arc;
 use tauri::{Manager, State, WebviewWindow};
 
 fn activity_log(msg: &str) {
+    let log_path = Path::new("/tmp").join(paths::flavored_name("butter-activity.log"));
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/butter-activity.log")
+        .open(log_path)
     {
         let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
     }
@@ -61,8 +67,18 @@ fn pty_cwd_by_id(manager: &PtyManager, id: &str) -> Result<String, String> {
     Err("Could not determine current working directory".to_string())
 }
 
+/// Agent API port range. The dev flavor uses its own range so it never takes
+/// 9876 (which docs and tools assume is the release app).
+fn agent_api_port_range() -> std::ops::RangeInclusive<u16> {
+    if paths::IS_DEV_FLAVOR {
+        19876..=19976
+    } else {
+        9876..=9976
+    }
+}
+
 fn bind_agent_api_listener() -> Result<TcpListener, String> {
-    for port in 9876..=9976 {
+    for port in agent_api_port_range() {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
@@ -295,22 +311,73 @@ struct AgentSessionActivity {
     session_id: Option<String>,
 }
 
+/// Clients that carry a terminal to another machine. A child of the shell whose
+/// command line mentions `claude` or `codex` but is one of these (for example
+/// `ssh -t box "tmux new -A -s x codex"`) runs the agent remotely: there is no
+/// local process, hook log or rollout to track, and a local
+/// `claude --resume` / `codex resume` would be wrong. Reopening such a terminal
+/// re-runs its command, which reattaches to the remote session instead.
+const REMOTE_TRANSPORTS: &[&str] = &[
+    "ssh",
+    "autossh",
+    "mosh",
+    "mosh-client",
+    "et",
+    "tailscale",
+    "aws",
+    "session-manager-plugin",
+];
+
+/// True if `comm` (a `ps -o comm=` value, path or bare name) is a remote
+/// transport rather than a local agent.
+fn is_remote_transport(comm: &str) -> bool {
+    let name = comm.trim().rsplit('/').next().unwrap_or("");
+    REMOTE_TRANSPORTS.contains(&name)
+}
+
+/// Check if a process whose command line mentions `needle` is running as a
+/// local child of the given shell PID. Remote transports (ssh and friends)
+/// whose arguments merely name the agent do not count.
+fn is_agent_child_running(shell_pid: u32, needle: &str) -> bool {
+    let Ok(out) = std::process::Command::new("pgrep")
+        .args(["-P", &shell_pid.to_string(), "-f", needle])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if pids.is_empty() {
+        return false;
+    }
+    let Ok(ps) = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pids.join(",")])
+        .output()
+    else {
+        // Cannot tell what the match is; keep the old behavior.
+        return true;
+    };
+    // Every match was a remote transport, or ps printed nothing because the
+    // process exited between the two calls: not a local agent either way.
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|comm| !is_remote_transport(comm))
+}
+
 /// Check if a `claude` process is running as a child of the given shell PID.
 fn is_claude_running(shell_pid: u32) -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-P", &shell_pid.to_string(), "-f", "claude"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    is_agent_child_running(shell_pid, "claude")
 }
 
 /// Check if a `codex` process is running as a child of the given shell PID.
 fn is_codex_running(shell_pid: u32) -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-P", &shell_pid.to_string(), "-f", "codex"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    is_agent_child_running(shell_pid, "codex")
 }
 
 static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -415,6 +482,18 @@ fn get_codex_activity(
                     let codex_alive = is_codex_running(pid);
                     activity_log(&format!("    codex pid={} alive={}", pid, codex_alive));
 
+                    // Hook events for this shell may come from an earlier
+                    // Claude run; without a live codex process they must not
+                    // mark the terminal as running Codex.
+                    if !codex_alive {
+                        activity_log(&format!("  codex pty={} => state=unknown", id));
+                        return ClaudeActivity {
+                            id,
+                            state: "unknown".to_string(),
+                            since: None,
+                        };
+                    }
+
                     match db.get_latest_hook_event_by_pid(pid) {
                         Ok(Some((event, ts))) => {
                             activity_log(&format!(
@@ -455,6 +534,41 @@ fn get_codex_activity(
 
             activity_log(&format!("  codex pty={} => state={}", id, state));
             ClaudeActivity { id, state, since }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct CodexThreadActivity {
+    /// PTY id.
+    id: String,
+    /// Codex conversation (thread) id the terminal's codex is writing.
+    thread_id: Option<String>,
+    /// Working directory of that codex process.
+    cwd: Option<String>,
+}
+
+/// For each PTY, the Codex conversation its running `codex` holds open (via
+/// Codex's per-thread writer lock). Exact per terminal, unlike cwd matching.
+#[tauri::command(async)]
+fn get_codex_threads(ids: Vec<String>, manager: State<'_, PtyManager>) -> Vec<CodexThreadActivity> {
+    let pids: Vec<(String, Option<u32>)> = ids
+        .into_iter()
+        .map(|id| {
+            let pid = manager.get_pid(&id).ok().flatten();
+            (id, pid)
+        })
+        .collect();
+    let shell_pids: Vec<u32> = pids.iter().filter_map(|(_, p)| *p).collect();
+    let threads = codex_session::resolve_codex_threads(&shell_pids);
+    pids.into_iter()
+        .map(|(id, pid)| {
+            let thread = pid.and_then(|p| threads.get(&p));
+            CodexThreadActivity {
+                id,
+                thread_id: thread.map(|t| t.thread_id.clone()),
+                cwd: thread.and_then(|t| t.cwd.clone()),
+            }
         })
         .collect()
 }
@@ -967,8 +1081,30 @@ fn db_list_sessions(db: State<Arc<AgentDatabase>>) -> Result<Vec<Session>, Strin
 }
 
 #[tauri::command]
+fn db_restore_candidates(db: State<Arc<AgentDatabase>>) -> Result<Vec<RestoreCandidate>, String> {
+    db.restore_candidates()
+}
+
+#[tauri::command]
+fn db_resolve_restore(
+    keep: Vec<String>,
+    retire: Vec<String>,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<(), String> {
+    db.resolve_restore(&keep, &retire)
+}
+
+#[tauri::command]
 fn db_get_session(id: String, db: State<Arc<AgentDatabase>>) -> Result<Option<Session>, String> {
     db.get_session(&id)
+}
+
+#[tauri::command]
+fn db_reopen_candidate(
+    id: String,
+    db: State<Arc<AgentDatabase>>,
+) -> Result<Option<Session>, String> {
+    db.reopen_candidate(&id)
 }
 
 #[tauri::command]
@@ -1046,11 +1182,17 @@ fn db_delete_scrollback(session_id: String, db: State<Arc<AgentDatabase>>) -> Re
 
 #[tauri::command]
 fn get_config() -> Result<config::Config, String> {
-    config::load_config()
+    // The webview never sees the TypeSafe key.
+    let mut cfg = config::load_config()?;
+    cfg.typesafe = cfg.typesafe.map(|t| t.redacted());
+    Ok(cfg)
 }
 
 #[tauri::command]
-fn save_config(config: config::Config) -> Result<(), String> {
+fn save_config(mut config: config::Config) -> Result<(), String> {
+    // The webview only has a redacted copy of `[typesafe]`; keep the section
+    // that is on disk so a save from the UI never drops the key.
+    config.typesafe = config::load_config().ok().and_then(|c| c.typesafe);
     config::save_config(&config)
 }
 
@@ -1596,8 +1738,7 @@ fn read_clipboard_types_native() -> Result<Vec<String>, String> {
 }
 
 fn butter_files_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home.join(".config").join("butter"))
+    paths::butter_config_dir()
 }
 
 fn paste_images_dir() -> Result<PathBuf, String> {
@@ -1708,6 +1849,12 @@ fn clipboard_history_compose(
     clipboard_history::compose(&app, db.inner(), &ids, &sep, include)
 }
 
+/// Build flavor ("release" or "dev") so the UI can show a DEV badge.
+#[tauri::command]
+fn app_flavor() -> &'static str {
+    paths::flavor()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1792,6 +1939,7 @@ pub fn run() {
             )
         })
         .invoke_handler(tauri::generate_handler![
+            session_cli::session_cli_pending,
             focus_manager_window,
             set_window_width,
             minimize_manager_window,
@@ -1816,6 +1964,7 @@ pub fn run() {
             browser_network_event,
             get_claude_activity,
             get_codex_activity,
+            get_codex_threads,
             get_agent_session_ids,
             get_agent_first_prompt_title,
             get_pty_cwd,
@@ -1832,6 +1981,7 @@ pub fn run() {
             db_create_session,
             db_update_session,
             db_set_session_agent,
+            db_reopen_candidate,
             db_get_app_state,
             db_set_app_state,
             team_list_users,
@@ -1856,6 +2006,8 @@ pub fn run() {
             team_save_pin,
             team_delete_pin,
             db_list_sessions,
+            db_restore_candidates,
+            db_resolve_restore,
             db_get_session,
             db_close_session,
             db_reopen_session,
@@ -1867,6 +2019,16 @@ pub fn run() {
             db_save_scrollback,
             db_get_scrollback,
             db_delete_scrollback,
+            // Composer dock
+            composer::composer_load_draft,
+            composer::composer_save_draft,
+            composer::composer_record_sent,
+            composer::composer_history,
+            composer::composer_list_actions,
+            composer::composer_jev_status,
+            composer::composer_jev_rank,
+            composer::dictation_available,
+            composer::dictation_hands_free,
             // Config commands
             get_config,
             save_config,
@@ -1902,13 +2064,19 @@ pub fn run() {
             thread::thread_mark_viewed,
             thread::thread_agent_alive,
             thread::thread_stage_launch,
+            app_flavor,
         ])
         .setup(|app| {
+            // Dev flavor: seed ~/.butter-dev from the release data on first
+            // launch (read-only on the release files). No-op in release.
+            paths::seed_dev_flavor_data();
+
             // Initialize the agent database
             let db = Arc::new(AgentDatabase::open().expect("Failed to initialize agent database"));
             app.manage(db.clone());
             clipboard_history::spawn_watcher(app.handle().clone(), db);
             app.manage(PtyManager::new(app.handle().clone()));
+            app.manage(session_cli::SessionCli::install().map_err(std::io::Error::other)?);
             app.manage(Arc::new(cc_search::CcSearch::default()));
             let browser_manager = Arc::new(BrowserManager::new(app.handle().clone()));
             let http_listener =
@@ -1947,24 +2115,56 @@ pub fn run() {
             {
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
-                let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
-                let app_handle = app.handle().clone();
+                // The dev flavor never registers Cmd+E so it cannot steal it
+                // from the release app running side by side.
+                if !paths::IS_DEV_FLAVOR {
+                    let shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::KeyE);
+                    let app_handle = app.handle().clone();
 
-                app.global_shortcut()
-                    .on_shortcut(shortcut, move |_app, _shortcut, _event| {
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                    // Non-fatal: if another app already holds Cmd+E, log and
+                    // keep starting instead of aborting setup.
+                    if let Err(err) = app.global_shortcut().on_shortcut(
+                        shortcut,
+                        move |_app, _shortcut, _event| {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                if window.is_visible().unwrap_or(false) {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
                             }
-                        }
-                    })?;
+                        },
+                    ) {
+                        eprintln!("Failed to register Cmd+E global shortcut: {}", err);
+                    }
+                }
             }
 
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod agent_detection_tests {
+    use super::is_remote_transport;
+
+    #[test]
+    fn remote_transports_are_not_local_agents() {
+        assert!(is_remote_transport("ssh"));
+        assert!(is_remote_transport("/usr/bin/ssh"));
+        assert!(is_remote_transport("/opt/homebrew/bin/mosh-client\n"));
+        assert!(is_remote_transport("/usr/local/bin/session-manager-plugin"));
+    }
+
+    #[test]
+    fn local_agents_are_not_remote_transports() {
+        assert!(!is_remote_transport("claude"));
+        assert!(!is_remote_transport("/Users/me/.local/bin/claude"));
+        assert!(!is_remote_transport("node"));
+        assert!(!is_remote_transport("/opt/homebrew/bin/codex"));
+        assert!(!is_remote_transport(""));
+    }
 }

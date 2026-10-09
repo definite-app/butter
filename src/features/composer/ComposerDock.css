@@ -1,0 +1,691 @@
+/* Composer dock (Cmd+I): bottom drawer inside the terminal pane.
+   Sizes/colors follow the "B · Composer dock" mockup. */
+
+.composer-dock {
+  --composer-bg: #1e1e21;
+  --composer-field: #19191b;
+  --composer-line: #2a2a2f;
+  --composer-line-strong: #2e2e33;
+  --composer-text: #e7e7ea;
+  --composer-text-2: #c9c9ce;
+  --composer-text-3: #9c9ca3;
+  --composer-text-4: #85858d;
+  --composer-mono: "Geist Mono", var(--font-mono);
+
+  position: relative;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--composer-bg);
+  border-top: 1px solid var(--composer-line-strong);
+  box-shadow: 0 -18px 40px rgba(0, 0, 0, 0.35);
+  color: var(--composer-text);
+  font-family: var(--font-sans);
+  z-index: 2;
+}
+
+.composer-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+/* System font: mono fonts lack ⌘ ⇧ ↵, and the fallback glyphs render tiny. */
+.composer-dock kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  color: #b4b4ba;
+}
+
+.composer-spacer {
+  flex-grow: 1;
+}
+
+.composer-handle {
+  height: 14px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.composer-handle span {
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: #3a3a40;
+  transition: background 0.15s ease;
+}
+
+.composer-handle:hover span {
+  background: #55555c;
+}
+
+/* ---- header ---- */
+
+.composer-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  flex-shrink: 0;
+  padding: 0 16px;
+  min-width: 0;
+}
+
+.composer-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 0;
+  background: transparent;
+  color: var(--composer-text-3);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.composer-tab.active {
+  background: #2a2a2f;
+  color: var(--composer-text);
+}
+
+.composer-tab:not(.active):hover {
+  background: #242428;
+}
+
+.composer-count {
+  font-family: var(--composer-mono);
+  font-size: 11.5px;
+  color: var(--composer-text-4);
+}
+
+.composer-listening {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 24px;
+  margin-left: 8px;
+  padding: 0 10px;
+  border-radius: 12px;
+  background: rgba(245, 215, 110, 0.12);
+  color: var(--accent-primary);
+  font-size: 12px;
+}
+
+.composer-listening .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  animation: composer-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes composer-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.composer-target {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--composer-text-4);
+}
+
+.composer-target b {
+  color: var(--composer-text-2);
+  font-weight: 600;
+}
+
+.composer-target-reset {
+  border: 0;
+  background: transparent;
+  color: var(--composer-text-3);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.composer-target-reset:hover {
+  background: #2a2a2f;
+  color: var(--composer-text);
+}
+
+.composer-enter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 14px;
+  flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--composer-text-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.composer-enter-toggle input {
+  accent-color: var(--accent-primary);
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+/* ---- body ---- */
+
+.composer-body {
+  position: relative;
+  flex-grow: 1;
+  min-height: 0;
+  display: flex;
+  margin: 6px 16px 0;
+}
+
+.composer-editor-frame {
+  position: relative;
+  flex-grow: 1;
+  min-height: 0;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 2px 4px 2px 16px;
+  border-radius: 10px;
+  background: var(--composer-field);
+  border: 1px solid var(--composer-line);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  cursor: text;
+}
+
+.composer-editor-frame.hidden {
+  visibility: hidden;
+  position: absolute;
+  inset: 0;
+}
+
+.composer-dock.dictating .composer-editor-frame {
+  border-color: rgba(245, 215, 110, 0.45);
+  box-shadow: 0 0 0 4px rgba(245, 215, 110, 0.06);
+}
+
+.composer-editor {
+  position: absolute;
+  inset: 2px 4px 2px 16px;
+}
+
+.composer-editor .monaco-editor,
+.composer-editor .monaco-editor .margin,
+.composer-editor .monaco-editor-background,
+.composer-editor .monaco-editor .inputarea.ime-input {
+  background-color: var(--composer-field) !important;
+}
+
+.composer-editor .monaco-editor {
+  --vscode-editor-foreground: var(--composer-text);
+  outline: none !important;
+}
+
+.composer-editor .monaco-editor .view-line {
+  color: var(--composer-text);
+}
+
+.composer-editor .monaco-editor .cursors-layer .cursor {
+  background-color: var(--accent-primary) !important;
+  border-color: var(--accent-primary) !important;
+}
+
+.composer-editor .monaco-editor .selected-text {
+  background-color: rgba(245, 215, 110, 0.18) !important;
+}
+
+/* Ghost completion from earlier drafts, with a "tab" hint after it. */
+.composer-editor .composer-ghost {
+  color: #5e5e66 !important;
+  font-style: normal;
+}
+
+.composer-editor .composer-ghost::after {
+  content: "tab";
+  margin-left: 10px;
+  padding: 0 5px;
+  font-family: "Geist Mono", var(--font-mono);
+  font-size: 11px;
+  color: #85858d;
+  border: 1px solid #33333a;
+  border-radius: 5px;
+}
+
+.composer-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  pointer-events: none;
+}
+
+.composer-mic {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: 1px solid #3a3a40;
+  background: #26262b;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.composer-mic:hover:not(:disabled) {
+  background: #2e2e33;
+  border-color: rgba(245, 215, 110, 0.45);
+}
+
+.composer-mic:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.composer-empty-text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  font-size: 14px;
+  color: var(--composer-text);
+}
+
+.composer-empty-text kbd {
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--composer-text);
+  border-color: #3a3a40;
+  background: #232327;
+}
+
+.composer-empty-text .sub {
+  font-size: 12.5px;
+  color: var(--composer-text-4);
+}
+
+.composer-history {
+  flex-grow: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--composer-field);
+  border: 1px solid var(--composer-line);
+}
+
+.composer-history-empty {
+  margin: auto;
+  font-size: 13px;
+  color: var(--composer-text-4);
+}
+
+.composer-history-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--composer-text-2);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.composer-history-row:hover {
+  background: #26262b;
+  color: var(--composer-text);
+}
+
+.composer-history-row .text {
+  flex-grow: 1;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+}
+
+.composer-history-row .when {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--composer-text-4);
+}
+
+/* ---- footer ---- */
+
+.composer-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 60px;
+  flex-shrink: 0;
+  padding: 0 16px;
+  min-width: 0;
+}
+
+.composer-attach,
+.composer-dictate {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 9px;
+  border: 1px dashed #3a3a40;
+  background: transparent;
+  color: var(--composer-text-3);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.composer-dictate {
+  border-style: solid;
+  border-color: #33333a;
+}
+
+.composer-attach:hover,
+.composer-dictate:hover:not(:disabled) {
+  color: var(--composer-text);
+  border-color: #4a4a52;
+}
+
+.composer-dictate:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.composer-dictate.on {
+  color: var(--accent-primary);
+  border-color: rgba(245, 215, 110, 0.45);
+}
+
+.composer-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 18px;
+}
+
+.composer-bars span {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent-primary);
+  animation: composer-bar 0.9s ease-in-out infinite alternate;
+}
+
+.composer-bars span:nth-child(2n) {
+  animation-delay: -0.3s;
+}
+
+.composer-bars span:nth-child(3n) {
+  animation-delay: -0.6s;
+}
+
+@keyframes composer-bar {
+  from {
+    transform: scaleY(0.4);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+.composer-status {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--composer-text-4);
+}
+
+.composer-insert,
+.composer-send {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 9px;
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.composer-insert {
+  border: 1px solid #33333a;
+  background: transparent;
+  color: var(--composer-text);
+}
+
+.composer-insert:hover:not(:disabled) {
+  background: #26262b;
+}
+
+.composer-send {
+  padding: 0 16px;
+  border: 0;
+  background: var(--accent-primary);
+  color: #1a1a1c;
+  font-weight: 600;
+}
+
+.composer-send kbd {
+  color: #3d3517;
+  background: rgba(26, 26, 28, 0.1);
+  border-color: rgba(26, 26, 28, 0.14);
+}
+
+.composer-send:hover:not(:disabled) {
+  background: var(--accent-primary-hover);
+}
+
+.composer-send:disabled {
+  background: #3a3527;
+  color: #8f8661;
+  cursor: default;
+}
+
+.composer-send:disabled kbd {
+  color: #6b6446;
+  background: rgba(0, 0, 0, 0.12);
+  border-color: rgba(0, 0, 0, 0.12);
+}
+
+.composer-insert:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ---- suggestions (Smart mockup) ---- */
+
+.composer-suggest {
+  position: fixed;
+  z-index: 60;
+  width: 560px;
+  max-width: calc(100vw - 16px);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  background: #242428;
+  border: 1px solid #36363c;
+  border-radius: 12px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+  font-family: var(--font-sans);
+  color: #e7e7ea;
+}
+
+.composer-suggest-section {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #85858d;
+}
+
+.composer-suggest-section:not(:first-child) {
+  padding-top: 10px;
+}
+
+.composer-suggest-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  flex-shrink: 0;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.composer-suggest-row.send {
+  height: 40px;
+}
+
+.composer-suggest-row.active {
+  background: #303036;
+}
+
+.composer-suggest-row .dot {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: #5a5a61;
+}
+
+.composer-suggest-row svg {
+  flex-shrink: 0;
+}
+
+.composer-suggest-row .label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13.5px;
+}
+
+.composer-suggest-row .label b {
+  font-weight: 600;
+}
+
+.composer-suggest-row .label.mono {
+  font-family: "Geist Mono", var(--font-mono);
+  font-size: 12.5px;
+}
+
+.composer-suggest-row .label.muted {
+  color: #c9c9ce;
+}
+
+.composer-suggest-row .hint {
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: #85858d;
+}
+
+.composer-suggest-row .hint.mono {
+  font-family: "Geist Mono", var(--font-mono);
+}
+
+.composer-suggest-row .badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: #c9c9ce;
+  background: #303036;
+}
+
+.composer-suggest-row .badge.claude {
+  color: #e8b89a;
+  background: rgba(217, 119, 87, 0.14);
+}
+
+.composer-suggest-row .badge.codex {
+  color: #a9c7f5;
+  background: rgba(96, 165, 250, 0.13);
+}
+
+.composer-suggest-footer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 34px;
+  padding: 0 10px;
+  margin-top: 4px;
+  border-top: 1px solid #33333a;
+  font-size: 12px;
+  color: #85858d;
+}
+
+.composer-suggest-footer kbd {
+  color: #9c9ca3;
+}

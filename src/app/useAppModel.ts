@@ -22,6 +22,8 @@ import { inferImageMimeType, extractImageFromClipboard } from "../utils/clipboar
 import { buildFooterCommand } from "../utils/shell";
 import { captureScrollback, getLastLinesFromBuffer } from "../utils/terminal";
 import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree";
+import { buildAgentResumeCommand } from "../utils/agentResume";
+import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import { createThreadModel } from "../features/thread/threadModel";
 import type {
@@ -43,6 +45,7 @@ import type {
   ConfigPreset,
   DbScrollback,
   DbSession,
+  RestoreCandidate,
   FileBrowserEntry,
   PasteQueueItem,
   RecordingClipboardEvent,
@@ -547,44 +550,86 @@ export function useAppModel() {
     { kind: AgentKind; agentSessionId: string | null; writtenAt: number }
   > = {};
   const codexIdCache: Record<string, string> = {};
+  // Terminals whose codexIdCache entry is exact: read from Codex's thread lock,
+  // or carried over from a trusted restore/reopen (seedCodexId).
+  const codexIdExact = new Set<string>();
   const isAgentLive = (state?: string) => state === "working" || state === "idle";
 
-  // Build the shell command that resumes (or relaunches) an agent. Prefers
-  // continuing the exact prior conversation by injecting a resume flag into the
-  // user's original launch command, so flags (e.g. --dangerously-skip-permissions)
-  // are preserved. Falls back to a fresh launch when no conversation id is known.
-  const buildAgentResumeCommand = (info: SessionAgentInfo): string => {
-    const original = info.command?.trim() ?? "";
-    if (info.kind === "claude") {
-      if (!info.agentSessionId) return original || "claude";
-      // Insert `--resume <id>` right after `claude`, keeping the user's flags.
-      const rest = /^claude(\s|$)/.test(original)
-        ? original.replace(/^claude\s*/, "")
-        : "";
-      return `claude --resume ${info.agentSessionId}${rest ? ` ${rest}` : ""}`;
+  // Codex conversation ids per terminal. Resolved from the running codex
+  // process's thread writer lock (exact per terminal); the cwd-based rollout
+  // scan is only a fallback for Codex builds without those locks.
+  const codexThreadCache: Record<string, { id: string; cwd: string | null; at: number }> = {};
+  const CODEX_THREAD_REFRESH_MS = 15_000;
+
+  async function resolveCodexThreads(
+    codexStates: Record<string, string>,
+    prevCodex: Record<string, string>
+  ): Promise<void> {
+    const nowMs = Date.now();
+    const ptys = ptyBySession();
+    const due = Object.keys(codexStates).filter((sid) => {
+      if (!isAgentLive(codexStates[sid]) || !ptys[sid]) return false;
+      const cached = codexThreadCache[sid];
+      const risingEdge = !isAgentLive(prevCodex[sid]);
+      return !cached || risingEdge || nowMs - cached.at > CODEX_THREAD_REFRESH_MS;
+    });
+    if (due.length === 0) return;
+    let results: { id: string; thread_id: string | null; cwd: string | null }[] = [];
+    try {
+      results = await invoke("get_codex_threads", { ids: due.map((sid) => ptys[sid]) });
+    } catch {
+      results = [];
     }
-    // codex
-    return info.agentSessionId ? `codex resume ${info.agentSessionId}` : "codex resume --last";
-  };
+    const lookup = sessionByPty();
+    for (const r of results) {
+      const sid = lookup[r.id];
+      if (!sid) continue;
+      if (r.thread_id) {
+        codexThreadCache[sid] = { id: r.thread_id, cwd: r.cwd, at: nowMs };
+        codexIdCache[sid] = r.thread_id;
+        codexIdExact.add(sid);
+      }
+    }
+  }
+
+  // Remember the conversation a restored/reopened Codex terminal is resuming.
+  // Until the resumed codex takes its thread lock (or while its resume picker
+  // is open) this keeps the known id instead of overwriting it with a guess.
+  function seedCodexId(sessionId: string, agentSessionId: string | null) {
+    if (!agentSessionId) return;
+    codexIdCache[sessionId] = agentSessionId;
+    codexIdExact.add(sessionId);
+  }
 
   async function resolveCodexSessionId(
     sessionId: string,
     cwd: string | null,
     curr: string | undefined,
     prev: string | undefined
-  ): Promise<string | null> {
-    if (!cwd) return codexIdCache[sessionId] ?? null;
-    // Re-resolve on the rising edge (a freshly launched codex), otherwise reuse
-    // the cached id to avoid scanning the rollout logs every poll.
+  ): Promise<{ id: string | null; exact: boolean }> {
+    const fromLock = codexThreadCache[sessionId];
+    if (fromLock) return { id: fromLock.id, exact: true };
+    const cached = () => ({
+      id: codexIdCache[sessionId] ?? null,
+      exact: codexIdExact.has(sessionId),
+    });
+    if (!cwd || codexIdExact.has(sessionId)) return cached();
+    // Fallback for Codex builds without thread locks (the backend returns
+    // null when locks exist): newest interactive rollout in this cwd that no
+    // other terminal already owns. Re-resolve on the rising edge (a freshly
+    // launched codex), otherwise reuse the cached id to avoid rescanning.
     const risingEdge = isAgentLive(curr) && !isAgentLive(prev);
-    if (codexIdCache[sessionId] && !risingEdge) return codexIdCache[sessionId];
+    if (codexIdCache[sessionId] && !risingEdge) return cached();
+    const exclude = Object.entries(codexIdCache)
+      .filter(([sid]) => sid !== sessionId)
+      .map(([, id]) => id);
     try {
-      const id = await invoke<string | null>("codex_latest_session_id", { cwd });
+      const id = await invoke<string | null>("codex_latest_session_id", { cwd, exclude });
       if (id) codexIdCache[sessionId] = id;
-      return id ?? codexIdCache[sessionId] ?? null;
     } catch {
-      return codexIdCache[sessionId] ?? null;
+      // keep the cached id
     }
+    return cached();
   }
 
   async function persistAgentSnapshots(
@@ -594,25 +639,36 @@ export function useAppModel() {
     prevCodex: Record<string, string>
   ) {
     const nowSec = Math.floor(Date.now() / 1000);
+    await resolveCodexThreads(codexStates, prevCodex);
     for (const session of sessions) {
       const sid = session.id;
       let kind: AgentKind | null = null;
       let agentSessionId: string | null = null;
-      if (isAgentLive(claudeStates[sid]) || agentSessionIds[sid]) {
+      let agentIdExact = false;
+      let cwd = session.directory ?? null;
+      // A live codex process wins over a Claude id left in the hook log by an
+      // earlier Claude run in the same shell; that stale id used to make
+      // Codex terminals restore as `claude --resume <old id>`.
+      if (isAgentLive(claudeStates[sid])) {
         kind = "claude";
         agentSessionId =
           agentSessionIds[sid] ?? persistedAgentCache[sid]?.agentSessionId ?? null;
       } else if (isAgentLive(codexStates[sid])) {
         kind = "codex";
-        agentSessionId = await resolveCodexSessionId(
+        const resolved = await resolveCodexSessionId(
           sid,
           session.directory ?? null,
           codexStates[sid],
           prevCodex[sid]
         );
+        agentSessionId = resolved.id;
+        agentIdExact = resolved.exact;
+        cwd = codexThreadCache[sid]?.cwd ?? cwd;
+      } else if (agentSessionIds[sid]) {
+        kind = "claude";
+        agentSessionId = agentSessionIds[sid];
       }
       if (!kind) continue;
-      const cwd = session.directory ?? null;
       setSessionAgentInfo((prev) => ({
         ...prev,
         [sid]: { kind, agentSessionId, cwd, lastSeenAt: nowSec },
@@ -632,6 +688,7 @@ export function useAppModel() {
             agent_session_id: agentSessionId,
             agent_cwd: cwd,
             agent_last_seen_at: nowSec,
+            agent_id_exact: agentIdExact,
           },
         });
       } catch {
@@ -639,6 +696,7 @@ export function useAppModel() {
       }
     }
   }
+  const AGENT_LIVE_AT_CLOSE_SECS = 90;
   const [idleTick, setIdleTick] = createSignal(0);
   const [presets, setPresets] = createSignal<TerminalPreset[]>([]);
   const [appConfig, setAppConfig] = createSignal<AppConfig | null>(null);
@@ -646,7 +704,7 @@ export function useAppModel() {
   const [restoreDecision, setRestoreDecision] = createSignal<"pending" | "yes" | "no">("no");
   const [pendingRestoreActiveId, setPendingRestoreActiveId] = createSignal<string | null>(null);
   // Previously-open terminals offered in the startup reopen picker.
-  const [restoreCandidates, setRestoreCandidates] = createSignal<DbSession[]>([]);
+  const [restoreCandidates, setRestoreCandidates] = createSignal<RestoreCandidate[]>([]);
   const [showPresetEditor, setShowPresetEditor] = createSignal(false);
   const [editingPreset, setEditingPreset] = createSignal<TerminalPreset | null>(null);
   const [newPresetTagName, setNewPresetTagName] = createSignal("");
@@ -791,6 +849,8 @@ export function useAppModel() {
   const terminalHostCleanup = new Map<string, () => void>();
   const lastPtySizeBySession = new Map<string, { rows: number; cols: number }>();
   const commandRunFor = new Set<string>();
+  // CLI prompts go into the child process command, never through terminal input.
+  const pendingCliCommands = new Map<string, string>();
   // Sessions that should relaunch/resume their agent on next terminal spawn.
   // Populated by the reopen picker; consumed once in ensureTerminal.
   const pendingAgentResume = new Map<string, SessionAgentInfo>();
@@ -2020,6 +2080,12 @@ export function useAppModel() {
         label: "Exit Quick Input View",
         description: "Return to focused terminal view",
         action: () => setQuickInputActive(false),
+      },
+      {
+        id: "compose",
+        label: "Compose",
+        description: "Write a prompt in the composer dock and send it to this terminal (⌘I)",
+        action: () => toggleComposer(),
       },
       {
         id: "scratchpad",
@@ -4382,12 +4448,13 @@ export function useAppModel() {
     if (!reopened) return null;
 
     try {
-      const dbSession = await invoke<DbSession | null>("db_get_session", { id });
+      const dbSession = await invoke<DbSession | null>("db_reopen_candidate", { id });
       if (!dbSession || dbSession.is_closed) {
         await refreshRecentlyClosedSessions();
         return null;
       }
 
+      queueAgentResumeOnReopen(dbSession);
       const session = mapDbSessionToWebSession(dbSession);
       const existingIndex = sessions.findIndex((entry) => entry.id === id);
       if (existingIndex === -1) {
@@ -4411,6 +4478,30 @@ export function useAppModel() {
       await refreshRecentlyClosedSessions();
       return null;
     }
+  }
+
+  // A terminal closed while its agent was running reopens into that agent's
+  // conversation (claude --resume / codex resume) instead of re-running the
+  // launch command, which would start a new conversation.
+  function queueAgentResumeOnReopen(dbSession: DbSession) {
+    const kind = dbSession.agent_kind;
+    if (kind !== "claude" && kind !== "codex") return;
+    // Only terminals launched as that agent: their launch command would
+    // otherwise start a fresh conversation. Plain shells reopen as shells.
+    const launch = dbSession.command?.trim().split(/\s+/)[0] ?? "";
+    if (launch !== kind) return;
+    const lastSeen = dbSession.agent_last_seen_at ?? 0;
+    const closedAt = dbSession.closed_at ?? 0;
+    // The agent snapshot is refreshed at least every 30s while it runs.
+    if (!lastSeen || (closedAt && closedAt - lastSeen > AGENT_LIVE_AT_CLOSE_SECS)) return;
+    if (kind === "codex") seedCodexId(dbSession.id, dbSession.agent_session_id);
+    pendingAgentResume.set(dbSession.id, {
+      kind,
+      agentSessionId: dbSession.agent_session_id,
+      cwd: dbSession.agent_cwd ?? dbSession.directory,
+      lastSeenAt: lastSeen,
+      command: dbSession.command,
+    });
   }
 
   async function reopenLastClosedSession() {
@@ -4441,6 +4532,11 @@ export function useAppModel() {
         const session = mapDbSessionToWebSession(dbSession);
         setSessions(startIndex + index, session);
       });
+      // Record them as open in this run so the next launch offers them.
+      await invoke("db_resolve_restore", {
+        keep: newSessions.map((s) => s.id),
+        retire: [],
+      }).catch((err) => console.error("[restore] Failed to record restored sessions:", err));
       // Load tags for restored sessions
       const dbTags = await invoke<Record<string, string[]>>("db_get_all_session_tags");
       if (dbTags && Object.keys(dbTags).length > 0) {
@@ -4892,13 +4988,20 @@ export function useAppModel() {
     let ptyId = ptyBySession()[id];
     const createdPty = !ptyId;
     if (!ptyId) {
+      const cliCommand = pendingCliCommands.get(id);
       ptyId = await invoke<string>("pty_create", {
         id,
         rows: term.rows,
         cols: term.cols,
-        cwd: session?.directory || null,
-        command: null,
+        // Resuming an agent: start the shell where the agent ran, so Codex
+        // (and Claude, whose history is per project dir) sees the same cwd.
+        cwd: pendingAgentResume.get(id)?.cwd || session?.directory || null,
+        command: cliCommand ?? null,
       });
+      if (cliCommand !== undefined) {
+        pendingCliCommands.delete(id);
+        commandRunFor.add(id);
+      }
       setPtyBySession((prev) => ({ ...prev, [id]: ptyId }));
     } else {
       void updatePtySize(id);
@@ -5365,14 +5468,7 @@ export function useAppModel() {
       }
       const text = await readClipboardText();
       console.log("[paste] clipboard text fallback length", text?.length ?? 0, "preview", text?.slice(0, 20));
-      let wrote = false;
-      if (text) {
-        const ptyId = ptyBySession()[sessionId];
-        if (ptyId) {
-          await invoke("pty_write", { id: ptyId, data: text });
-          wrote = true;
-        }
-      }
+      const wrote = text ? await pasteTextToSession(sessionId, text) : false;
       if (!wrote) {
         console.log("[paste] falling back to ctrl+v", source);
         await sendCtrlVToSession(sessionId, source);
@@ -5509,6 +5605,32 @@ export function useAppModel() {
     await Command.create("open", [path]).execute();
   };
 
+  /**
+   * Deliver clipboard text to a session as a real terminal paste.
+   *
+   * Goes through xterm.js `paste()`, which turns newlines into CR and wraps the text in
+   * ESC[200~ ... ESC[201~ when the running program enabled bracketed paste (DECSET 2004),
+   * then emits it as one onData chunk (one pty_write). Writing the raw clipboard text
+   * straight to the PTY skips both steps: a TUI such as Claude Code then gets a long
+   * unbracketed burst that arrives over many small reads, cannot tell where the paste
+   * starts, and keeps only the tail of the text.
+   */
+  const pasteTextToSession = async (sessionId: string, text: string): Promise<boolean> => {
+    const instance = terminalInstances.get(sessionId);
+    if (instance) {
+      instance.term.paste(text);
+      return true;
+    }
+    const ptyId = ptyBySession()[sessionId];
+    if (!ptyId) {
+      console.warn("[paste] no pty for session", sessionId);
+      return false;
+    }
+    // No xterm instance, so we cannot know the bracketed paste mode. Match xterm's newline handling.
+    await invoke("pty_write", { id: ptyId, data: text.replace(/\r?\n/g, "\r") });
+    return true;
+  };
+
   const sendCtrlVToSession = async (sessionId: string, source: string) => {
     const ptyId = ptyBySession()[sessionId];
     if (!ptyId) {
@@ -5556,6 +5678,116 @@ export function useAppModel() {
       !event.ctrlKey &&
       !event.altKey
     );
+  };
+
+  // ===== Composer dock (Cmd+I) =====
+  // Per-session open state; the draft itself lives in a file (see composer.rs).
+  const [composerOpenBySession, setComposerOpenBySession] = createSignal<Record<string, boolean>>({});
+  let composerFocusHandler: (() => void) | undefined;
+
+  const registerComposerFocus = (fn?: () => void) => {
+    composerFocusHandler = fn;
+  };
+
+  const isComposerOpen = (sessionId: string | null | undefined) =>
+    !!sessionId && !!composerOpenBySession()[sessionId];
+
+  const composerHasFocus = () => {
+    const el = document.activeElement;
+    return !!(el && el instanceof HTMLElement && el.closest(".composer-dock"));
+  };
+
+  const refitAfterLayout = (sessionId: string) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => fitTerminalSession(sessionId)));
+  };
+
+  const setComposerOpen = (sessionId: string, open: boolean) => {
+    setComposerOpenBySession((prev) => {
+      const next = { ...prev };
+      if (open) next[sessionId] = true;
+      else delete next[sessionId];
+      return next;
+    });
+    refitAfterLayout(sessionId);
+    if (!open && activeSessionId() === sessionId) {
+      requestAnimationFrame(() => focusTerminal(sessionId));
+    }
+  };
+
+  /** Cmd+I: open (and focus) the dock; focused -> hide it; open but unfocused -> focus it. */
+  const toggleComposer = () => {
+    const sessionId = activeSessionId();
+    if (!sessionId || appView() !== "terminal") return;
+    if (quickInputActive()) setQuickInputActive(false);
+    if (activeWorkspaceTabKind() !== "terminal") {
+      setActiveWorkspaceTabForSession(sessionId, TERMINAL_WORKSPACE_TAB_ID);
+    }
+    const open = isComposerOpen(sessionId);
+    if (open && !composerHasFocus()) {
+      composerFocusHandler?.();
+      return;
+    }
+    setComposerOpen(sessionId, !open);
+  };
+
+  const sessionAgentKind = (sessionId: string): AgentKindName => {
+    if (isAgentLive(claudeState()[sessionId])) return "claude";
+    if (isAgentLive(codexState()[sessionId])) return "codex";
+    const command = sessions.find((s) => s.id === sessionId)?.command ?? "";
+    if (/\bclaude\b/.test(command)) return "claude";
+    if (/\bcodex\b/.test(command)) return "codex";
+    return "shell";
+  };
+
+  const sessionAgentLabel = (sessionId: string): string => {
+    const kind = sessionAgentKind(sessionId);
+    if (kind === "claude") return "Claude Code";
+    if (kind === "codex") return "Codex";
+    const command = sessions.find((s) => s.id === sessionId)?.command?.trim();
+    if (command && /^\s*(?:\S*\/)?(ssh|mosh)\s/.test(command)) return "ssh";
+    return "Shell";
+  };
+
+  const getSessionCwd = async (sessionId: string): Promise<string | null> => {
+    const ptyId = ptyBySession()[sessionId];
+    if (ptyId) {
+      try {
+        const cwd = await invoke<string>("get_pty_cwd", { id: ptyId });
+        if (cwd) return cwd;
+      } catch {
+        // fall through to the session's launch directory
+      }
+    }
+    return sessions.find((s) => s.id === sessionId)?.directory ?? null;
+  };
+
+  /**
+   * Send composer text to a session: ONE bracketed paste (xterm `paste()`,
+   * the same path as Cmd+V), then optionally a separate CR after a short
+   * delay so TUIs like Claude Code see it as Enter, not as part of the paste.
+   */
+  const sendComposerText = async (
+    sessionId: string,
+    text: string,
+    pressEnter: boolean
+  ): Promise<boolean> => {
+    const steps = planSend(text, pressEnter, sessionAgentKind(sessionId));
+    if (!steps.length) return false;
+    if (!ptyBySession()[sessionId] && !terminalInstances.get(sessionId)) {
+      await ensureTerminal(sessionId, { focus: false });
+    }
+    for (const step of steps) {
+      if (step.kind === "paste") {
+        const ok = await pasteTextToSession(sessionId, step.text);
+        if (!ok) return false;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+        const ptyId = ptyBySession()[sessionId];
+        if (!ptyId) return false;
+        await invoke("pty_write", { id: ptyId, data: "\r" });
+      }
+    }
+    return true;
   };
 
   const setFooterPresetSelection = (presetId: string) => {
@@ -5983,9 +6215,21 @@ export function useAppModel() {
     return id;
   }
 
+  // Persist the picker's answer: reopened terminals join this run; every other
+  // candidate is marked closed (still reopenable from Recently Closed). Without
+  // this, unpicked terminals stayed "open" in the DB and piled up across
+  // launches, so the picker kept offering (and pre-checking) old sessions.
+  const resolveRestoreCandidates = async (keep: string[], retire: string[]) => {
+    try {
+      await invoke("db_resolve_restore", { keep, retire });
+    } catch (err) {
+      console.error("[reopen] Failed to persist picker selection:", err);
+    }
+    await refreshRecentlyClosedSessions();
+  };
+
   // Reopen the chosen previously-open terminals from the startup picker. Each
-  // selection may opt to also restart/resume its agent. Unselected candidates
-  // are left untouched in the DB (still reopenable later).
+  // selection may opt to also restart/resume its agent.
   const reopenSessionsFromPicker = (
     selections: { id: string; restartAgent: boolean }[]
   ) => {
@@ -5993,15 +6237,20 @@ export function useAppModel() {
     const candidates = restoreCandidates();
     const existingIds = new Set(sessions.map((s) => s.id));
     let firstId: string | null = null;
+    const kept = new Set<string>();
     for (const sel of selections) {
       const dbSession = candidates.find((c) => c.id === sel.id);
       if (!dbSession) continue;
+      kept.add(dbSession.id);
       if (!existingIds.has(dbSession.id)) {
         setSessions(sessions.length, mapDbSessionToWebSession(dbSession));
         existingIds.add(dbSession.id);
       }
       if (firstId === null) firstId = dbSession.id;
       if (sel.restartAgent && dbSession.agent_kind) {
+        if (dbSession.agent_kind === "codex") {
+          seedCodexId(dbSession.id, dbSession.agent_session_id);
+        }
         pendingAgentResume.set(dbSession.id, {
           kind: dbSession.agent_kind as AgentKind,
           agentSessionId: dbSession.agent_session_id,
@@ -6011,6 +6260,10 @@ export function useAppModel() {
         });
       }
     }
+    void resolveRestoreCandidates(
+      [...kept],
+      candidates.filter((c) => !kept.has(c.id)).map((c) => c.id)
+    );
     setRestoreCandidates([]);
     if (firstId === null) {
       // Nothing selected — start fresh.
@@ -6026,6 +6279,11 @@ export function useAppModel() {
 
   // Dismiss the picker without reopening anything; start a fresh terminal.
   const dismissReopenPicker = () => {
+    const candidates = restoreCandidates();
+    void resolveRestoreCandidates(
+      [],
+      candidates.map((c) => c.id)
+    );
     setRestorePromptOpen(false);
     setRestoreCandidates([]);
     setRestoreDecision("no");
@@ -6628,6 +6886,23 @@ export function useAppModel() {
     };
     window.addEventListener("keydown", handleQuickInputShortcut, true); // capture phase
 
+    // Cmd+I toggles the composer dock for the active terminal
+    const handleComposerShortcut = (event: KeyboardEvent) => {
+      const isCmdI =
+        (event.key === "i" || event.key === "I" || event.code === "KeyI") &&
+        event.metaKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.ctrlKey;
+      if (!isCmdI) return;
+      if (appView() !== "terminal") return;
+      if (showCommandPalette()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleComposer();
+    };
+    window.addEventListener("keydown", handleComposerShortcut, true);
+
     // Cmd+Shift+N to toggle Scratchpad
     const handleScratchpadShortcut = (event: KeyboardEvent) => {
       const isCmdShiftN =
@@ -6774,13 +7049,15 @@ export function useAppModel() {
       }
     }
 
-    // Offer to reopen the terminals that were open at last exit. The set
-    // survives both a clean quit and a crash (sessions stay is_closed=0), and
-    // each carries its last-known agent so we can restart/resume it.
+    // Offer to reopen the terminals that were open at last exit. Open/close is
+    // written to the DB as it happens (not at shutdown), so the set survives
+    // both a clean quit and a crash; the backend flags the ones from the most
+    // recent run as `preselect`, and each carries its last-known agent so we
+    // can restart/resume it.
     if (sessions.length === 0) {
-      let candidates: DbSession[] = [];
+      let candidates: RestoreCandidate[] = [];
       try {
-        candidates = await invoke<DbSession[]>("db_list_sessions");
+        candidates = await invoke<RestoreCandidate[]>("db_restore_candidates");
       } catch (err) {
         console.error("[reopen] Failed to list previous sessions:", err);
       }
@@ -6788,22 +7065,51 @@ export function useAppModel() {
         setRestoreDecision("no");
         createSession();
       } else {
-        // Order newest-active first so the picker leads with what you used last.
+        // Last run's terminals first, then newest-active first.
+        const activity = (c: RestoreCandidate) => c.last_accessed_at ?? c.created_at;
         candidates = [...candidates].sort(
           (a, b) =>
-            (b.last_accessed_at ?? b.created_at) - (a.last_accessed_at ?? a.created_at)
+            Number(b.preselect) - Number(a.preselect) || activity(b) - activity(a)
         );
         setRestoreCandidates(candidates);
         const savedActiveId = localStorage.getItem("terminal-active-session");
+        const preselected = candidates.filter((c) => c.preselect);
+        const pool = preselected.length > 0 ? preselected : candidates;
         setPendingRestoreActiveId(
-          savedActiveId && candidates.some((c) => c.id === savedActiveId)
+          savedActiveId && pool.some((c) => c.id === savedActiveId)
             ? savedActiveId
-            : candidates[0].id
+            : pool[0].id
         );
         setRestoreDecision("pending");
         setRestorePromptOpen(true);
       }
     }
+
+    // Local CLI requests reuse the ordinary tab/PTY creation path. The backend
+    // confirms success to the caller only after this request's PTY exists.
+    let cliPollBusy = false;
+    const cliPoll = setInterval(async () => {
+      if (cliPollBusy || restoreDecision() === "pending") return;
+      cliPollBusy = true;
+      try {
+        const requests = await invoke<Array<{ id: string; directory: string; command: string; title: string }>>(
+          "session_cli_pending",
+        );
+        // Admit one request at a time: the active tab must acquire its PTY
+        // before another request changes selection. Stable IDs prevent duplicates.
+        const request = requests[0];
+        if (request && !sessions.some((session) => session.id === request.id)) {
+          setAppView("terminal");
+          pendingCliCommands.set(request.id, request.command);
+          createSession(undefined, request.command, request.directory, request.title, request.id);
+          await invoke("focus_manager_window");
+        }
+      } catch (error) {
+        console.error("CLI session poll failed:", error);
+      } finally {
+        cliPollBusy = false;
+      }
+    }, 500);
 
     const unlisten = await listen<{ id: string; data: string }>(
       "pty-data",
@@ -7022,6 +7328,7 @@ export function useAppModel() {
 
     onCleanup(() => {
       recorderShuttingDown = true;
+      clearInterval(cliPoll);
       if (recorderInstance && recorderInstance.state !== "inactive") {
         try {
           recorderInstance.stop();
@@ -7533,5 +7840,14 @@ export function useAppModel() {
     openPathExternally,
     startScreenRecording,
     stopScreenRecording,
+    composerOpenBySession,
+    isComposerOpen,
+    setComposerOpen,
+    toggleComposer,
+    registerComposerFocus,
+    sessionAgentKind,
+    sessionAgentLabel,
+    getSessionCwd,
+    sendComposerText,
   };
 }

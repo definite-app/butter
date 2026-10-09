@@ -242,3 +242,74 @@ impl PtyManager {
         Ok(session.child.process_id())
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A large bracketed paste written through the PTY master in one `write_all`
+    /// (the same path `PtyManager::write` uses for `pty_write`) must reach the child
+    /// byte-for-byte, with the ESC[200~ / ESC[201~ markers intact.
+    #[test]
+    fn large_bracketed_paste_reaches_child_intact() {
+        let line = "Customer shall not use the Services in a manner not expressly permitted by these Terms or an Order Form.";
+        let mut text = String::from("START_MARKER");
+        while text.len() < 20_000 {
+            text.push('\r');
+            text.push_str(line);
+        }
+        text.push_str("\rEND_MARKER");
+        let payload = format!("\x1b[200~{}\x1b[201~", text);
+
+        let out_path = std::env::temp_dir().join(format!("butter-paste-{}.bin", Uuid::new_v4()));
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "stty raw -echo; echo READY; head -c {} > '{}'",
+                payload.len(),
+                out_path.display()
+            ),
+        ]);
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+
+        // Drain child output on a thread; signal once the child is in raw mode.
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut signalled = false;
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if !signalled && String::from_utf8_lossy(&seen).contains("READY") {
+                    signalled = true;
+                    let _ = ready_tx.send(());
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child never reported READY");
+
+        let mut writer = pair.master.take_writer().expect("writer");
+        writer.write_all(payload.as_bytes()).expect("write_all");
+        writer.flush().expect("flush");
+
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "child exited with {:?}", status);
+        let received = std::fs::read(&out_path).expect("read output");
+        let _ = std::fs::remove_file(&out_path);
+        assert_eq!(received.len(), payload.len());
+        assert!(received == payload.as_bytes(), "paste bytes were altered in transit");
+    }
+}
