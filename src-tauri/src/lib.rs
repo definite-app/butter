@@ -2064,6 +2064,7 @@ pub fn run() {
             thread::thread_add_message,
             thread::thread_update_message_status,
             thread::thread_set_pinned,
+            thread::thread_rename,
             thread::thread_mark_viewed,
             thread::thread_agent_alive,
             thread::thread_stage_launch,

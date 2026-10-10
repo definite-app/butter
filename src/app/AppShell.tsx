@@ -120,7 +120,9 @@ export function AppShell() {
           </Match>
         </Switch>
       </div>
-      <FooterBar />
+      <Show when={app.appView() !== "thread"}>
+        <FooterBar />
+      </Show>
       <CommandPalette />
       <TerminalSwitcher />
       <FileBrowser />

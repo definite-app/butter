@@ -35,31 +35,6 @@
   justify-content: flex-end;
 }
 
-.ot-brand {
-  display: flex;
-  align-items: center;
-  gap: 5px; /* tight, so "[1]thread" reads as one word */
-}
-
-.ot-mark {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  background: var(--accent-primary);
-  color: #18181b;
-  font-size: 12px;
-  font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.ot-title {
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  color: var(--text-primary);
-}
-
 .ot-focus-title {
   text-align: center;
   line-height: 1.25;
@@ -114,35 +89,6 @@
   margin-left: 2px;
 }
 
-.ot-seg {
-  display: inline-flex;
-  padding: 2px;
-  border-radius: var(--radius-lg);
-  background: rgba(255, 255, 255, 0.04);
-  margin-left: var(--space-1);
-}
-
-.ot-seg-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--text-sm);
-  padding: 3px 10px;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-}
-
-.ot-seg-btn:hover {
-  color: var(--text-primary);
-}
-
-.ot-seg-btn.active {
-  background: var(--surface-selected);
-  color: var(--text-primary);
-  cursor: default;
-}
-
 /* --- Pinned shelf --- */
 .ot-shelf {
   display: flex;
@@ -151,6 +97,11 @@
   overflow-x: auto;
   flex-shrink: 0;
   scrollbar-width: none;
+}
+
+/* Nothing focused: the pins take the header's row. */
+.ot-shelf.top {
+  padding-top: var(--space-4);
 }
 
 .ot-shelf::-webkit-scrollbar {
@@ -205,7 +156,7 @@
 }
 
 .ot-column {
-  max-width: 680px;
+  max-width: 960px;
   margin: 0 auto;
   padding: var(--space-4) var(--space-4) var(--space-6);
   display: flex;
@@ -515,7 +466,7 @@
 }
 
 .ot-composer {
-  max-width: 680px;
+  max-width: 960px;
   margin: 0 auto;
   display: flex;
   align-items: flex-end;
@@ -639,38 +590,6 @@
   text-overflow: ellipsis;
 }
 
-button.ot-target.picker {
-  border: none;
-  cursor: pointer;
-  font: inherit;
-  font-size: var(--text-sm);
-  gap: 3px;
-  padding: 0 8px 0 10px;
-}
-
-button.ot-target.picker:hover,
-button.ot-target.picker.open {
-  background: rgba(255, 255, 255, 0.09);
-  color: var(--text-primary);
-}
-
-button.ot-target.picker svg {
-  width: 12px;
-  height: 12px;
-  flex-shrink: 0;
-  opacity: 0.6;
-  transition: transform 0.12s ease;
-}
-
-button.ot-target.picker.open svg {
-  transform: rotate(180deg);
-}
-
-.ot-target-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .ot-preset-menu {
   position: absolute;
   left: 0;
@@ -710,7 +629,7 @@ button.ot-target.picker.open svg {
   cursor: pointer;
 }
 
-.ot-preset-item:hover,
+.ot-preset-item.active,
 .ot-preset-item:focus-visible {
   background: rgba(255, 255, 255, 0.06);
   outline: none;
@@ -821,4 +740,106 @@ button.ot-target.picker.open svg {
 .ot-send:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+/* --- Pinned thread popover --- */
+.ot-popover {
+  position: fixed;
+  z-index: 40;
+  max-width: calc(100vw - 24px);
+  padding: 12px 12px 8px;
+  border-radius: 12px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--text-sm);
+}
+
+.ot-popover-title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.ot-popover-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.ot-popover-icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  margin: -3px -4px 0 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.ot-popover-icon:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.ot-popover-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.ot-popover-input {
+  width: 100%;
+  padding: 4px 8px;
+  margin: -2px 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  outline: none;
+}
+
+.ot-popover-agent {
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.ot-popover-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 10px 0 0;
+}
+
+.ot-popover-meta dt {
+  color: var(--text-muted);
+}
+
+.ot-popover-meta dd {
+  margin: 0;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.ot-popover-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+  margin: 8px -4px 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-default);
+}
+
+.ot-popover-actions .ot-ghost-btn {
+  font-size: var(--text-sm);
 }

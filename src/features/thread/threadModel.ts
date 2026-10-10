@@ -58,6 +58,8 @@ export interface ThreadModelDeps {
   pasteIntoSession: (id: string, text: string) => Promise<boolean>;
   reopenSession: (id: string) => Promise<string | null>;
   tagSession: (id: string, tag: string) => void;
+  /** Rename the thread's terminal session to match. */
+  renameSession: (id: string, title: string) => void;
 }
 
 export const THREAD_TAG = "thread";
@@ -629,6 +631,21 @@ export function createThreadModel(deps: ThreadModelDeps) {
     }
   };
 
+  const renameThread = async (threadId: string, title: string) => {
+    const previous = threadById()[threadId]?.title;
+    const next = title.trim();
+    if (!next || next === previous) return;
+    patchThread(threadId, { title: next });
+    try {
+      const saved = await invoke<string>("thread_rename", { sessionId: threadId, title: next });
+      patchThread(threadId, { title: saved });
+      deps.renameSession(threadId, saved);
+    } catch (err) {
+      console.error("[thread] rename failed", err);
+      if (previous !== undefined) patchThread(threadId, { title: previous });
+    }
+  };
+
   const focusThread = (threadId: string | null) => {
     setFocusedThreadId(threadId);
     if (threadId) {
@@ -660,6 +677,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
     startThread,
     sendReply,
     setPinned,
+    renameThread,
     hasUnread,
     isWorking,
     reload: load,

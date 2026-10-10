@@ -4,7 +4,9 @@ import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
 import { threadAgentKind, threadPresetLaunch } from "./threadModel";
-import type { ThreadMessage } from "./threadModel";
+import type { ThreadMessage, ThreadPresetLaunch } from "./threadModel";
+import { assignHandles, filterHandles, findMention, insertMention, mentionAtCaret, stripMention } from "./mentions";
+import type { MentionToken } from "./mentions";
 import "./OneThread.css";
 
 const TIME_GAP_MS = 10 * 60 * 1000;
@@ -161,6 +163,30 @@ function LocalImage(props: { path: string; class?: string; version?: number; onC
   );
 }
 
+function AgentMenuText(props: {
+  handle: string;
+  agent: { launch: ThreadPresetLaunch; name: string; detail: string };
+}) {
+  const kind = () => {
+    const launch = props.agent.launch;
+    if (!launch.ok) return launch.label;
+    return threadAgentKind(launch.agentCommand) === "codex" ? "Codex" : "";
+  };
+  return (
+    <span class="ot-preset-text">
+      <span class="ot-preset-name">
+        @{props.handle}
+        <Show when={kind()}>
+          <span class="ot-preset-kind">{kind()}</span>
+        </Show>
+      </span>
+      <span class="ot-preset-dir" title={props.agent.detail}>
+        {props.agent.name} · {props.agent.detail}
+      </span>
+    </span>
+  );
+}
+
 export function OneThread() {
   const app = useAppContext();
   const model = app.thread;
@@ -178,34 +204,68 @@ export function OneThread() {
       }
     )
   );
-  // Which preset new threads start in; null is plain Claude Code in the
-  // shared threads folder. Remembered per viewer.
-  const PRESET_STORAGE_KEY = "butter.1thread.presetId";
-  const readStoredPresetId = () => {
-    try {
-      return localStorage.getItem(PRESET_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  };
-  const [presetId, setPresetId] = createSignal<string | null>(readStoredPresetId());
-  const [presetMenuOpen, setPresetMenuOpen] = createSignal(false);
-  const threadPresets = createMemo(() =>
-    app.presets().map((preset) => ({ preset, launch: threadPresetLaunch(preset) }))
+  // Agents a new thread can start with, picked by typing @handle anywhere in
+  // the message. @claude (the default) is plain Claude Code in the shared
+  // threads folder; every Butter preset gets a handle from its name.
+  type AgentOption = { preset: TerminalPreset | null; launch: ThreadPresetLaunch; name: string; detail: string };
+  const agents = createMemo(() =>
+    assignHandles<AgentOption>([
+      {
+        name: "claude",
+        value: { preset: null, launch: { ok: true, agentCommand: null }, name: "Claude Code", detail: "1thread folder" },
+      },
+      ...app.presets().map((preset) => ({
+        name: preset.name,
+        value: {
+          preset,
+          launch: threadPresetLaunch(preset),
+          name: preset.name,
+          detail: (preset.directory || "~").replace(/^\/Users\/[^/]+(?=\/|$)/, "~"),
+        },
+      })),
+    ])
   );
-  const selectedPreset = () =>
-    threadPresets().find((p) => p.launch.ok && p.preset.id === presetId())?.preset ?? null;
-  const choosePreset = (preset: TerminalPreset | null) => {
-    setPresetId(preset?.id ?? null);
-    try {
-      if (preset) localStorage.setItem(PRESET_STORAGE_KEY, preset.id);
-      else localStorage.removeItem(PRESET_STORAGE_KEY);
-    } catch {
-      // Storage unavailable: the choice lasts for this session only.
+  const agentForHandle = (handle: string) => agents().find((a) => a.handle === handle)?.value ?? null;
+  // The @token being typed at the caret, which opens the agent menu.
+  const [mention, setMention] = createSignal<MentionToken | null>(null);
+  const [mentionIndex, setMentionIndex] = createSignal(0);
+  const mentionMatches = createMemo(() => {
+    const token = mention();
+    if (!token) return { available: [], unavailable: [] };
+    const matches = filterHandles(agents(), token.query);
+    return {
+      available: matches.filter((a) => a.value.launch.ok),
+      unavailable: matches.filter((a) => !a.value.launch.ok),
+    };
+  });
+  const mentionMenuOpen = () =>
+    mention() !== null && mentionMatches().available.length + mentionMatches().unavailable.length > 0;
+  const updateMention = () => {
+    if (!inputRef || focused() || replyTarget() || inputRef.selectionStart !== inputRef.selectionEnd) {
+      setMention(null);
+      return;
     }
-    setPresetMenuOpen(false);
-    inputRef?.focus();
+    const token = mentionAtCaret(inputRef.value, inputRef.selectionStart);
+    if (token?.query !== mention()?.query || token?.start !== mention()?.start) setMentionIndex(0);
+    setMention(token);
   };
+  const chooseMention = (handle: string) => {
+    const token = mention();
+    if (!token || !inputRef) return;
+    const next = insertMention(draft(), token, handle);
+    setDraft(next.text);
+    inputRef.value = next.text;
+    inputRef.setSelectionRange(next.caret, next.caret);
+    setMention(null);
+    resizeInput();
+    inputRef.focus();
+  };
+  // The agent the draft @mentions, if any.
+  const mentionedAgent = createMemo(() => {
+    if (focused() || replyTarget()) return null;
+    const found = findMention(draft(), agents().map((a) => a.handle));
+    return found ? { ...found, agent: agentForHandle(found.handle) } : null;
+  });
   const [sending, setSending] = createSignal(false);
   // Message id whose ⋯ menu is open.
   const [menuFor, setMenuFor] = createSignal<string | null>(null);
@@ -235,6 +295,66 @@ export function OneThread() {
     const id = model.replyTargetId();
     return id && model.threadById()[id] ? id : null;
   };
+
+  // Hovering a pinned thread shows its details and lets you rename it.
+  const [popover, setPopover] = createSignal<{ id: string; left: number; top: number } | null>(null);
+  const [renaming, setRenaming] = createSignal(false);
+  const [renameDraft, setRenameDraft] = createSignal("");
+  let renameRef: HTMLInputElement | undefined;
+  let popoverOpenTimer: number | undefined;
+  let popoverCloseTimer: number | undefined;
+  const POPOVER_WIDTH = 280;
+  const showPopover = (id: string, el: HTMLElement) => {
+    window.clearTimeout(popoverCloseTimer);
+    window.clearTimeout(popoverOpenTimer);
+    if (renaming()) return;
+    const open = () => {
+      const rect = el.getBoundingClientRect();
+      const left = Math.max(12, Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - 12));
+      setPopover({ id, left, top: rect.bottom + 6 });
+    };
+    // Once one popover is open, moving along the row switches right away.
+    if (popover()) open();
+    else popoverOpenTimer = window.setTimeout(open, 350);
+  };
+  const hidePopover = () => {
+    window.clearTimeout(popoverOpenTimer);
+    if (renaming()) return;
+    popoverCloseTimer = window.setTimeout(() => setPopover(null), 150);
+  };
+  const keepPopover = () => window.clearTimeout(popoverCloseTimer);
+  const closePopover = () => {
+    window.clearTimeout(popoverOpenTimer);
+    window.clearTimeout(popoverCloseTimer);
+    setRenaming(false);
+    setPopover(null);
+  };
+  const popoverThread = () => {
+    const open = popover();
+    return open ? model.threads().find((t) => t.session_id === open.id) ?? null : null;
+  };
+  const messageCounts = (threadId: string) => {
+    const messages = model.messages().filter((m) => m.session_id === threadId);
+    return { total: messages.length, fromYou: messages.filter((m) => m.role === "user").length };
+  };
+  const startRename = () => {
+    setRenameDraft(popoverThread()?.title ?? "");
+    setRenaming(true);
+    requestAnimationFrame(() => {
+      renameRef?.focus();
+      renameRef?.select();
+    });
+  };
+  const finishRename = (commit: boolean) => {
+    if (!renaming()) return;
+    const thread = popoverThread();
+    if (commit && thread) void model.renameThread(thread.session_id, renameDraft());
+    closePopover();
+  };
+  onCleanup(() => {
+    window.clearTimeout(popoverOpenTimer);
+    window.clearTimeout(popoverCloseTimer);
+  });
 
   const pinnedThreads = createMemo(() =>
     model
@@ -346,20 +466,28 @@ export function OneThread() {
     inputRef.style.height = `${Math.min(inputRef.scrollHeight, 140)}px`;
   };
 
-  const canSend = () => (draft().trim().length > 0 || pendingImages().length > 0) && !sending();
+  const mentionError = () => {
+    const agent = mentionedAgent()?.agent;
+    return agent && !agent.launch.ok ? `${agent.name}: ${agent.launch.reason}` : null;
+  };
+  const canSend = () =>
+    (draft().trim().length > 0 || pendingImages().length > 0) && !sending() && !mentionError();
 
   const send = async () => {
-    const text = draft().trim();
     const images = pendingImages();
     if (!canSend()) return;
+    const found = mentionedAgent();
+    const text = found ? stripMention(draft(), found) : draft().trim();
+    if (!text && images.length === 0) return;
     setSending(true);
     try {
       const target = focusedId() ?? replyTarget();
       if (target) {
         await model.sendReply(target, text, images);
       } else {
-        await model.startThread(text, images, selectedPreset());
+        await model.startThread(text, images, found?.agent?.preset ?? null);
       }
+      setMention(null);
       setDraft("");
       setPendingImages([]);
       setPasteError(null);
@@ -429,9 +557,7 @@ export function OneThread() {
 
   const closeMenuOnOutsideClick = (event: MouseEvent) => {
     const target = event.target as HTMLElement | null;
-    if (presetMenuOpen() && !target?.closest(".ot-preset-menu, .ot-target.picker")) {
-      setPresetMenuOpen(false);
-    }
+    if (mention() && !target?.closest(".ot-preset-menu, .ot-input")) setMention(null);
     if (!menuFor()) return;
     if (target?.closest(".ot-menu, .ot-more-btn")) return;
     setMenuFor(null);
@@ -440,12 +566,6 @@ export function OneThread() {
   const handleKeyDown = (event: KeyboardEvent) => {
     if (app.showCommandPalette() || app.imageEditorOpen()) return;
     if (event.key === "Escape") {
-      if (presetMenuOpen()) {
-        event.preventDefault();
-        setPresetMenuOpen(false);
-        inputRef?.focus();
-        return;
-      }
       if (menuFor()) {
         event.preventDefault();
         setMenuFor(null);
@@ -484,22 +604,15 @@ export function OneThread() {
   const placeholder = () => {
     if (focused()) return `Message ${focused()?.title}`;
     if (replyTarget()) return "Reply";
-    return "Start a new thread";
+    return "Start a new thread · @ to pick an agent";
   };
 
   return (
     <div class="one-thread">
-      <header class="ot-header">
+      <Show when={focused()}>
+        <header class="ot-header">
         <div class="ot-header-left">
-          <Show
-            when={focused()}
-            fallback={
-              <div class="ot-brand" role="heading" aria-level="1" aria-label="1thread">
-                <span class="ot-mark" aria-hidden="true">1</span>
-                <span class="ot-title" aria-hidden="true">thread</span>
-              </div>
-            }
-          >
+          <Show when={focused()}>
             <button class="ot-ghost-btn ot-back" onClick={() => model.focusThread(null)}>
               ‹ All
             </button>
@@ -541,25 +654,22 @@ export function OneThread() {
               </>
             )}
           </Show>
-          <div class="ot-seg" role="tablist">
-            <button class="ot-seg-btn active" role="tab" aria-selected="true">
-              Thread
-            </button>
-            <button class="ot-seg-btn" role="tab" aria-selected="false" onClick={() => app.setAppView("terminal")}>
-              Terminals
-            </button>
-          </div>
         </div>
       </header>
+      </Show>
 
       <Show when={pinnedThreads().length > 0}>
-        <div class="ot-shelf">
+        <div class={`ot-shelf ${focused() ? "" : "top"}`}>
           <For each={pinnedThreads()}>
             {(thread) => (
               <button
                 class={`ot-chip ${focusedId() === thread.session_id ? "active" : ""}`}
-                onClick={() => model.focusThread(thread.session_id)}
-                title={thread.title}
+                onClick={() => {
+                  closePopover();
+                  model.focusThread(thread.session_id);
+                }}
+                onMouseEnter={(e) => showPopover(thread.session_id, e.currentTarget)}
+                onMouseLeave={hidePopover}
               >
                 <span class="ot-chip-name">{thread.title}</span>
                 <Show when={model.hasUnread(thread.session_id) && focusedId() !== thread.session_id}>
@@ -575,7 +685,7 @@ export function OneThread() {
         <div class="ot-column">
           <Show when={model.loaded() && visibleMessages().length === 0 && workingThreads().length === 0}>
             <div class="ot-empty">
-              Send a message to start a thread. Each one runs Claude Code in its own terminal.
+              Send a message to start a thread. Each one runs in its own terminal; type @ to pick the agent.
             </div>
           </Show>
           <For each={items()}>
@@ -737,80 +847,39 @@ export function OneThread() {
             void send();
           }}
         >
-          <Show
-            when={!focused() && replyTarget()}
-            fallback={
-              <Show
-                when={!focused()}
-                fallback={<span class="ot-target">{focused()?.preset_name ?? "Claude Code"}</span>}
-              >
-                <button
-                  type="button"
-                  class={`ot-target picker ${presetMenuOpen() ? "open" : ""}`}
-                  onClick={() => setPresetMenuOpen((open) => !open)}
-                  title="Where new threads start"
-                  aria-haspopup="listbox"
-                  aria-expanded={presetMenuOpen()}
-                >
-                  <span class="ot-target-label">{selectedPreset()?.name ?? "Claude Code"}</span>
-                  <Icon name="chevron" />
-                </button>
-                <Show when={presetMenuOpen()}>
-                  <div class="ot-preset-menu" role="listbox" aria-label="Start new threads in">
-                    <div class="ot-preset-heading">Start new threads in</div>
-                    <button
-                      type="button"
-                      role="option"
-                      aria-selected={!selectedPreset()}
-                      class="ot-preset-item"
-                      onClick={() => choosePreset(null)}
-                    >
-                      <span class="ot-preset-text">
-                        <span class="ot-preset-name">Claude Code</span>
-                        <span class="ot-preset-dir">1thread folder</span>
-                      </span>
-                      <Show when={!selectedPreset()}>
-                        <Icon name="check" />
-                      </Show>
-                    </button>
-                    <For each={threadPresets()}>
-                      {({ preset, launch }) => (
-                        <button
-                          type="button"
-                          role="option"
-                          aria-selected={selectedPreset()?.id === preset.id}
-                          aria-disabled={!launch.ok}
-                          class={`ot-preset-item ${launch.ok ? "" : "unavailable"}`}
-                          title={launch.ok ? undefined : launch.reason}
-                          onClick={() => launch.ok && choosePreset(preset)}
-                        >
-                          <span class="ot-preset-text">
-                            <span class="ot-preset-name">
-                              {preset.name}
-                              <Show
-                                when={launch.ok}
-                                fallback={<span class="ot-preset-kind">{launch.ok ? "" : launch.label}</span>}
-                              >
-                                <Show when={launch.ok && threadAgentKind(launch.agentCommand) === "codex"}>
-                                  <span class="ot-preset-kind">Codex</span>
-                                </Show>
-                              </Show>
-                            </span>
-                            <span class="ot-preset-dir" title={preset.directory}>
-                              {(preset.directory || "~").replace(/^\/Users\/[^/]+(?=\/|$)/, "~")}
-                            </span>
-                          </span>
-                          <Show when={selectedPreset()?.id === preset.id}>
-                            <Icon name="check" />
-                          </Show>
-                        </button>
-                      )}
-                    </For>
+          <Show when={mentionMenuOpen()}>
+            <div class="ot-preset-menu" role="listbox" aria-label="Agents">
+              <div class="ot-preset-heading">Start with</div>
+              <For each={mentionMatches().available}>
+                {(agent, i) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={mentionIndex() === i()}
+                    class={`ot-preset-item ${mentionIndex() === i() ? "active" : ""}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onMouseEnter={() => setMentionIndex(i())}
+                    onClick={() => chooseMention(agent.handle)}
+                  >
+                    <AgentMenuText handle={agent.handle} agent={agent.value} />
+                  </button>
+                )}
+              </For>
+              <For each={mentionMatches().unavailable}>
+                {(agent) => (
+                  <div
+                    role="option"
+                    aria-disabled="true"
+                    class="ot-preset-item unavailable"
+                    title={agent.value.launch.ok ? undefined : agent.value.launch.reason}
+                  >
+                    <AgentMenuText handle={agent.handle} agent={agent.value} />
                   </div>
-                </Show>
-              </Show>
-            }
-          >
+                )}
+              </For>
+            </div>
+          </Show>
+          <Show when={!focused() && replyTarget()}>
             {(target) => (
               <span class="ot-target reply">
                 ↳ {threadTitle(target())}
@@ -825,7 +894,7 @@ export function OneThread() {
               </span>
             )}
           </Show>
-          <Show when={pendingImages().length > 0 || pasteError()}>
+          <Show when={pendingImages().length > 0 || pasteError() || mentionError()}>
             <div class="ot-attachments">
               <For each={pendingImages()}>
                 {(path) => (
@@ -854,7 +923,7 @@ export function OneThread() {
                   </div>
                 )}
               </For>
-              <Show when={pasteError()}>
+              <Show when={pasteError() ?? mentionError()}>
                 {(error) => <span class="ot-attachment-error">{error()}</span>}
               </Show>
             </div>
@@ -868,9 +937,35 @@ export function OneThread() {
             onInput={(e) => {
               setDraft(e.currentTarget.value);
               resizeInput();
+              updateMention();
             }}
+            onClick={updateMention}
+            onKeyUp={(e) => {
+              if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateMention();
+            }}
+            onBlur={() => setMention(null)}
             onPaste={(e) => void handlePaste(e)}
             onKeyDown={(e) => {
+              const options = mentionMatches().available;
+              if (mention() && options.length > 0 && !e.isComposing) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const step = e.key === "ArrowDown" ? 1 : -1;
+                  setMentionIndex((i) => (i + step + options.length) % options.length);
+                  return;
+                }
+                if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+                  e.preventDefault();
+                  chooseMention(options[Math.min(mentionIndex(), options.length - 1)].handle);
+                  return;
+                }
+              }
+              if (mention() && e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setMention(null);
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.isComposing) {
                 e.preventDefault();
                 void send();
@@ -890,6 +985,87 @@ export function OneThread() {
           </button>
         </form>
       </div>
+
+      <Show when={popover() && popoverThread()}>
+        {(thread) => {
+          const counts = () => messageCounts(thread().session_id);
+          return (
+            <div
+              class="ot-popover"
+              role="dialog"
+              aria-label="Thread details"
+              style={{ left: `${popover()?.left ?? 0}px`, top: `${popover()?.top ?? 0}px`, width: `${POPOVER_WIDTH}px` }}
+              onMouseEnter={keepPopover}
+              onMouseLeave={hidePopover}
+            >
+              <Show
+                when={renaming()}
+                fallback={
+                  <div class="ot-popover-title-row">
+                    <div class="ot-popover-title">{thread().title}</div>
+                    <button class="ot-popover-icon" onClick={startRename} title="Rename" aria-label="Rename thread">
+                      <Icon name="edit" />
+                    </button>
+                  </div>
+                }
+              >
+                <input
+                  ref={renameRef}
+                  class="ot-popover-input"
+                  value={renameDraft()}
+                  aria-label="Thread name"
+                  maxLength={120}
+                  onInput={(e) => setRenameDraft(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      finishRename(true);
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      finishRename(false);
+                    }
+                  }}
+                  onBlur={() => finishRename(true)}
+                />
+              </Show>
+              <div class="ot-popover-agent">{thread().preset_name ?? "Claude Code"}</div>
+              <dl class="ot-popover-meta">
+                <dt>Started</dt>
+                <dd>{formatSeparator(thread().created_at)}</dd>
+                <dt>Last message</dt>
+                <dd>{formatSeparator(thread().last_activity_at)}</dd>
+                <dt>Messages</dt>
+                <dd>
+                  {counts().total} · {counts().fromYou} from you
+                </dd>
+              </dl>
+              <div class="ot-popover-actions">
+                <button
+                  class="ot-ghost-btn"
+                  onClick={() => {
+                    const id = thread().session_id;
+                    closePopover();
+                    void model.setPinned(id, false);
+                  }}
+                >
+                  Unpin
+                </button>
+                <button
+                  class="ot-ghost-btn"
+                  onClick={() => {
+                    const id = thread().session_id;
+                    closePopover();
+                    void openTerminal(id);
+                  }}
+                >
+                  Open terminal
+                </button>
+              </div>
+            </div>
+          );
+        }}
+      </Show>
     </div>
   );
 }

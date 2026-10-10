@@ -397,6 +397,23 @@ pub fn thread_set_pinned(
 }
 
 #[tauri::command]
+pub fn thread_rename(session_id: String, title: String, db: State<Arc<AgentDatabase>>) -> Result<String, String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err("Thread name can't be empty".to_string());
+    }
+    let title: String = title.chars().take(120).collect();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE threads SET title = ?2 WHERE session_id = ?1",
+            params![session_id, title],
+        )
+        .map_err(|e| format!("Failed to rename thread: {e}"))
+    })?;
+    Ok(title)
+}
+
+#[tauri::command]
 pub fn thread_mark_viewed(session_id: String, db: State<Arc<AgentDatabase>>) -> Result<i64, String> {
     let now = now_ms();
     db.with_conn(|conn| {

@@ -7464,6 +7464,7 @@ export function useAppModel() {
       if (!tags().includes(tag)) saveTags([...tags(), tag]);
       addTagToTerminal(id, tag);
     },
+    renameSession: updateSessionTitle,
   });
 
   return {
