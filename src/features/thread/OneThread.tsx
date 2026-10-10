@@ -4,9 +4,11 @@ import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
 import { threadAgentKind, threadPresetLaunch } from "./threadModel";
-import type { ThreadMessage, ThreadPresetLaunch } from "./threadModel";
+import type { ThreadMessage, ThreadPresetLaunch, ThreadRecord } from "./threadModel";
 import { assignHandles, filterHandles, findMention, insertMention, mentionAtCaret, stripMention } from "./mentions";
 import type { MentionToken } from "./mentions";
+import { matchesTerms, parseSearchQuery, searchSnippet } from "./search";
+import type { SearchFrom } from "./search";
 import "./OneThread.css";
 
 const TIME_GAP_MS = 10 * 60 * 1000;
@@ -55,7 +57,7 @@ function formatSeparator(at: number): string {
   return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
-type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron" | "edit";
+type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron" | "edit" | "search";
 
 // Inline stroke icons (16px, currentColor) for the bubble actions and menu.
 function Icon(props: { name: IconName; filled?: boolean }) {
@@ -102,6 +104,10 @@ function Icon(props: { name: IconName; filled?: boolean }) {
         </Match>
         <Match when={props.name === "chevron"}>
           <path d="m18 15-6-6-6 6" />
+        </Match>
+        <Match when={props.name === "search"}>
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
         </Match>
         <Match when={props.name === "open"}>
           <path d="M14 4h6v6" />
@@ -356,6 +362,97 @@ export function OneThread() {
     window.clearTimeout(popoverCloseTimer);
   });
 
+  // Search across every thread's messages and names (⌘F).
+  const [searchOpen, setSearchOpen] = createSignal(false);
+  const [searchText, setSearchText] = createSignal("");
+  const [searchPinnedOnly, setSearchPinnedOnly] = createSignal(false);
+  const [searchFrom, setSearchFrom] = createSignal<SearchFrom>(null);
+  let searchRef: HTMLInputElement | undefined;
+  const openSearch = () => {
+    closePopover();
+    setMenuFor(null);
+    setSearchOpen(true);
+    requestAnimationFrame(() => {
+      searchRef?.focus();
+      searchRef?.select();
+    });
+  };
+  const closeSearch = () => {
+    setSearchOpen(false);
+    requestAnimationFrame(() => inputRef?.focus());
+  };
+  const FROM_LABEL: Record<"any" | "me" | "agent", string> = { any: "Anyone", me: "Me", agent: "Agents" };
+  const cycleSearchFrom = () =>
+    setSearchFrom((from) => (from === null ? "me" : from === "me" ? "agent" : null));
+  type SearchGroup = { thread: ThreadRecord; matches: ThreadMessage[]; total: number };
+  const MATCHES_PER_THREAD = 3;
+  const searchResults = createMemo(() => {
+    if (!searchOpen()) return null;
+    const query = parseSearchQuery(searchText(), agents().map((a) => a.handle));
+    const pinnedOnly = query.pinned || searchPinnedOnly();
+    const from = query.from ?? searchFrom();
+    if (query.terms.length === 0 && !query.agent && !pinnedOnly && !from) return null;
+    // undefined: any agent; null: the default Claude Code.
+    const presetId = query.agent ? (agentForHandle(query.agent)?.preset?.id ?? null) : undefined;
+    const threadOk = (t: ThreadRecord) =>
+      (!pinnedOnly || t.pinned) && (presetId === undefined || (t.preset_id ?? null) === presetId);
+    const threads = new Map(model.threads().map((t) => [t.session_id, t]));
+    const groups = new Map<string, SearchGroup>();
+    const messages = model.messages();
+    let total = 0;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      const thread = threads.get(m.session_id);
+      if (!thread || !threadOk(thread)) continue;
+      if ((from === "me" && m.role !== "user") || (from === "agent" && m.role !== "agent")) continue;
+      if (!matchesTerms(m.body, query.terms)) continue;
+      let group = groups.get(thread.session_id);
+      if (!group) {
+        group = { thread, matches: [], total: 0 };
+        groups.set(thread.session_id, group);
+      }
+      group.total += 1;
+      total += 1;
+      if (group.matches.length < MATCHES_PER_THREAD) group.matches.push(m);
+    }
+    // Threads whose name matches, even if no message does.
+    if (query.terms.length > 0) {
+      const byRecent = [...threads.values()].sort((a, b) => b.last_activity_at - a.last_activity_at);
+      for (const thread of byRecent) {
+        if (groups.has(thread.session_id) || !threadOk(thread)) continue;
+        if (matchesTerms(thread.title, query.terms)) {
+          groups.set(thread.session_id, { thread, matches: [], total: 0 });
+        }
+      }
+    }
+    return { terms: query.terms, pinnedOnly, groups: [...groups.values()], total };
+  });
+  // Message to scroll to once a thread opened from search has rendered.
+  let pendingJump: string | null = null;
+  const flushJump = () => {
+    const id = pendingJump;
+    pendingJump = null;
+    if (!id || !streamRef) return;
+    const row = streamRef.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
+    if (!row) {
+      scrollToBottom();
+      return;
+    }
+    row.scrollIntoView({ block: "center" });
+    row.classList.add("ot-flash");
+    window.setTimeout(() => row.classList.remove("ot-flash"), 1800);
+  };
+  const jumpTo = (threadId: string, messageId: string | null) => {
+    setSearchOpen(false);
+    pendingJump = messageId;
+    stickToBottom = messageId === null;
+    if (focusedId() === threadId) {
+      requestAnimationFrame(() => (messageId ? flushJump() : scrollToBottom()));
+    } else {
+      model.focusThread(threadId);
+    }
+  };
+
   const pinnedThreads = createMemo(() =>
     model
       .threads()
@@ -447,9 +544,10 @@ export function OneThread() {
 
   createEffect(
     on(focusedId, () => {
-      stickToBottom = true;
+      stickToBottom = pendingJump === null;
       requestAnimationFrame(() => {
-        scrollToBottom();
+        if (pendingJump) flushJump();
+        else scrollToBottom();
         inputRef?.focus();
       });
     })
@@ -565,7 +663,17 @@ export function OneThread() {
 
   const handleKeyDown = (event: KeyboardEvent) => {
     if (app.showCommandPalette() || app.imageEditorOpen()) return;
+    if ((event.key === "f" || event.key === "F") && event.metaKey && !event.shiftKey) {
+      event.preventDefault();
+      openSearch();
+      return;
+    }
     if (event.key === "Escape") {
+      if (searchOpen()) {
+        event.preventDefault();
+        closeSearch();
+        return;
+      }
       if (menuFor()) {
         event.preventDefault();
         setMenuFor(null);
@@ -601,6 +709,27 @@ export function OneThread() {
     document.removeEventListener("mousedown", closeMenuOnOutsideClick);
   });
 
+  const pinChips = () => (
+    <For each={pinnedThreads()}>
+      {(thread) => (
+        <button
+          class={`ot-chip ${focusedId() === thread.session_id ? "active" : ""}`}
+          onClick={() => {
+            closePopover();
+            model.focusThread(thread.session_id);
+          }}
+          onMouseEnter={(e) => showPopover(thread.session_id, e.currentTarget)}
+          onMouseLeave={hidePopover}
+        >
+          <span class="ot-chip-name">{thread.title}</span>
+          <Show when={model.hasUnread(thread.session_id) && focusedId() !== thread.session_id}>
+            <span class="ot-unread" />
+          </Show>
+        </button>
+      )}
+    </For>
+  );
+
   const placeholder = () => {
     if (focused()) return `Message ${focused()?.title}`;
     if (replyTarget()) return "Reply";
@@ -609,7 +738,7 @@ export function OneThread() {
 
   return (
     <div class="one-thread">
-      <Show when={focused()}>
+      <Show when={focused() && !searchOpen()}>
         <header class="ot-header">
         <div class="ot-header-left">
           <Show when={focused()}>
@@ -635,6 +764,9 @@ export function OneThread() {
           <Show when={focused()}>
             {(thread) => (
               <>
+                <button class="ot-ghost-btn ot-icon-btn" onClick={openSearch} title="Search (⌘F)" aria-label="Search">
+                  <Icon name="search" />
+                </button>
                 <button
                   class={`ot-ghost-btn ot-icon-btn ${thread().pinned ? "active" : ""}`}
                   onClick={() => void model.setPinned(thread().session_id, !thread().pinned)}
@@ -658,30 +790,201 @@ export function OneThread() {
       </header>
       </Show>
 
-      <Show when={pinnedThreads().length > 0}>
-        <div class={`ot-shelf ${focused() ? "" : "top"}`}>
-          <For each={pinnedThreads()}>
-            {(thread) => (
-              <button
-                class={`ot-chip ${focusedId() === thread.session_id ? "active" : ""}`}
-                onClick={() => {
-                  closePopover();
-                  model.focusThread(thread.session_id);
-                }}
-                onMouseEnter={(e) => showPopover(thread.session_id, e.currentTarget)}
-                onMouseLeave={hidePopover}
-              >
-                <span class="ot-chip-name">{thread.title}</span>
-                <Show when={model.hasUnread(thread.session_id) && focusedId() !== thread.session_id}>
-                  <span class="ot-unread" />
+      <Show
+        when={!searchOpen()}
+        fallback={
+          <div class="ot-search-bar">
+            <div class="ot-search-inner">
+              <label class="ot-search-field">
+                <Icon name="search" />
+                <input
+                  ref={searchRef}
+                  class="ot-search-input"
+                  placeholder="Search threads"
+                  value={searchText()}
+                  spellcheck={false}
+                  onInput={(e) => setSearchText(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.isComposing) {
+                      const first = searchResults()?.groups[0];
+                      if (first) {
+                        e.preventDefault();
+                        jumpTo(first.thread.session_id, first.matches[0]?.id ?? null);
+                      }
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      closeSearch();
+                    }
+                  }}
+                />
+                <Show when={searchText()}>
+                  <button
+                    type="button"
+                    class="ot-search-clear"
+                    onClick={() => {
+                      setSearchText("");
+                      searchRef?.focus();
+                    }}
+                    aria-label="Clear search"
+                  >
+                    ×
+                  </button>
                 </Show>
+              </label>
+              <button
+                type="button"
+                class={`ot-filter ${searchPinnedOnly() ? "active" : ""}`}
+                aria-pressed={searchPinnedOnly()}
+                onClick={() => setSearchPinnedOnly((on) => !on)}
+              >
+                Pinned only
               </button>
-            )}
-          </For>
+              <button
+                type="button"
+                class={`ot-filter ${searchFrom() ? "active" : ""}`}
+                onClick={cycleSearchFrom}
+                title="Who sent the message"
+              >
+                From: {FROM_LABEL[searchFrom() ?? "any"]}
+              </button>
+              <button type="button" class="ot-ghost-btn" onClick={closeSearch}>
+                Done
+              </button>
+            </div>
+          </div>
+        }
+      >
+        <Show
+          when={!focused()}
+          fallback={
+            <Show when={pinnedThreads().length > 0}>
+              <div class="ot-shelf">{pinChips()}</div>
+            </Show>
+          }
+        >
+          <div class="ot-topbar">
+            <div class="ot-shelf">{pinChips()}</div>
+            <button class="ot-ghost-btn ot-icon-btn ot-search-btn" onClick={openSearch} title="Search (⌘F)" aria-label="Search">
+              <Icon name="search" />
+            </button>
+          </div>
+        </Show>
+      </Show>
+
+      <Show when={searchOpen()}>
+        <div class="ot-stream">
+          <div class="ot-column ot-search-column">
+            <Show
+              when={searchResults()}
+              fallback={
+                <div class="ot-search-hint">
+                  <div>Search every thread's messages and names. Narrow it down with:</div>
+                  <For
+                    each={[
+                      ["@agent", "threads started with that agent"],
+                      ["from:me", "only your messages"],
+                      ["from:agent", "only agent replies"],
+                      ["is:pinned", "only pinned threads"],
+                    ]}
+                  >
+                    {([token, what]) => (
+                      <button
+                        type="button"
+                        class="ot-search-token"
+                        onClick={() => {
+                          const base = searchText().trim();
+                          setSearchText(`${base ? `${base} ` : ""}${token === "@agent" ? "@" : `${token} `}`);
+                          searchRef?.focus();
+                        }}
+                      >
+                        <code>{token}</code>
+                        <span>{what}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              }
+            >
+              {(results) => (
+                <Show
+                  when={results().groups.length > 0}
+                  fallback={
+                    <div class="ot-search-empty">
+                      <div>No messages match{results().pinnedOnly ? " in pinned threads" : ""}.</div>
+                      <Show when={searchPinnedOnly()}>
+                        <button type="button" class="ot-filter" onClick={() => setSearchPinnedOnly(false)}>
+                          Search all threads
+                        </button>
+                      </Show>
+                    </div>
+                  }
+                >
+                  <div class="ot-search-count">
+                    {results().total > 0
+                      ? `${results().total} ${results().total === 1 ? "message" : "messages"} in ${
+                          results().groups.length
+                        } ${results().groups.length === 1 ? "thread" : "threads"}`
+                      : `${results().groups.length} ${results().groups.length === 1 ? "thread" : "threads"}`}
+                  </div>
+                  <For each={results().groups}>
+                    {(group) => (
+                      <section class="ot-search-group">
+                        <button
+                          type="button"
+                          class="ot-search-thread"
+                          onClick={() => jumpTo(group.thread.session_id, group.matches[0]?.id ?? null)}
+                        >
+                          <span class="ot-search-thread-name">
+                            <For each={searchSnippet(group.thread.title, results().terms, 200)}>
+                              {(part) => (part.hit ? <mark>{part.text}</mark> : part.text)}
+                            </For>
+                          </span>
+                          <span class="ot-search-thread-meta">
+                            {group.thread.preset_name ?? "Claude Code"}
+                            {group.thread.pinned ? " · pinned" : ""}
+                          </span>
+                        </button>
+                        <For each={group.matches}>
+                          {(m) => (
+                            <button
+                              type="button"
+                              class="ot-search-hit"
+                              onClick={() => jumpTo(group.thread.session_id, m.id)}
+                            >
+                              <span class={`ot-search-who ${m.role}`}>{m.role === "user" ? "You" : "Agent"}</span>
+                              <span class="ot-search-snippet">
+                                <Show when={m.body.trim()} fallback={<span class="ot-search-muted">Image</span>}>
+                                  <For each={searchSnippet(m.body, results().terms)}>
+                                    {(part) => (part.hit ? <mark>{part.text}</mark> : part.text)}
+                                  </For>
+                                </Show>
+                              </span>
+                              <span class="ot-search-when">{formatSeparator(m.created_at)}</span>
+                            </button>
+                          )}
+                        </For>
+                        <Show when={group.total > group.matches.length}>
+                          <div class="ot-search-more">
+                            {group.total - group.matches.length} more in this thread
+                          </div>
+                        </Show>
+                      </section>
+                    )}
+                  </For>
+                </Show>
+              )}
+            </Show>
+          </div>
         </div>
       </Show>
 
-      <div class="ot-stream" ref={streamRef} onScroll={handleScroll}>
+      <div
+        class="ot-stream"
+        ref={streamRef}
+        onScroll={handleScroll}
+        style={{ display: searchOpen() ? "none" : undefined }}
+      >
         <div class="ot-column">
           <Show when={model.loaded() && visibleMessages().length === 0 && workingThreads().length === 0}>
             <div class="ot-empty">
@@ -730,7 +1033,7 @@ export function OneThread() {
                       );
                     };
                     return (
-                      <div class={`ot-row ${m().role}`}>
+                      <div class={`ot-row ${m().role}`} data-message-id={m().id}>
                         <div class="ot-bubble-line">
                           <div class="ot-bubble-stack">
                             <Show when={m().attachments?.length}>
@@ -839,7 +1142,7 @@ export function OneThread() {
         </div>
       </div>
 
-      <div class="ot-composer-wrap">
+      <div class="ot-composer-wrap" style={{ display: searchOpen() ? "none" : undefined }}>
         <form
           class="ot-composer"
           onSubmit={(e) => {

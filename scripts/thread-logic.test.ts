@@ -1,4 +1,4 @@
-// Unit tests for 1thread @agent mentions. Run: npm run test:composer
+// Unit tests for 1thread @agent mentions and search. Run: npm run test:composer
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -10,6 +10,7 @@ import {
   mentionAtCaret,
   stripMention,
 } from "../src/features/thread/mentions.ts";
+import { matchesTerms, parseSearchQuery, searchSnippet } from "../src/features/thread/search.ts";
 
 test("agentHandle slugs preset names", () => {
   assert.equal(agentHandle("CC Mike3"), "cc-mike3");
@@ -62,4 +63,34 @@ test("findMention and stripMention pull the agent out of the message", () => {
   assert.equal(findMention("@nobody hi", handles), null);
   const lead = findMention("@CC-Mike3 fix the build", handles)!;
   assert.equal(stripMention("@CC-Mike3 fix the build", lead), "fix the build");
+});
+
+// ----- search -----
+
+test("parseSearchQuery pulls out filters", () => {
+  assert.deepEqual(parseSearchQuery("Eagles @CC-Mike3 from:me is:pinned odds", ["claude", "cc-mike3"]), {
+    terms: ["eagles", "odds"],
+    agent: "cc-mike3",
+    from: "me",
+    pinned: true,
+  });
+  // An unknown @word is just a search term.
+  assert.deepEqual(parseSearchQuery("@nobody", ["claude"]).terms, ["@nobody"]);
+});
+
+test("matchesTerms needs every term", () => {
+  assert.equal(matchesTerms("The Eagles play Sunday", ["eagles", "sunday"]), true);
+  assert.equal(matchesTerms("The Eagles play Sunday", ["eagles", "monday"]), false);
+});
+
+test("searchSnippet highlights matches and trims long text", () => {
+  assert.deepEqual(searchSnippet("Barkley is out", ["barkley"]), [
+    { text: "Barkley", hit: true },
+    { text: " is out", hit: false },
+  ]);
+  const long = `${"word ".repeat(40)}Barkley is out ${"tail ".repeat(60)}`;
+  const parts = searchSnippet(long, ["barkley"], 20);
+  assert.equal(parts[0].text, "…");
+  assert.equal(parts.at(-1)?.text, "…");
+  assert.ok(parts.some((p) => p.hit && p.text === "Barkley"));
 });

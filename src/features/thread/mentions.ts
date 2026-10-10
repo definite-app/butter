@@ -1,5 +1,5 @@
 // @agent mentions in the 1thread composer. Pure so it can be unit tested
-// (scripts/thread-mentions.test.ts).
+// (scripts/thread-logic.test.ts).
 
 const HANDLE_CHARS = /[a-z0-9._-]/i;
 

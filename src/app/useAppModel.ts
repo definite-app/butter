@@ -6489,6 +6489,8 @@ export function useAppModel() {
         setTeamSearchRequestId((prev) => prev + 1);
         return;
       }
+      // 1thread handles its own ⌘F.
+      if (appView() === "thread") return;
       if (activeWorkspaceTabKind() === "text_file") {
         event.preventDefault();
         event.stopPropagation();
