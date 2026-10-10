@@ -643,7 +643,8 @@ export function OneThread() {
     const item = takeHeld(id);
     if (!item) return;
     try {
-      await model.startThread(item.text, item.images, agentForHandle(item.handle)?.preset ?? null);
+      const threadId = await model.startThread(item.text, item.images, agentForHandle(item.handle)?.preset ?? null);
+      if (threadId && !focusedId() && !replyTarget()) model.setReplyTargetId(threadId);
     } catch (err) {
       console.error("[thread] send failed", err);
     }
@@ -745,19 +746,24 @@ export function OneThread() {
     if (!text && images.length === 0) return;
     setSending(true);
     try {
+      // The next message replies to the same thread by default (Backspace in
+      // the empty input clears that).
+      let nextTarget: string | null = null;
       const target = focusedId() ?? replyTarget();
       if (target) {
         await model.sendReply(target, text, images);
+        nextTarget = target;
       } else if (found?.agent) {
-        await model.startThread(text, images, found.agent.preset);
+        nextTarget = await model.startThread(text, images, found.agent.preset);
       } else {
+        // Held: the reply target is set once the thread actually starts.
         holdSend(text, images);
       }
       setMention(null);
       setDraft("");
       setPendingImages([]);
       setPasteError(null);
-      model.setReplyTargetId(null);
+      model.setReplyTargetId(focusedId() ? null : nextTarget);
       stickToBottom = true;
       requestAnimationFrame(resizeInput);
     } catch (err) {
@@ -919,7 +925,7 @@ export function OneThread() {
 
   const placeholder = () => {
     if (focused()) return `Message ${focused()?.title}`;
-    if (replyTarget()) return "Reply";
+    if (replyTarget()) return "Reply · ⌫ for a new thread";
     return "Start a new thread · @ to pick an agent";
   };
 
@@ -1641,6 +1647,17 @@ export function OneThread() {
                 e.preventDefault();
                 e.stopPropagation();
                 setMention(null);
+                return;
+              }
+              if (
+                e.key === "Backspace" &&
+                !e.currentTarget.value &&
+                pendingImages().length === 0 &&
+                replyTarget() &&
+                !focusedId()
+              ) {
+                e.preventDefault();
+                model.setReplyTargetId(null);
                 return;
               }
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.isComposing) {
