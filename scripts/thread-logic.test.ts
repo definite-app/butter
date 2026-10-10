@@ -16,6 +16,7 @@ test("agentHandle slugs preset names", () => {
   assert.equal(agentHandle("CC Mike3"), "cc-mike3");
   assert.equal(agentHandle("  Codex (yolo)! "), "codex-yolo");
   assert.equal(agentHandle("🦀"), "agent");
+  assert.equal(agentHandle("Claude - Buckit Consumer 1"), "claude-buckit-consumer-1");
 });
 
 test("assignHandles keeps handles unique", () => {

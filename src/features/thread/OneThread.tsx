@@ -574,7 +574,16 @@ export function OneThread() {
   // A new thread with no @agent is held for a few seconds so the user can
   // see where it's going and switch agents before anything starts.
   const HOLD_MS = 5000;
-  type HeldSend = { id: string; text: string; images: string[]; handle: string; deadline: number };
+  type HeldSend = {
+    id: string;
+    text: string;
+    images: string[];
+    handle: string;
+    deadline: number;
+    /** "routing" while Jev picks; "jev" when its pick replaced the default; "user" once switched by hand. */
+    pickedBy: "default" | "routing" | "jev" | "user";
+    confidence?: number;
+  };
   const [held, setHeld] = createSignal<HeldSend[]>([]);
   const [heldMenuFor, setHeldMenuFor] = createSignal<string | null>(null);
   const [now, setNow] = createSignal(Date.now());
@@ -611,9 +620,43 @@ export function OneThread() {
       console.error("[thread] send failed", err);
     }
   };
+  // Ask Jev which preset the message is meant for; no answer keeps the default.
+  const routeHeld = async (id: string, text: string) => {
+    const defaultHandle = defaultAgentHandle();
+    const candidates = agents()
+      .filter((a) => a.handle !== defaultHandle && a.value.launch.ok)
+      .map((a) => ({
+        handle: a.handle,
+        name: a.value.name,
+        detail: [a.value.detail, a.value.preset?.command?.trim()].filter(Boolean).join(" · "),
+      }));
+    let decision: { handle: string | null; confidence: number } | null = null;
+    if (text.trim() && candidates.length > 0) {
+      try {
+        decision = await invoke<{ handle: string | null; confidence: number }>("thread_route", {
+          message: text,
+          candidates,
+        });
+      } catch (err) {
+        console.warn("[thread] routing unavailable:", err);
+      }
+    }
+    setHeld((list) =>
+      list.map((h) => {
+        if (h.id !== id || h.pickedBy !== "routing") return h;
+        return decision?.handle
+          ? { ...h, handle: decision.handle, pickedBy: "jev", confidence: decision.confidence }
+          : { ...h, pickedBy: "default" };
+      })
+    );
+  };
   const holdSend = (text: string, images: string[]) => {
     const id = crypto.randomUUID();
-    setHeld((list) => [...list, { id, text, images, handle: defaultAgentHandle(), deadline: Date.now() + HOLD_MS }]);
+    setHeld((list) => [
+      ...list,
+      { id, text, images, handle: defaultAgentHandle(), deadline: Date.now() + HOLD_MS, pickedBy: "routing" },
+    ]);
+    void routeHeld(id, text);
     setNow(Date.now());
     armHeld(id, HOLD_MS);
     syncTicker();
@@ -635,7 +678,7 @@ export function OneThread() {
   };
   // Picking an agent is a decision, so the message goes right away.
   const switchHeld = (id: string, handle: string) => {
-    setHeld((list) => list.map((h) => (h.id === id ? { ...h, handle } : h)));
+    setHeld((list) => list.map((h) => (h.id === id ? { ...h, handle, pickedBy: "user" } : h)));
     void releaseHeld(id);
   };
   // The countdown pauses while the agent menu is open.
@@ -1271,11 +1314,18 @@ export function OneThread() {
                         type="button"
                         class={`ot-held-agent ${heldMenuFor() === item.id ? "open" : ""}`}
                         onClick={() => toggleHeldMenu(item.id)}
-                        title="Send to a different agent"
+                        title={
+                          item.pickedBy === "jev"
+                            ? `Picked by Jev (${Math.round((item.confidence ?? 0) * 100)}% sure). Click to change.`
+                            : "Send to a different agent"
+                        }
                         aria-haspopup="listbox"
                         aria-expanded={heldMenuFor() === item.id}
                       >
                         → @{item.handle}
+                        <Show when={item.pickedBy === "routing"}>
+                          <span class="ot-held-routing">…</span>
+                        </Show>
                         <Icon name="chevron" />
                       </button>
                       <Show when={heldMenuFor() === item.id}>

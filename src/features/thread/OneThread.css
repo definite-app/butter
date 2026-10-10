@@ -1138,3 +1138,7 @@
 .ot-held-count {
   font-variant-numeric: tabular-nums;
 }
+
+.ot-held-routing {
+  opacity: 0.6;
+}
