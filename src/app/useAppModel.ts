@@ -6293,7 +6293,9 @@ export function useAppModel() {
   };
 
   // Dismiss the picker without reopening anything; start a fresh terminal.
-  const dismissReopenPicker = () => {
+  // "New terminal" always leaves a terminal open; closing the picker (×, Esc,
+  // clicking outside) only does that when the terminal view would be empty.
+  const dismissReopenPicker = (options?: { newTerminal?: boolean }) => {
     const candidates = restoreCandidates();
     void resolveRestoreCandidates(
       [],
@@ -6302,7 +6304,8 @@ export function useAppModel() {
     setRestorePromptOpen(false);
     setRestoreCandidates([]);
     setRestoreDecision("no");
-    if (sessions.length === 0) createSession();
+    const newTerminal = options?.newTerminal ?? true;
+    if (sessions.length === 0 && (newTerminal || appView() === "terminal")) createSession();
   };
 
   // Persist the active terminal id (crash-safe) and keep its last_accessed_at

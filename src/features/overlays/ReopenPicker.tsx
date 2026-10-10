@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
 
 type RowState = { selected: boolean; restart: boolean };
@@ -56,6 +56,19 @@ export function ReopenPicker() {
     app.reopenSessionsFromPicker(selections);
   };
 
+  const close = () => app.dismissReopenPicker({ newTerminal: false });
+  createEffect(() => {
+    if (!app.restorePromptOpen()) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    onCleanup(() => window.removeEventListener("keydown", onKeyDown, true));
+  });
+
   const fmtDir = (dir?: string | null) =>
     dir ? dir.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~") : "";
 
@@ -73,10 +86,15 @@ export function ReopenPicker() {
 
   return (
     <Show when={app.restorePromptOpen()}>
-      <div class="modal-overlay">
+      <div class="modal-overlay" onClick={close}>
         <div class="reopen-card" onClick={(e) => e.stopPropagation()}>
           <div class="reopen-header">
-            <div class="reopen-title">Reopen previous terminals</div>
+            <div class="reopen-title-row">
+              <div class="reopen-title">Reopen previous terminals</div>
+              <button type="button" class="reopen-close" onClick={close} aria-label="Close" title="Close (Esc)">
+                ×
+              </button>
+            </div>
             <div class="reopen-subtitle-row">
               <div class="reopen-subtitle">
                 {app.restoreCandidates().length} terminal
@@ -171,7 +189,7 @@ export function ReopenPicker() {
           </div>
 
           <div class="reopen-actions">
-            <button class="reopen-btn ghost" onClick={() => app.dismissReopenPicker()}>
+            <button class="reopen-btn ghost" onClick={() => app.dismissReopenPicker({ newTerminal: true })}>
               New terminal
             </button>
             <div class="reopen-actions-right">

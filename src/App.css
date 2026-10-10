@@ -3806,6 +3806,32 @@ body.butter-printing-markdown .butter-print-content hr {
   gap: 4px;
 }
 
+.reopen-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.reopen-close {
+  width: 26px;
+  height: 26px;
+  margin: -4px -6px 0 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.reopen-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
 .reopen-title {
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);

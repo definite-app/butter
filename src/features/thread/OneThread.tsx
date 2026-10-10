@@ -571,6 +571,101 @@ export function OneThread() {
   const canSend = () =>
     (draft().trim().length > 0 || pendingImages().length > 0) && !sending() && !mentionError();
 
+  // A new thread with no @agent is held for a few seconds so the user can
+  // see where it's going and switch agents before anything starts.
+  const HOLD_MS = 5000;
+  type HeldSend = { id: string; text: string; images: string[]; handle: string; deadline: number };
+  const [held, setHeld] = createSignal<HeldSend[]>([]);
+  const [heldMenuFor, setHeldMenuFor] = createSignal<string | null>(null);
+  const [now, setNow] = createSignal(Date.now());
+  const heldTimers = new Map<string, number>();
+  let heldTicker: number | undefined;
+  const syncTicker = () => {
+    if (held().length > 0 && heldTicker === undefined) {
+      heldTicker = window.setInterval(() => setNow(Date.now()), 250);
+    } else if (held().length === 0 && heldTicker !== undefined) {
+      window.clearInterval(heldTicker);
+      heldTicker = undefined;
+    }
+  };
+  const defaultAgentHandle = () => agents()[0]?.handle ?? "claude";
+  const armHeld = (id: string, delay: number) => {
+    window.clearTimeout(heldTimers.get(id));
+    heldTimers.set(id, window.setTimeout(() => void releaseHeld(id), delay));
+  };
+  const takeHeld = (id: string) => {
+    const item = held().find((h) => h.id === id) ?? null;
+    window.clearTimeout(heldTimers.get(id));
+    heldTimers.delete(id);
+    setHeld((list) => list.filter((h) => h.id !== id));
+    if (heldMenuFor() === id) setHeldMenuFor(null);
+    syncTicker();
+    return item;
+  };
+  const releaseHeld = async (id: string) => {
+    const item = takeHeld(id);
+    if (!item) return;
+    try {
+      await model.startThread(item.text, item.images, agentForHandle(item.handle)?.preset ?? null);
+    } catch (err) {
+      console.error("[thread] send failed", err);
+    }
+  };
+  const holdSend = (text: string, images: string[]) => {
+    const id = crypto.randomUUID();
+    setHeld((list) => [...list, { id, text, images, handle: defaultAgentHandle(), deadline: Date.now() + HOLD_MS }]);
+    setNow(Date.now());
+    armHeld(id, HOLD_MS);
+    syncTicker();
+    stickToBottom = true;
+    requestAnimationFrame(scrollToBottom);
+  };
+  // Cancel puts the message back in the composer (if it's empty).
+  const cancelHeld = (id: string) => {
+    const item = takeHeld(id);
+    if (!item) return;
+    if (!draft().trim() && pendingImages().length === 0) {
+      setDraft(item.text);
+      setPendingImages(item.images);
+      requestAnimationFrame(() => {
+        resizeInput();
+        inputRef?.focus();
+      });
+    }
+  };
+  // Picking an agent is a decision, so the message goes right away.
+  const switchHeld = (id: string, handle: string) => {
+    setHeld((list) => list.map((h) => (h.id === id ? { ...h, handle } : h)));
+    void releaseHeld(id);
+  };
+  // The countdown pauses while the agent menu is open.
+  const toggleHeldMenu = (id: string) => {
+    const opening = heldMenuFor() !== id;
+    const previous = heldMenuFor();
+    if (previous) resumeHeld(previous);
+    if (opening) {
+      window.clearTimeout(heldTimers.get(id));
+      setHeldMenuFor(id);
+    } else {
+      setHeldMenuFor(null);
+    }
+  };
+  const resumeHeld = (id: string) => {
+    setHeldMenuFor((open) => (open === id ? null : open));
+    const item = held().find((h) => h.id === id);
+    if (!item) return;
+    const deadline = Date.now() + Math.max(2000, item.deadline - Date.now());
+    setHeld((list) => list.map((h) => (h.id === id ? { ...h, deadline } : h)));
+    armHeld(id, deadline - Date.now());
+  };
+  const secondsLeft = (item: HeldSend) =>
+    heldMenuFor() === item.id ? null : Math.max(1, Math.ceil((item.deadline - now()) / 1000));
+  onCleanup(() => {
+    // Leaving 1thread sends anything still held rather than dropping it.
+    for (const item of held()) void releaseHeld(item.id);
+    window.clearInterval(heldTicker);
+  });
+
   const send = async () => {
     const images = pendingImages();
     if (!canSend()) return;
@@ -582,8 +677,10 @@ export function OneThread() {
       const target = focusedId() ?? replyTarget();
       if (target) {
         await model.sendReply(target, text, images);
+      } else if (found?.agent) {
+        await model.startThread(text, images, found.agent.preset);
       } else {
-        await model.startThread(text, images, found?.agent?.preset ?? null);
+        holdSend(text, images);
       }
       setMention(null);
       setDraft("");
@@ -656,6 +753,8 @@ export function OneThread() {
   const closeMenuOnOutsideClick = (event: MouseEvent) => {
     const target = event.target as HTMLElement | null;
     if (mention() && !target?.closest(".ot-preset-menu, .ot-input")) setMention(null);
+    const heldMenu = heldMenuFor();
+    if (heldMenu && !target?.closest(".ot-held-menu, .ot-held-agent")) resumeHeld(heldMenu);
     if (!menuFor()) return;
     if (target?.closest(".ot-menu, .ot-more-btn")) return;
     setMenuFor(null);
@@ -672,6 +771,17 @@ export function OneThread() {
       if (searchOpen()) {
         event.preventDefault();
         closeSearch();
+        return;
+      }
+      if (heldMenuFor()) {
+        event.preventDefault();
+        resumeHeld(heldMenuFor() as string);
+        return;
+      }
+      const lastHeld = held().at(-1);
+      if (lastHeld && !focusedId() && !draft().trim()) {
+        event.preventDefault();
+        cancelHeld(lastHeld.id);
         return;
       }
       if (menuFor()) {
@@ -1139,10 +1249,95 @@ export function OneThread() {
               </Switch>
             )}
           </For>
+          <Show when={!focusedId()}>
+            <For each={held()}>
+              {(item) => (
+                <div class="ot-row user held">
+                  <div class="ot-bubble-line">
+                    <div class="ot-bubble-stack">
+                      <Show when={item.images.length > 0}>
+                        <div class="ot-bubble-images">
+                          <For each={item.images}>{(path) => <LocalImage path={path} class="ot-bubble-image" />}</For>
+                        </div>
+                      </Show>
+                      <Show when={item.text}>
+                        <div class="ot-bubble user">{item.text}</div>
+                      </Show>
+                    </div>
+                  </div>
+                  <div class="ot-held-bar">
+                    <span class="ot-held-picker">
+                      <button
+                        type="button"
+                        class={`ot-held-agent ${heldMenuFor() === item.id ? "open" : ""}`}
+                        onClick={() => toggleHeldMenu(item.id)}
+                        title="Send to a different agent"
+                        aria-haspopup="listbox"
+                        aria-expanded={heldMenuFor() === item.id}
+                      >
+                        → @{item.handle}
+                        <Icon name="chevron" />
+                      </button>
+                      <Show when={heldMenuFor() === item.id}>
+                        <div class="ot-preset-menu ot-held-menu" role="listbox" aria-label="Send to">
+                          <div class="ot-preset-heading">Send to</div>
+                          <For each={agents()}>
+                            {(agent) => (
+                              <button
+                                type="button"
+                                role="option"
+                                aria-selected={agent.handle === item.handle}
+                                aria-disabled={!agent.value.launch.ok}
+                                class={`ot-preset-item ${agent.value.launch.ok ? "" : "unavailable"}`}
+                                title={agent.value.launch.ok ? undefined : agent.value.launch.reason}
+                                onClick={() => agent.value.launch.ok && switchHeld(item.id, agent.handle)}
+                              >
+                                <AgentMenuText handle={agent.handle} agent={agent.value} />
+                                <Show when={agent.handle === item.handle}>
+                                  <Icon name="check" />
+                                </Show>
+                              </button>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
+                    </span>
+                    <span class="ot-held-count">
+                      {secondsLeft(item) === null ? "paused" : `sending in ${secondsLeft(item)}s`}
+                    </span>
+                    <button type="button" class="ot-receipt-link" onClick={() => void releaseHeld(item.id)}>
+                      Send now
+                    </button>
+                    <button type="button" class="ot-receipt-link" onClick={() => cancelHeld(item.id)}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </For>
+          </Show>
         </div>
       </div>
 
       <div class="ot-composer-wrap" style={{ display: searchOpen() ? "none" : undefined }}>
+        <Show when={!focused() && replyTarget()}>
+          {(target) => (
+            <div class="ot-reply-to">
+              <span class="ot-reply-to-label">
+                Replying to <span class="ot-reply-to-name">{threadTitle(target())}</span>
+              </span>
+              <button
+                type="button"
+                class="ot-target-clear"
+                onClick={() => model.setReplyTargetId(null)}
+                aria-label="Stop replying"
+                title="Stop replying (Esc)"
+              >
+                ×
+              </button>
+            </div>
+          )}
+        </Show>
         <form
           class="ot-composer"
           onSubmit={(e) => {
@@ -1181,21 +1376,6 @@ export function OneThread() {
                 )}
               </For>
             </div>
-          </Show>
-          <Show when={!focused() && replyTarget()}>
-            {(target) => (
-              <span class="ot-target reply">
-                ↳ {threadTitle(target())}
-                <button
-                  type="button"
-                  class="ot-target-clear"
-                  onClick={() => model.setReplyTargetId(null)}
-                  aria-label="Clear reply target"
-                >
-                  ×
-                </button>
-              </span>
-            )}
           </Show>
           <Show when={pendingImages().length > 0 || pasteError() || mentionError()}>
             <div class="ot-attachments">

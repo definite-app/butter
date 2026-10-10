@@ -589,23 +589,6 @@
   border-color: var(--border-strong);
 }
 
-.ot-target {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  height: 28px;
-  padding: 0 10px;
-  border-radius: var(--radius-full);
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-secondary);
-  font-size: var(--text-sm);
-  white-space: nowrap;
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .ot-preset-menu {
   position: absolute;
   left: 0;
@@ -695,8 +678,25 @@
   white-space: nowrap;
 }
 
-.ot-target.reply {
-  background: var(--accent-primary-muted);
+.ot-reply-to {
+  max-width: 960px;
+  margin: 0 auto 6px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ot-reply-to-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ot-reply-to-name {
   color: var(--accent-primary);
 }
 
@@ -1082,4 +1082,59 @@
 .ot-row.ot-flash .ot-bubble {
   box-shadow: 0 0 0 2px var(--accent-primary);
   transition: box-shadow 0.4s ease;
+}
+
+/* --- Held new thread (countdown before it starts) --- */
+.ot-row.held .ot-bubble {
+  opacity: 0.7;
+}
+
+.ot-held-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ot-held-picker {
+  position: relative;
+}
+
+.ot-held-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 6px 0 8px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--accent-primary-muted);
+  color: var(--accent-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.ot-held-agent svg {
+  width: 11px;
+  height: 11px;
+  opacity: 0.7;
+  transform: rotate(180deg);
+  transition: transform 0.12s ease;
+}
+
+.ot-held-agent.open svg {
+  transform: none;
+}
+
+.ot-held-menu {
+  left: auto;
+  right: 0;
+}
+
+.ot-held-count {
+  font-variant-numeric: tabular-nums;
 }
