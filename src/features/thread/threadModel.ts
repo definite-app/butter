@@ -23,6 +23,8 @@ export interface ThreadRecord {
   preset_id: string | null;
   preset_name: string | null;
   agent_command: string | null;
+  /** Set on an agent looped into another thread; the UI shows them as one conversation. */
+  parent_id: string | null;
 }
 
 export type ThreadMessageRole = "user" | "agent";
@@ -65,7 +67,7 @@ export interface ThreadModelDeps {
 export const THREAD_TAG = "thread";
 
 const THREAD_INSTRUCTIONS =
-  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; open them to see them.";
+  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; open them to see them. To show the user an image you made or found, add --image <path> before the message (repeat it for several). Other agents may be in this conversation too; what they and the user said that you missed arrives in <conversation_context>.";
 
 // Pre-approve the reply command so the agent never blocks on a permission
 // prompt the user can't see. `--allowedTools` is variadic, so it must be
@@ -83,6 +85,13 @@ const AWAIT_WORK_MS = 20_000;
 const FALLBACK_DELAY_MS = 5_000;
 
 export const wrapButterMessage = (text: string) => `<butter_message>${text}</butter_message>`;
+
+/** The name a thread's agent goes by in a conversation with several agents. */
+export const threadAgentLabel = (t: Pick<ThreadRecord, "preset_name" | "agent_command"> | undefined) =>
+  t?.preset_name || (threadAgentKind(t?.agent_command) === "codex" ? "Codex" : "Claude Code");
+
+const CONTEXT_MAX_MESSAGES = 30;
+const CONTEXT_MAX_CHARS = 8000;
 
 /** What the agent receives for a message: its text plus one line per attached image. */
 export function agentTextForMessage(message: Pick<ThreadMessage, "body" | "attachments">): string {
@@ -245,6 +254,38 @@ export function createThreadModel(deps: ThreadModelDeps) {
   });
 
   const isThread = (id: string) => Boolean(threadById()[id]);
+  /** The conversation a session belongs to: its own id, or the thread it was looped into. */
+  const rootOf = (id: string) => {
+    const parent = threadById()[id]?.parent_id;
+    return parent && threadById()[parent] ? parent : id;
+  };
+  /** Top-level threads; looped-in agents live inside them. */
+  const conversations = createMemo(() => threads().filter((t) => rootOf(t.session_id) === t.session_id));
+  const sessionsIn = (rootId: string) => threads().filter((t) => rootOf(t.session_id) === rootId);
+  const conversationMessages = (rootId: string) => messages().filter((m) => rootOf(m.session_id) === rootId);
+
+  /**
+   * What a session missed in its conversation before `before`: messages other
+   * agents (and the user, to them) added since this session last took part.
+   * A newly looped-in agent gets the whole conversation.
+   */
+  const missedContext = (sessionId: string, before: number) => {
+    const conversation = conversationMessages(rootOf(sessionId)).filter((m) => m.created_at < before);
+    const own = conversation.filter((m) => m.session_id === sessionId);
+    const since = own.length > 0 ? own[own.length - 1].created_at : -Infinity;
+    const missed = conversation.filter((m) => m.session_id !== sessionId && m.created_at > since);
+    if (missed.length === 0) return "";
+    const lines: string[] = [];
+    let chars = 0;
+    for (const m of missed.slice(-CONTEXT_MAX_MESSAGES).reverse()) {
+      const who = m.role === "user" ? "User" : threadAgentLabel(threadById()[m.session_id]);
+      const line = `${who}: ${agentTextForMessage(m)}`;
+      if (chars + line.length > CONTEXT_MAX_CHARS && lines.length > 0) break;
+      lines.unshift(line);
+      chars += line.length;
+    }
+    return `<conversation_context>\n${lines.join("\n\n")}\n</conversation_context>`;
+  };
   const kindOf = (id: string) => threadAgentKind(threadById()[id]?.agent_command);
 
   // Codex turn state per thread, polled from its rollout log (Butter's Codex
@@ -405,10 +446,16 @@ export function createThreadModel(deps: ThreadModelDeps) {
 
   // ----- Starting a thread -----
   /** Start a thread, in `preset`'s folder with its Claude flags when given. */
-  const startThread = async (text: string, attachments: string[] = [], preset: TerminalPreset | null = null) => {
+  const startThread = async (
+    text: string,
+    attachments: string[] = [],
+    preset: TerminalPreset | null = null,
+    parentId: string | null = null
+  ) => {
     const body = text.trim();
     if (!body && attachments.length === 0) return null;
-    const title = body ? threadTitleFromMessage(body) : "image";
+    const parent = parentId ? threadById()[rootOf(parentId)] : undefined;
+    const title = parent ? parent.title : body ? threadTitleFromMessage(body) : "image";
     // Create the session without a stored command: if the app restarts, the
     // restored shell must not replay the first prompt as a new conversation.
     // Resume goes through the persisted agent snapshot instead.
@@ -420,9 +467,11 @@ export function createThreadModel(deps: ThreadModelDeps) {
       presetName: preset?.name ?? null,
       directory: preset?.directory ?? null,
       agentCommand: preset ? threadPresetAgentCommand(preset) : null,
+      parentId: parent?.session_id ?? null,
     });
     setThreads((prev) => [record, ...prev.filter((t) => t.session_id !== record.session_id)]);
-    const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, title, sessionId);
+    const sessionTitle = parent ? `${title} · ${threadAgentLabel(record)}` : title;
+    const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, sessionTitle, sessionId);
     deps.tagSession(id, THREAD_TAG);
     const message = await addMessage(id, "user", body, "composer", "delivered", attachments);
     const entry = rt(id);
@@ -430,7 +479,9 @@ export function createThreadModel(deps: ThreadModelDeps) {
     entry.awaitingWork = true;
     try {
       await deps.startSessionTerminal(id);
-      await launchAgent(id, agentTextForMessage(message), null);
+      const context = parent ? missedContext(id, message.created_at) : "";
+      const prompt = context ? `${context}\n\n${wrapButterMessage(agentTextForMessage(message))}` : agentTextForMessage(message);
+      await launchAgent(id, prompt, null);
     } catch (err) {
       console.error("[thread] failed to launch thread terminal", err);
     }
@@ -445,6 +496,34 @@ export function createThreadModel(deps: ThreadModelDeps) {
     void deliverQueued(threadId);
   };
 
+  /**
+   * Send into a conversation. With an agent, it goes to that agent's session
+   * in the conversation, looping the agent in first if it isn't there yet.
+   * Otherwise it goes to whichever agent the conversation was last with.
+   * Returns the session it went to.
+   */
+  const sendToConversation = async (
+    rootId: string,
+    text: string,
+    attachments: string[] = [],
+    agent: { preset: TerminalPreset | null } | null = null
+  ): Promise<string | null> => {
+    const root = rootOf(rootId);
+    if (agent) {
+      const presetId = agent.preset?.id ?? null;
+      const existing = sessionsIn(root).find((t) => (t.preset_id ?? null) === presetId);
+      if (existing) {
+        await sendReply(existing.session_id, text, attachments);
+        return existing.session_id;
+      }
+      return startThread(text, attachments, agent.preset, root);
+    }
+    const latest = conversationMessages(root).at(-1);
+    const target = latest && isThread(latest.session_id) ? latest.session_id : root;
+    await sendReply(target, text, attachments);
+    return target;
+  };
+
   const queuedFor = (threadId: string) =>
     messages().filter((m) => m.session_id === threadId && m.role === "user" && m.status === "queued");
 
@@ -456,7 +535,8 @@ export function createThreadModel(deps: ThreadModelDeps) {
     try {
       const entry = rt(threadId);
       const now = Date.now();
-      const combined = queued.map(agentTextForMessage).join("\n\n");
+      const context = missedContext(threadId, queued[0].created_at);
+      const combined = [context, ...queued.map(agentTextForMessage)].filter(Boolean).join("\n\n");
       const session = deps.sessions.find((s) => s.id === threadId);
 
       if (!session || !deps.ptyBySession()[threadId]) {
@@ -602,7 +682,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
       // An agent reply means it read whatever we delivered.
       rt(message.session_id).awaitingWork = false;
       markThreadSeen(message.session_id);
-      if (focusedThreadId() === message.session_id) void markViewed(message.session_id);
+      if (focusedThreadId() === rootOf(message.session_id)) void markViewed(rootOf(message.session_id));
     }
     if (!isThread(message.session_id)) void load();
   }).then((fn) => {
@@ -654,19 +734,23 @@ export function createThreadModel(deps: ThreadModelDeps) {
     }
   };
 
-  const hasUnread = (threadId: string) => {
-    const t = threadById()[threadId];
+  /** Unread agent replies anywhere in a conversation (by its root id). */
+  const hasUnread = (rootId: string) => {
+    const t = threadById()[rootId];
     if (!t) return false;
     const viewed = t.last_viewed_at ?? 0;
-    return messages().some(
-      (m) => m.session_id === threadId && m.role === "agent" && m.created_at > viewed
-    );
+    return conversationMessages(rootId).some((m) => m.role === "agent" && m.created_at > viewed);
   };
 
-  const isWorking = (threadId: string) => agentStates()[threadId] === "working";
+  const isSessionWorking = (sessionId: string) => agentStates()[sessionId] === "working";
+  /** Whether any agent in a conversation is working. */
+  const isWorking = (rootId: string) => sessionsIn(rootOf(rootId)).some((t) => isSessionWorking(t.session_id));
 
   return {
     threads,
+    conversations,
+    sessionsIn,
+    rootOf,
     messages,
     loaded,
     threadById,
@@ -676,10 +760,12 @@ export function createThreadModel(deps: ThreadModelDeps) {
     setReplyTargetId,
     startThread,
     sendReply,
+    sendToConversation,
     setPinned,
     renameThread,
     hasUnread,
     isWorking,
+    isSessionWorking,
     reload: load,
   };
 }

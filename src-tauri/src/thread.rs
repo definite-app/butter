@@ -16,7 +16,7 @@ use tauri::State;
 /// Event emitted to the webview when an agent reply arrives over HTTP.
 pub const THREAD_MESSAGE_EVENT: &str = "thread-message";
 
-const THREAD_COLUMNS: &str = "session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at, preset_id, preset_name, agent_command";
+const THREAD_COLUMNS: &str = "session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at, preset_id, preset_name, agent_command, parent_id";
 const MESSAGE_COLUMNS: &str =
     "id, session_id, role, body, source, status, created_at, attachments";
 
@@ -36,6 +36,9 @@ pub struct ThreadRecord {
     /// or `codex --search`), reused for every launch and resume of this thread.
     /// None means plain `claude`.
     pub agent_command: Option<String>,
+    /// Set on an agent looped into another thread: the thread it belongs to.
+    /// The UI shows a thread and its looped-in agents as one conversation.
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +84,7 @@ fn row_to_thread(row: &Row) -> rusqlite::Result<ThreadRecord> {
         preset_id: row.get(7)?,
         preset_name: row.get(8)?,
         agent_command: row.get(9)?,
+        parent_id: row.get(10)?,
     })
 }
 
@@ -197,9 +201,13 @@ pub fn thread_create(
     preset_name: Option<String>,
     directory: Option<String>,
     agent_command: Option<String>,
+    parent_id: Option<String>,
     db: State<Arc<AgentDatabase>>,
 ) -> Result<ThreadRecord, String> {
     validate_thread_id(&session_id)?;
+    if let Some(parent) = parent_id.as_deref() {
+        validate_thread_id(parent)?;
+    }
     let shared = threads_dir()?;
     std::fs::create_dir_all(&shared).map_err(|e| format!("Failed to create threads dir: {e}"))?;
     let cwd = match directory.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
@@ -216,12 +224,12 @@ pub fn thread_create(
     db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO threads (session_id, title, cwd, pinned, created_at, last_activity_at, last_viewed_at,
-                                  preset_id, preset_name, agent_command)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4, ?5, ?6, ?7)
+                                  preset_id, preset_name, agent_command, parent_id)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, cwd = excluded.cwd,
                  preset_id = excluded.preset_id, preset_name = excluded.preset_name,
-                 agent_command = excluded.agent_command",
-            params![session_id, title, cwd, now, preset_id, preset_name, agent_command],
+                 agent_command = excluded.agent_command, parent_id = excluded.parent_id",
+            params![session_id, title, cwd, now, preset_id, preset_name, agent_command, parent_id],
         )
         .map_err(|e| format!("Failed to create thread: {e}"))?;
         get_thread_conn(conn, &session_id)?.ok_or_else(|| "Thread not found after insert".to_string())
@@ -362,6 +370,48 @@ fn adopt_pending_attachments(session_id: &str, paths: &[String]) -> Result<Vec<S
         adopted.push(target.to_string_lossy().to_string());
     }
     Ok(adopted)
+}
+
+const AGENT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+const AGENT_IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Copies images an agent attached to its reply (`butter-cli thread reply
+/// --image <path>`) into the thread's attachments folder, so the bubble keeps
+/// working if the agent later moves or deletes the file.
+pub fn import_agent_images(session_id: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_thread_id(session_id)?;
+    let target_dir = threads_dir()?.join("attachments").join(session_id);
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| format!("Failed to create thread attachments dir: {e}"))?;
+    let mut imported = Vec::with_capacity(paths.len());
+    for path in paths {
+        let source = std::path::Path::new(path);
+        if !source.is_absolute() {
+            return Err(format!("Image path must be absolute: {path}"));
+        }
+        let meta = std::fs::metadata(source).map_err(|e| format!("Image not found: {path} ({e})"))?;
+        if !meta.is_file() {
+            return Err(format!("Not a file: {path}"));
+        }
+        if meta.len() > AGENT_IMAGE_MAX_BYTES {
+            return Err(format!("Image is larger than 25 MB: {path}"));
+        }
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !AGENT_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            return Err(format!("Only png, jpg, gif and webp images can be attached: {path}"));
+        }
+        let target = target_dir.join(format!("agent-{}.{ext}", uuid::Uuid::new_v4()));
+        std::fs::copy(source, &target).map_err(|e| format!("Failed to copy image: {e}"))?;
+        imported.push(target.to_string_lossy().to_string());
+    }
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -786,6 +836,25 @@ mod tests {
         assert_eq!(with_image.attachments, vec!["/tmp/a.png".to_string()]);
         assert!(get_thread(&db, "missing").unwrap().is_none());
         assert!(validate_thread_id("../etc").is_err());
+    }
+
+    #[test]
+    fn looped_in_agent_keeps_its_parent() {
+        let db = AgentDatabase::open_in_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO threads (session_id, title, cwd, pinned, created_at, last_activity_at, parent_id)
+                 VALUES ('root', 'demo', NULL, 0, 1, 1, NULL), ('child', 'demo', NULL, 0, 2, 2, 'root')",
+                [],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())?;
+            let child = get_thread_conn(conn, "child")?.unwrap();
+            assert_eq!(child.parent_id.as_deref(), Some("root"));
+            assert_eq!(get_thread_conn(conn, "root")?.unwrap().parent_id, None);
+            Ok::<_, String>(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
-import { threadAgentKind, threadPresetLaunch } from "./threadModel";
+import { threadAgentKind, threadAgentLabel, threadPresetLaunch } from "./threadModel";
 import type { ThreadMessage, ThreadPresetLaunch, ThreadRecord } from "./threadModel";
 import { assignHandles, filterHandles, findMention, insertMention, mentionAtCaret, stripMention } from "./mentions";
 import type { MentionToken } from "./mentions";
@@ -247,7 +247,7 @@ export function OneThread() {
   const mentionMenuOpen = () =>
     mention() !== null && mentionMatches().available.length + mentionMatches().unavailable.length > 0;
   const updateMention = () => {
-    if (!inputRef || focused() || replyTarget() || inputRef.selectionStart !== inputRef.selectionEnd) {
+    if (!inputRef || inputRef.selectionStart !== inputRef.selectionEnd) {
       setMention(null);
       return;
     }
@@ -290,7 +290,17 @@ export function OneThread() {
     const id = focusedId();
     return id ? model.threadById()[id] ?? null : null;
   };
-  const threadTitle = (id: string) => model.threadById()[id]?.title || "thread";
+  const threadTitle = (id: string) => model.threadById()[model.rootOf(id)]?.title || "thread";
+  // A conversation can hold several agents (looped in with @agent).
+  const multiAgent = (rootId: string) => model.sessionsIn(rootId).length > 1;
+  const participants = (rootId: string) => model.sessionsIn(rootId).map((t) => threadAgentLabel(t));
+  /** Label over an agent's replies: the thread (in the all view) and, with several agents, which one. */
+  const runLabel = (sessionId: string) => {
+    const root = model.rootOf(sessionId);
+    const agent = multiAgent(root) ? threadAgentLabel(model.threadById()[sessionId]) : null;
+    if (focusedId()) return agent ?? "";
+    return agent ? `${threadTitle(root)} · ${agent}` : threadTitle(root);
+  };
   const replyTarget = () => {
     const id = model.replyTargetId();
     return id && model.threadById()[id] ? id : null;
@@ -298,7 +308,6 @@ export function OneThread() {
 
   // The agent the draft @mentions, if any.
   const mentionedAgent = createMemo(() => {
-    if (focused() || replyTarget()) return null;
     const found = findMention(draft(), agents().map((a) => a.handle));
     return found ? { ...found, agent: agentForHandle(found.handle) } : null;
   });
@@ -340,7 +349,7 @@ export function OneThread() {
     return open ? model.threads().find((t) => t.session_id === open.id) ?? null : null;
   };
   const messageCounts = (threadId: string) => {
-    const messages = model.messages().filter((m) => m.session_id === threadId);
+    const messages = model.messages().filter((m) => model.rootOf(m.session_id) === threadId);
     return { total: messages.length, fromYou: messages.filter((m) => m.role === "user").length };
   };
   const startRename = () => {
@@ -421,16 +430,19 @@ export function OneThread() {
     if (query.terms.length === 0 && !agent && !pinnedOnly && !from && !since) return null;
     // undefined: any agent; null: the default Claude Code.
     const presetId = agent ? (agentForHandle(agent)?.preset?.id ?? null) : undefined;
-    const threadOk = (t: ThreadRecord) =>
-      (!pinnedOnly || t.pinned) && (presetId === undefined || (t.preset_id ?? null) === presetId);
-    const threads = new Map(model.threads().map((t) => [t.session_id, t]));
+    // Pinned is a property of the conversation; the agent filter matches the
+    // agent that sent or received the message.
+    const threadOk = (t: ThreadRecord) => !pinnedOnly || t.pinned;
+    const agentOk = (sessionId: string) =>
+      presetId === undefined || (model.threadById()[sessionId]?.preset_id ?? null) === presetId;
+    const threads = new Map(model.conversations().map((t) => [t.session_id, t]));
     const groups = new Map<string, SearchGroup>();
     const messages = model.messages();
     let total = 0;
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const m = messages[i];
-      const thread = threads.get(m.session_id);
-      if (!thread || !threadOk(thread)) continue;
+      const thread = threads.get(model.rootOf(m.session_id));
+      if (!thread || !threadOk(thread) || !agentOk(m.session_id)) continue;
       if ((from === "me" && m.role !== "user") || (from === "agent" && m.role !== "agent")) continue;
       if (m.created_at < since) continue;
       if (!matchesTerms(m.body, query.terms)) continue;
@@ -448,6 +460,7 @@ export function OneThread() {
       const byRecent = [...threads.values()].sort((a, b) => b.last_activity_at - a.last_activity_at);
       for (const thread of byRecent) {
         if (groups.has(thread.session_id) || !threadOk(thread) || thread.last_activity_at < since) continue;
+        if (!model.sessionsIn(thread.session_id).some((t) => agentOk(t.session_id))) continue;
         if (matchesTerms(thread.title, query.terms)) {
           groups.set(thread.session_id, { thread, matches: [], total: 0 });
         }
@@ -492,14 +505,14 @@ export function OneThread() {
   const visibleMessages = createMemo(() => {
     const id = focusedId();
     const all = model.messages();
-    return id ? all.filter((m) => m.session_id === id) : all;
+    return id ? all.filter((m) => model.rootOf(m.session_id) === id) : all;
   });
 
   const workingThreads = createMemo(
     () => {
       const id = focusedId();
-      const ids = id ? [id] : model.threads().map((t) => t.session_id);
-      return ids.filter((tid) => model.isWorking(tid));
+      const sessions = id ? model.sessionsIn(id) : model.threads();
+      return sessions.map((t) => t.session_id).filter((tid) => model.isSessionWorking(tid));
     },
     [],
     { equals: sameIds }
@@ -536,7 +549,7 @@ export function OneThread() {
       prevAt = m.created_at;
       const startsAgentRun =
         m.role === "agent" && (!prev || prev.role !== "agent" || prev.session_id !== m.session_id);
-      if (inAll && startsAgentRun) {
+      if ((inAll || multiAgent(model.rootOf(m.session_id))) && startsAgentRun) {
         out.push({ kind: "label", key: `label-${m.id}`, threadId: m.session_id });
       }
       out.push({ kind: "message", key: m.id, message: m, receipt: receiptFor.get(m.id) ?? null });
@@ -546,7 +559,8 @@ export function OneThread() {
     const last = list[list.length - 1];
     for (const tid of workingThreads()) {
       const continuesRun = last && last.role === "agent" && last.session_id === tid;
-      out.push({ kind: "typing", key: `typing-${tid}`, threadId: tid, showLabel: inAll && !continuesRun });
+      const labeled = inAll || multiAgent(model.rootOf(tid));
+      out.push({ kind: "typing", key: `typing-${tid}`, threadId: tid, showLabel: labeled && !continuesRun });
     }
     const nextCache = new Map<string, StreamItem>();
     const stable = out.map((item) => {
@@ -751,7 +765,8 @@ export function OneThread() {
       let nextTarget: string | null = null;
       const target = focusedId() ?? replyTarget();
       if (target) {
-        await model.sendReply(target, text, images);
+        // An @agent in a reply loops that agent into the conversation.
+        await model.sendToConversation(target, text, images, found?.agent ? { preset: found.agent.preset } : null);
         nextTarget = target;
       } else if (found?.agent) {
         nextTarget = await model.startThread(text, images, found.agent.preset);
@@ -925,7 +940,7 @@ export function OneThread() {
 
   const placeholder = () => {
     if (focused()) return `Message ${focused()?.title}`;
-    if (replyTarget()) return "Reply · ⌫ for a new thread";
+    if (replyTarget()) return "Reply · @ to loop in an agent · ⌫ for a new thread";
     return "Start a new thread · @ to pick an agent";
   };
 
@@ -946,7 +961,11 @@ export function OneThread() {
               <div class="ot-focus-title">
                 <div class="ot-focus-name">{thread().title}</div>
                 <div class={`ot-focus-status ${model.isWorking(thread().session_id) ? "working" : ""}`}>
-                  {thread().preset_name ? `${thread().preset_name} · ` : ""}
+                  {multiAgent(thread().session_id)
+                    ? `${participants(thread().session_id).join(" + ")} · `
+                    : thread().preset_name
+                      ? `${thread().preset_name} · `
+                      : ""}
                   {model.isWorking(thread().session_id) ? "working…" : "idle"}
                 </div>
               </div>
@@ -1244,7 +1263,7 @@ export function OneThread() {
                             </For>
                           </span>
                           <span class="ot-search-thread-meta">
-                            {group.thread.preset_name ?? "Claude Code"}
+                            {participants(group.thread.session_id).join(" + ")}
                             {group.thread.pinned ? " · pinned" : ""}
                           </span>
                         </button>
@@ -1302,8 +1321,8 @@ export function OneThread() {
                 </Match>
                 <Match when={item.kind === "label" && item}>
                   {(it) => (
-                    <button class="ot-thread-name" onClick={() => model.focusThread(it().threadId)}>
-                      {threadTitle(it().threadId)}
+                    <button class="ot-thread-name" onClick={() => model.focusThread(model.rootOf(it().threadId))}>
+                      {runLabel(it().threadId)}
                     </button>
                   )}
                 </Match>
@@ -1311,8 +1330,8 @@ export function OneThread() {
                   {(it) => (
                     <div class="ot-row agent">
                       <Show when={it().showLabel}>
-                        <button class="ot-thread-name" onClick={() => model.focusThread(it().threadId)}>
-                          {threadTitle(it().threadId)}
+                        <button class="ot-thread-name" onClick={() => model.focusThread(model.rootOf(it().threadId))}>
+                          {runLabel(it().threadId)}
                         </button>
                       </Show>
                       <div class="ot-bubble agent ot-typing" aria-label="Agent is working">
@@ -1326,12 +1345,13 @@ export function OneThread() {
                 <Match when={item.kind === "message" && item}>
                   {(it) => {
                     const m = () => it().message;
-                    const pinned = () => model.threadById()[m().session_id]?.pinned ?? false;
+                    const root = () => model.rootOf(m().session_id);
+                    const pinned = () => model.threadById()[root()]?.pinned ?? false;
                     const stale = () => {
                       app.idleTick();
                       return (
                         m().status === "delivered" &&
-                        !model.isWorking(m().session_id) &&
+                        !model.isSessionWorking(m().session_id) &&
                         Date.now() - m().created_at > STALE_DELIVERY_MS
                       );
                     };
@@ -1364,7 +1384,7 @@ export function OneThread() {
                           <div class={`ot-hover-actions ${menuFor() === m().id ? "open" : ""}`}>
                             <Show when={!focusedId()}>
                               <button
-                                onClick={() => startReply(m().session_id)}
+                                onClick={() => startReply(root())}
                                 title="Reply in this thread"
                                 aria-label="Reply in this thread"
                               >
@@ -1373,7 +1393,7 @@ export function OneThread() {
                             </Show>
                             <button
                               class={pinned() ? "active" : ""}
-                              onClick={() => void model.setPinned(m().session_id, !pinned())}
+                              onClick={() => void model.setPinned(root(), !pinned())}
                               title={pinned() ? "Unpin thread" : "Pin thread"}
                               aria-label={pinned() ? "Unpin thread" : "Pin thread"}
                               aria-pressed={pinned()}
@@ -1399,18 +1419,18 @@ export function OneThread() {
                                   </button>
                                 </Show>
                                 <Show when={!focusedId()}>
-                                  <button role="menuitem" onClick={fromMenu(() => startReply(m().session_id))}>
+                                  <button role="menuitem" onClick={fromMenu(() => startReply(root()))}>
                                     <Icon name="reply" />
                                     Reply
                                   </button>
-                                  <button role="menuitem" onClick={fromMenu(() => model.focusThread(m().session_id))}>
+                                  <button role="menuitem" onClick={fromMenu(() => model.focusThread(root()))}>
                                     <Icon name="open" />
                                     Open thread
                                   </button>
                                 </Show>
                                 <button
                                   role="menuitem"
-                                  onClick={fromMenu(() => void model.setPinned(m().session_id, !pinned()))}
+                                  onClick={fromMenu(() => void model.setPinned(root(), !pinned()))}
                                 >
                                   <Icon name="pin" filled={pinned()} />
                                   {pinned() ? "Unpin thread" : "Pin thread"}
@@ -1547,7 +1567,7 @@ export function OneThread() {
         >
           <Show when={mentionMenuOpen()}>
             <div class="ot-preset-menu" role="listbox" aria-label="Agents">
-              <div class="ot-preset-heading">Start with</div>
+              <div class="ot-preset-heading">{focused() || replyTarget() ? "Loop in" : "Start with"}</div>
               <For each={mentionMatches().available}>
                 {(agent, i) => (
                   <button
@@ -1723,7 +1743,7 @@ export function OneThread() {
                   onBlur={() => finishRename(true)}
                 />
               </Show>
-              <div class="ot-popover-agent">{thread().preset_name ?? "Claude Code"}</div>
+              <div class="ot-popover-agent">{participants(thread().session_id).join(" + ")}</div>
               <dl class="ot-popover-meta">
                 <dt>Started</dt>
                 <dd>{formatSeparator(thread().created_at)}</dd>

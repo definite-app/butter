@@ -754,7 +754,11 @@ async fn team_reply(
 #[derive(Deserialize)]
 struct ThreadReplyForm {
     token: String,
+    #[serde(default)]
     body: String,
+    /// Absolute image paths, one per line (`--image`, repeatable).
+    #[serde(default)]
+    images: String,
 }
 
 async fn thread_reply(
@@ -770,7 +774,18 @@ async fn thread_reply(
         Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a 1thread session"),
         Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
-    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None, &[]) {
+    let paths: Vec<String> = form
+        .images
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let images = match crate::thread::import_agent_images(&id, &paths) {
+        Ok(images) => images,
+        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+    };
+    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None, &images) {
         Ok(message) => {
             let _ = state
                 .browser

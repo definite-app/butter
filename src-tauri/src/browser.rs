@@ -1679,7 +1679,7 @@ Usage:
   butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
-  butter-cli thread reply <message>
+  butter-cli thread reply [--image <path>]... <message>
   butter-cli help
 EOF
   else
@@ -1699,7 +1699,7 @@ Usage:
   butter-cli team user set --username <name> --pwd <path> --cmd <command> [--display-name <name>] [--description <text>] [--disabled]
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
-  butter-cli thread reply <message>
+  butter-cli thread reply [--image <path>]... <message>
   butter-cli help
 EOF
   fi
@@ -1749,14 +1749,34 @@ case "$root" in
     shift || true
     case "$subcommand" in
       reply)
+        images=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --image)
+              [ -n "${2:-}" ] || usage 1
+              image="$2"
+              case "$image" in
+                /*) ;;
+                *) image="$PWD/$image" ;;
+              esac
+              images="${images}${image}
+"
+              shift 2
+              ;;
+            *)
+              break
+              ;;
+          esac
+        done
         content="$(join_args "$@")"
-        if [ -z "$content" ] && [ ! -t 0 ]; then
+        if [ -z "$content" ] && [ -z "$images" ] && [ ! -t 0 ]; then
           content="$(cat)"
         fi
-        [ -n "$content" ] || usage 1
+        [ -n "$content" ] || [ -n "$images" ] || usage 1
         curl -fsS -X POST \
           --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
           --data-urlencode "body=$content" \
+          --data-urlencode "images=$images" \
           "$BUTTER_TEAM_ENDPOINT/thread/$BUTTER_SESSION_ID/reply"
         printf '\n'
         exit 0
