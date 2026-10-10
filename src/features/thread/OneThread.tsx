@@ -260,12 +260,6 @@ export function OneThread() {
     resizeInput();
     inputRef.focus();
   };
-  // The agent the draft @mentions, if any.
-  const mentionedAgent = createMemo(() => {
-    if (focused() || replyTarget()) return null;
-    const found = findMention(draft(), agents().map((a) => a.handle));
-    return found ? { ...found, agent: agentForHandle(found.handle) } : null;
-  });
   const [sending, setSending] = createSignal(false);
   // Message id whose ⋯ menu is open.
   const [menuFor, setMenuFor] = createSignal<string | null>(null);
@@ -296,6 +290,12 @@ export function OneThread() {
     return id && model.threadById()[id] ? id : null;
   };
 
+  // The agent the draft @mentions, if any.
+  const mentionedAgent = createMemo(() => {
+    if (focused() || replyTarget()) return null;
+    const found = findMention(draft(), agents().map((a) => a.handle));
+    return found ? { ...found, agent: agentForHandle(found.handle) } : null;
+  });
   // Hovering a pinned thread shows its details and lets you rename it.
   const [popover, setPopover] = createSignal<{ id: string; left: number; top: number } | null>(null);
   const [renaming, setRenaming] = createSignal(false);
