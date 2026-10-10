@@ -367,6 +367,33 @@ export function OneThread() {
   const [searchText, setSearchText] = createSignal("");
   const [searchPinnedOnly, setSearchPinnedOnly] = createSignal(false);
   const [searchFrom, setSearchFrom] = createSignal<SearchFrom>(null);
+  // The agent filter, shown as a chip in the field. Typing "@handle " sets it.
+  const [searchAgent, setSearchAgent] = createSignal<string | null>(null);
+  type SearchSince = "any" | "today" | "week" | "month";
+  const [searchSince, setSearchSince] = createSignal<SearchSince>("any");
+  const [searchMenu, setSearchMenu] = createSignal<"agent" | "time" | null>(null);
+  const SINCE_LABEL: Record<SearchSince, string> = {
+    any: "Any time",
+    today: "Today",
+    week: "Past 7 days",
+    month: "Past 30 days",
+  };
+  const sinceCutoff = (since: SearchSince) => {
+    if (since === "any") return 0;
+    const now = new Date();
+    if (since === "today") return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    return Date.now() - (since === "week" ? 7 : 30) * 86_400_000;
+  };
+  const handleSearchInput = (value: string) => {
+    // A finished "@handle " becomes the agent chip.
+    const found = findMention(value, agents().map((a) => a.handle));
+    if (found && /\s/.test(value.charAt(found.end))) {
+      setSearchAgent(found.handle);
+      value = stripMention(value, found) + (value.endsWith(" ") ? " " : "");
+      if (searchRef) searchRef.value = value;
+    }
+    setSearchText(value);
+  };
   let searchRef: HTMLInputElement | undefined;
   const openSearch = () => {
     closePopover();
@@ -378,12 +405,10 @@ export function OneThread() {
     });
   };
   const closeSearch = () => {
+    setSearchMenu(null);
     setSearchOpen(false);
     requestAnimationFrame(() => inputRef?.focus());
   };
-  const FROM_LABEL: Record<"any" | "me" | "agent", string> = { any: "Anyone", me: "Me", agent: "Agents" };
-  const cycleSearchFrom = () =>
-    setSearchFrom((from) => (from === null ? "me" : from === "me" ? "agent" : null));
   type SearchGroup = { thread: ThreadRecord; matches: ThreadMessage[]; total: number };
   const MATCHES_PER_THREAD = 3;
   const searchResults = createMemo(() => {
@@ -391,9 +416,11 @@ export function OneThread() {
     const query = parseSearchQuery(searchText(), agents().map((a) => a.handle));
     const pinnedOnly = query.pinned || searchPinnedOnly();
     const from = query.from ?? searchFrom();
-    if (query.terms.length === 0 && !query.agent && !pinnedOnly && !from) return null;
+    const agent = searchAgent() ?? query.agent;
+    const since = sinceCutoff(searchSince());
+    if (query.terms.length === 0 && !agent && !pinnedOnly && !from && !since) return null;
     // undefined: any agent; null: the default Claude Code.
-    const presetId = query.agent ? (agentForHandle(query.agent)?.preset?.id ?? null) : undefined;
+    const presetId = agent ? (agentForHandle(agent)?.preset?.id ?? null) : undefined;
     const threadOk = (t: ThreadRecord) =>
       (!pinnedOnly || t.pinned) && (presetId === undefined || (t.preset_id ?? null) === presetId);
     const threads = new Map(model.threads().map((t) => [t.session_id, t]));
@@ -405,6 +432,7 @@ export function OneThread() {
       const thread = threads.get(m.session_id);
       if (!thread || !threadOk(thread)) continue;
       if ((from === "me" && m.role !== "user") || (from === "agent" && m.role !== "agent")) continue;
+      if (m.created_at < since) continue;
       if (!matchesTerms(m.body, query.terms)) continue;
       let group = groups.get(thread.session_id);
       if (!group) {
@@ -416,10 +444,10 @@ export function OneThread() {
       if (group.matches.length < MATCHES_PER_THREAD) group.matches.push(m);
     }
     // Threads whose name matches, even if no message does.
-    if (query.terms.length > 0) {
+    if (query.terms.length > 0 && !from) {
       const byRecent = [...threads.values()].sort((a, b) => b.last_activity_at - a.last_activity_at);
       for (const thread of byRecent) {
-        if (groups.has(thread.session_id) || !threadOk(thread)) continue;
+        if (groups.has(thread.session_id) || !threadOk(thread) || thread.last_activity_at < since) continue;
         if (matchesTerms(thread.title, query.terms)) {
           groups.set(thread.session_id, { thread, matches: [], total: 0 });
         }
@@ -796,6 +824,7 @@ export function OneThread() {
   const closeMenuOnOutsideClick = (event: MouseEvent) => {
     const target = event.target as HTMLElement | null;
     if (mention() && !target?.closest(".ot-preset-menu, .ot-input")) setMention(null);
+    if (searchMenu() && !target?.closest(".ot-filter-wrap")) setSearchMenu(null);
     const heldMenu = heldMenuFor();
     if (heldMenu && !target?.closest(".ot-held-menu, .ot-held-agent")) resumeHeld(heldMenu);
     if (!menuFor()) return;
@@ -811,6 +840,11 @@ export function OneThread() {
       return;
     }
     if (event.key === "Escape") {
+      if (searchMenu()) {
+        event.preventDefault();
+        setSearchMenu(null);
+        return;
+      }
       if (searchOpen()) {
         event.preventDefault();
         closeSearch();
@@ -947,63 +981,176 @@ export function OneThread() {
         when={!searchOpen()}
         fallback={
           <div class="ot-search-bar">
-            <div class="ot-search-inner">
-              <label class="ot-search-field">
-                <Icon name="search" />
-                <input
-                  ref={searchRef}
-                  class="ot-search-input"
-                  placeholder="Search threads"
-                  value={searchText()}
-                  spellcheck={false}
-                  onInput={(e) => setSearchText(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.isComposing) {
-                      const first = searchResults()?.groups[0];
-                      if (first) {
-                        e.preventDefault();
-                        jumpTo(first.thread.session_id, first.matches[0]?.id ?? null);
-                      }
-                    } else if (e.key === "Escape") {
+            <label class="ot-search-field">
+              <Icon name="search" />
+              <Show when={searchAgent()}>
+                {(handle) => (
+                  <span class="ot-search-chip">
+                    @{handle()}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSearchAgent(null);
+                        searchRef?.focus();
+                      }}
+                      aria-label="Remove agent filter"
+                    >
+                      ×
+                    </button>
+                  </span>
+                )}
+              </Show>
+              <input
+                ref={searchRef}
+                class="ot-search-input"
+                placeholder={searchAgent() ? "Search this agent's threads" : "Search threads"}
+                value={searchText()}
+                spellcheck={false}
+                onInput={(e) => handleSearchInput(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.isComposing) {
+                    const first = searchResults()?.groups[0];
+                    if (first) {
                       e.preventDefault();
-                      e.stopPropagation();
-                      closeSearch();
+                      jumpTo(first.thread.session_id, first.matches[0]?.id ?? null);
                     }
-                  }}
-                />
-                <Show when={searchText()}>
-                  <button
-                    type="button"
-                    class="ot-search-clear"
-                    onClick={() => {
-                      setSearchText("");
-                      searchRef?.focus();
-                    }}
-                    aria-label="Clear search"
-                  >
-                    ×
-                  </button>
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (searchMenu()) setSearchMenu(null);
+                    else closeSearch();
+                  } else if (e.key === "Backspace" && searchAgent() && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) {
+                    setSearchAgent(null);
+                  }
+                }}
+              />
+              <button type="button" class="ot-search-esc" onClick={closeSearch} title="Close search">
+                esc
+              </button>
+            </label>
+            <div class="ot-search-filters">
+              <span class="ot-filter-wrap">
+                <button
+                  type="button"
+                  class={`ot-filter ${searchAgent() ? "active" : ""}`}
+                  onClick={() => setSearchMenu((m) => (m === "agent" ? null : "agent"))}
+                  aria-haspopup="listbox"
+                  aria-expanded={searchMenu() === "agent"}
+                >
+                  Agent: {searchAgent() ? `@${searchAgent()}` : "Any"}
+                  <span class="ot-filter-caret">▾</span>
+                </button>
+                <Show when={searchMenu() === "agent"}>
+                  <div class="ot-preset-menu ot-filter-menu" role="listbox" aria-label="Agent">
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={!searchAgent()}
+                      class="ot-preset-item"
+                      onClick={() => {
+                        setSearchAgent(null);
+                        setSearchMenu(null);
+                      }}
+                    >
+                      <span class="ot-preset-text">
+                        <span class="ot-preset-name">Any agent</span>
+                      </span>
+                      <Show when={!searchAgent()}>
+                        <Icon name="check" />
+                      </Show>
+                    </button>
+                    <For each={agents()}>
+                      {(agent) => (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={searchAgent() === agent.handle}
+                          class="ot-preset-item"
+                          onClick={() => {
+                            setSearchAgent(agent.handle);
+                            setSearchMenu(null);
+                          }}
+                        >
+                          <AgentMenuText handle={agent.handle} agent={agent.value} />
+                          <Show when={searchAgent() === agent.handle}>
+                            <Icon name="check" />
+                          </Show>
+                        </button>
+                      )}
+                    </For>
+                  </div>
                 </Show>
-              </label>
+              </span>
               <button
                 type="button"
                 class={`ot-filter ${searchPinnedOnly() ? "active" : ""}`}
                 aria-pressed={searchPinnedOnly()}
                 onClick={() => setSearchPinnedOnly((on) => !on)}
               >
+                <Icon name="pin" filled={searchPinnedOnly()} />
                 Pinned only
               </button>
-              <button
-                type="button"
-                class={`ot-filter ${searchFrom() ? "active" : ""}`}
-                onClick={cycleSearchFrom}
-                title="Who sent the message"
-              >
-                From: {FROM_LABEL[searchFrom() ?? "any"]}
-              </button>
-              <button type="button" class="ot-ghost-btn" onClick={closeSearch}>
-                Done
-              </button>
+              <div class="ot-seg" role="radiogroup" aria-label="From">
+                <For each={[[null, "Anyone"], ["me", "Me"], ["agent", "Agents"]] as const}>
+                  {([value, label]) => (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={searchFrom() === value}
+                      class={`ot-seg-btn ${searchFrom() === value ? "active" : ""}`}
+                      onClick={() => setSearchFrom(value)}
+                    >
+                      {label}
+                    </button>
+                  )}
+                </For>
+              </div>
+              <span class="ot-filter-wrap">
+                <button
+                  type="button"
+                  class={`ot-filter ${searchSince() !== "any" ? "active" : ""}`}
+                  onClick={() => setSearchMenu((m) => (m === "time" ? null : "time"))}
+                  aria-haspopup="listbox"
+                  aria-expanded={searchMenu() === "time"}
+                >
+                  {SINCE_LABEL[searchSince()]}
+                  <span class="ot-filter-caret">▾</span>
+                </button>
+                <Show when={searchMenu() === "time"}>
+                  <div class="ot-preset-menu ot-filter-menu narrow" role="listbox" aria-label="Time">
+                    <For each={["any", "today", "week", "month"] as const}>
+                      {(since) => (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={searchSince() === since}
+                          class="ot-preset-item"
+                          onClick={() => {
+                            setSearchSince(since);
+                            setSearchMenu(null);
+                          }}
+                        >
+                          <span class="ot-preset-text">
+                            <span class="ot-preset-name">{SINCE_LABEL[since]}</span>
+                          </span>
+                          <Show when={searchSince() === since}>
+                            <Icon name="check" />
+                          </Show>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </span>
+              <span class="ot-search-total">
+                <Show when={searchResults()}>
+                  {(results) =>
+                    results().total > 0
+                      ? `${results().total} ${results().total === 1 ? "message" : "messages"}`
+                      : `${results().groups.length} ${results().groups.length === 1 ? "thread" : "threads"}`
+                  }
+                </Show>
+              </span>
             </div>
           </div>
         }
@@ -1047,7 +1194,11 @@ export function OneThread() {
                         class="ot-search-token"
                         onClick={() => {
                           const base = searchText().trim();
-                          setSearchText(`${base ? `${base} ` : ""}${token === "@agent" ? "@" : `${token} `}`);
+                          if (token === "@agent") {
+                            setSearchMenu("agent");
+                            return;
+                          }
+                          setSearchText(`${base ? `${base} ` : ""}${token} `);
                           searchRef?.focus();
                         }}
                       >
@@ -1073,13 +1224,6 @@ export function OneThread() {
                     </div>
                   }
                 >
-                  <div class="ot-search-count">
-                    {results().total > 0
-                      ? `${results().total} ${results().total === 1 ? "message" : "messages"} in ${
-                          results().groups.length
-                        } ${results().groups.length === 1 ? "thread" : "threads"}`
-                      : `${results().groups.length} ${results().groups.length === 1 ? "thread" : "threads"}`}
-                  </div>
                   <For each={results().groups}>
                     {(group) => (
                       <section class="ot-search-group">
