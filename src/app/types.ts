@@ -214,7 +214,7 @@ export interface PasteQueueItem {
   filename: string;
 }
 
-export type AppView = "terminal" | "canvas" | "team";
+export type AppView = "terminal" | "canvas" | "team" | "thread";
 export type CanvasTool = "select" | "pen";
 export type CanvasFileKind = "text" | "image" | "binary";
 

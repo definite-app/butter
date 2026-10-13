@@ -25,6 +25,7 @@ import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree"
 import { buildAgentResumeCommand } from "../utils/agentResume";
 import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
+import { buildThreadResumeCommand, createThreadModel, THREAD_TAG } from "../features/thread/threadModel";
 import type {
   AppView,
   AppConfig,
@@ -716,7 +717,7 @@ export function useAppModel() {
   const [showFilterMenu, setShowFilterMenu] = createSignal(false);
   const [appView, setAppView] = createSignal<AppView>((() => {
     const stored = localStorage.getItem(APP_VIEW_STORAGE_KEY);
-    return stored === "canvas" || stored === "team" ? stored : "terminal";
+    return stored === "canvas" || stored === "team" || stored === "thread" ? stored : "terminal";
   })());
   const [showCommandPalette, setShowCommandPalette] = createSignal(false);
   const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher">(
@@ -2129,6 +2130,12 @@ export function useAppModel() {
         label: "Open Team Mode",
         description: "Switch to Slack-style agent channels and DMs",
         action: () => setAppViewMode("team"),
+      },
+      {
+        id: "open-thread-view",
+        label: "Open 1thread",
+        description: "Chat with Claude Code sessions in one message stream",
+        action: () => setAppViewMode("thread"),
       },
     ];
 
@@ -4447,6 +4454,15 @@ export function useAppModel() {
         return null;
       }
 
+      // Load tags before the session mounts: its terminal's resume command
+      // depends on them (1thread sessions resume with extra flags).
+      try {
+        const tagsForSession = await invoke<string[]>("db_get_session_tags", { sessionId: id });
+        setTerminalTags((prev) => ({ ...prev, [id]: tagsForSession }));
+      } catch (err) {
+        console.error(`Failed to load tags for reopened session ${id}:`, err);
+      }
+
       queueAgentResumeOnReopen(dbSession);
       const session = mapDbSessionToWebSession(dbSession);
       const existingIndex = sessions.findIndex((entry) => entry.id === id);
@@ -4454,13 +4470,6 @@ export function useAppModel() {
         setSessions(sessions.length, session);
       } else {
         setSessions(existingIndex, session);
-      }
-
-      try {
-        const tagsForSession = await invoke<string[]>("db_get_session_tags", { sessionId: id });
-        setTerminalTags((prev) => ({ ...prev, [id]: tagsForSession }));
-      } catch (err) {
-        console.error(`Failed to load tags for reopened session ${id}:`, err);
       }
 
       selectSession(id);
@@ -5008,8 +5017,21 @@ export function useAppModel() {
     if (resumeInfo && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       pendingAgentResume.delete(id);
-      const resumeCmd = buildAgentResumeCommand(resumeInfo);
-      void invoke("pty_write", { id: ptyId, data: `${resumeCmd}\n` });
+      // 1thread sessions resume with their reply instructions, which the
+      // transcript doesn't keep; everything else uses the plain resume.
+      const isThread = (resumeInfo.kind === "claude" || resumeInfo.kind === "codex") && (terminalTags()[id] || []).includes(THREAD_TAG);
+      const resumePtyId = ptyId;
+      void (async () => {
+        let resumeCmd = buildAgentResumeCommand(resumeInfo);
+        if (isThread) {
+          try {
+            resumeCmd = await buildThreadResumeCommand(id, resumeInfo.agentSessionId ?? null);
+          } catch (err) {
+            console.warn("[thread] falling back to plain resume:", err);
+          }
+        }
+        await invoke("pty_write", { id: resumePtyId, data: `${resumeCmd}\n` });
+      })();
     } else if (command && createdPty && !commandRunFor.has(id)) {
       commandRunFor.add(id);
       void invoke("pty_write", { id: ptyId, data: `${command}\n` });
@@ -5061,6 +5083,62 @@ export function useAppModel() {
     }
   };
 
+  // Hidden hosts let a session's xterm + PTY start while no terminal view is
+  // mounted (1thread). The xterm element moves to the real host once the
+  // terminal view registers one; the buffer, and so the scrollback, carries over.
+  const offscreenTerminalHosts = new Map<string, HTMLDivElement>();
+  let offscreenTerminalContainer: HTMLDivElement | null = null;
+
+  async function ensureTerminalOffscreen(id: string) {
+    for (const [hostId, host] of offscreenTerminalHosts) {
+      if (!terminalInstances.has(hostId) && hostId !== id) {
+        host.remove();
+        offscreenTerminalHosts.delete(hostId);
+        if (terminalHosts.get(hostId) === host) terminalHosts.delete(hostId);
+      }
+    }
+    if (terminalInstances.has(id)) return;
+    // View hosts stay registered after their view unmounts; a detached one
+    // can't be measured, so fall back to an offscreen host.
+    if (!terminalHosts.get(id)?.isConnected) {
+      if (!offscreenTerminalContainer) {
+        offscreenTerminalContainer = document.createElement("div");
+        offscreenTerminalContainer.setAttribute("aria-hidden", "true");
+        Object.assign(offscreenTerminalContainer.style, {
+          position: "fixed",
+          left: "-20000px",
+          top: "0",
+          width: "1000px",
+          height: "640px",
+          overflow: "hidden",
+          pointerEvents: "none",
+        });
+        document.body.appendChild(offscreenTerminalContainer);
+      }
+      offscreenTerminalHosts.get(id)?.remove();
+      const host = document.createElement("div");
+      host.style.width = "100%";
+      host.style.height = "100%";
+      offscreenTerminalContainer.appendChild(host);
+      offscreenTerminalHosts.set(id, host);
+      terminalHosts.set(id, host);
+    }
+    await ensureTerminal(id, { focus: false });
+  }
+
+  async function pasteIntoSession(id: string, text: string): Promise<boolean> {
+    if (!terminalInstances.has(id)) {
+      await ensureTerminalOffscreen(id);
+    }
+    const instance = terminalInstances.get(id);
+    if (!instance) return false;
+    // Paste so bracketed paste mode is respected, then send Enter.
+    instance.term.paste(text);
+    instance.term.input("\r");
+    scheduleScrollbackSave(id);
+    return true;
+  }
+
   const registerTerminalHost = (id: string, el?: HTMLDivElement) => {
     if (el) {
       terminalHosts.set(id, el);
@@ -5070,6 +5148,11 @@ export function useAppModel() {
         requestAnimationFrame(() => fitTerminalSession(id));
       } else {
         maybeEnsureTerminal(id);
+      }
+      const offscreenHost = offscreenTerminalHosts.get(id);
+      if (offscreenHost && offscreenHost !== el) {
+        offscreenHost.remove();
+        offscreenTerminalHosts.delete(id);
       }
     } else {
       clearTerminalHostInteractions(id);
@@ -6210,7 +6293,9 @@ export function useAppModel() {
   };
 
   // Dismiss the picker without reopening anything; start a fresh terminal.
-  const dismissReopenPicker = () => {
+  // "New terminal" always leaves a terminal open; closing the picker (×, Esc,
+  // clicking outside) only does that when the terminal view would be empty.
+  const dismissReopenPicker = (options?: { newTerminal?: boolean }) => {
     const candidates = restoreCandidates();
     void resolveRestoreCandidates(
       [],
@@ -6219,7 +6304,8 @@ export function useAppModel() {
     setRestorePromptOpen(false);
     setRestoreCandidates([]);
     setRestoreDecision("no");
-    if (sessions.length === 0) createSession();
+    const newTerminal = options?.newTerminal ?? true;
+    if (sessions.length === 0 && (newTerminal || appView() === "terminal")) createSession();
   };
 
   // Persist the active terminal id (crash-safe) and keep its last_accessed_at
@@ -6406,6 +6492,8 @@ export function useAppModel() {
         setTeamSearchRequestId((prev) => prev + 1);
         return;
       }
+      // 1thread handles its own ⌘F.
+      if (appView() === "thread") return;
       if (activeWorkspaceTabKind() === "text_file") {
         event.preventDefault();
         event.stopPropagation();
@@ -6444,6 +6532,7 @@ export function useAppModel() {
       const isCmdW = (event.key === "w" || event.key === "W") && event.metaKey && !event.shiftKey;
       if (!isCmdW) return;
       event.preventDefault();
+      if (appView() === "thread") return;
       const active = activeSessionId();
       const activeTab = activeWorkspaceFileTab();
       if (active && activeTab) {
@@ -6470,6 +6559,7 @@ export function useAppModel() {
       // If pressed again quickly (already at line start), send regular backspace
       const isCmdBackspace = event.key === "Backspace" && event.metaKey;
       if (!isCmdBackspace) return;
+      if (appView() === "thread") return;
       if (activeWorkspaceTabKind() !== "terminal") return;
       if (isEditableTarget(event.target)) return;
       event.preventDefault();
@@ -6579,6 +6669,7 @@ export function useAppModel() {
           return;
         }
         if (isEditableTarget(event.target)) return;
+        if (appView() === "thread") return;
         console.log("[paste] event target", {
           tag: (event.target as HTMLElement | null)?.tagName,
           className: (event.target as HTMLElement | null)?.className,
@@ -6672,7 +6763,7 @@ export function useAppModel() {
       if (!isPaste) return;
       if (isWithinTerminalHost(event.target)) return;
       if (isEditableTarget(event.target)) return;
-      if (appView() === "canvas") return;
+      if (appView() === "canvas" || appView() === "thread") return;
       if (activeWorkspaceTabKind() !== "terminal") return;
       if (isTerminalActiveElement()) return;
       const active = activeSessionId();
@@ -6697,6 +6788,7 @@ export function useAppModel() {
 
     const handleShiftEnter = (event: KeyboardEvent) => {
       if (!isShiftEnterEvent(event)) return;
+      if (appView() === "thread") return;
       if (activeWorkspaceTabKind() !== "terminal") return;
       if (isEditableTarget(event.target)) return;
       // Let terminal's own handler deal with it to avoid double newlines
@@ -6714,7 +6806,7 @@ export function useAppModel() {
       if (event.inputType !== "insertFromPaste") return;
       if (isWithinTerminalHost(event.target)) return;
       if (isEditableTarget(event.target)) return;
-      if (appView() === "canvas") return;
+      if (appView() === "canvas" || appView() === "thread") return;
       if (activeWorkspaceTabKind() !== "terminal") return;
       const sessionId = resolvePasteSessionId(event.target);
       if (!sessionId) return;
@@ -6785,7 +6877,7 @@ export function useAppModel() {
     // Enter key to rename selected terminal (like Finder)
     const handleEnterRename = (event: KeyboardEvent) => {
       if (event.key !== "Enter") return;
-      if (appView() === "canvas") return;
+      if (appView() === "canvas" || appView() === "thread") return;
       if (activeWorkspaceTabKind() !== "terminal") return;
       // Don't trigger if already renaming or in an editable field
       if (renamingSessionId()) return;
@@ -7364,7 +7456,24 @@ export function useAppModel() {
     current.resolve(value);
   };
 
+  const thread = createThreadModel({
+    sessions,
+    claudeState,
+    agentSessionIdBySession,
+    ptyBySession,
+    createSession,
+    startSessionTerminal: ensureTerminalOffscreen,
+    pasteIntoSession,
+    reopenSession: reopenClosedSession,
+    tagSession: (id, tag) => {
+      if (!tags().includes(tag)) saveTags([...tags(), tag]);
+      addTagToTerminal(id, tag);
+    },
+    renameSession: updateSessionTitle,
+  });
+
   return {
+    thread,
     sessions,
     setSessions,
     recentlyClosedSessions,

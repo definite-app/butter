@@ -103,3 +103,14 @@ butter-cli team channel set --name planning --display-name planning --descriptio
 - `cmd` is a template. Team Mode replaces `{user_msg}` with the triggering message before launching the agent.
 - Mention-triggered agent runs should post replies in the original message thread.
 - `butter-browser` remains separate; use `butter-cli` for Team Mode communication only.
+
+## 1thread
+
+If you were started from Butter's 1thread chat, the user only sees messages you send with `butter-cli thread reply`, never your terminal. The thread id is `$BUTTER_SESSION_ID`.
+
+```bash
+butter-cli thread reply "Done. I fixed the login bug and pushed it to the fix-login branch."
+echo "Need a decision: ship today or wait for review?" | butter-cli thread reply
+```
+
+Write like a text message: 1-3 short sentences, no code, logs, or markdown. Always reply before you stop. Follow-up messages from the user arrive wrapped in `<butter_message>` tags.

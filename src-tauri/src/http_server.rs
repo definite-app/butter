@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::TcpListener;
+use tauri::Emitter;
 use std::sync::Arc;
 
 /// Shared state for the HTTP server
@@ -65,6 +66,8 @@ pub async fn start_server(
         .route("/team/:id/users/set", post(team_user_set))
         .route("/team/:id/channels", get(team_channels))
         .route("/team/:id/channels/set", post(team_channel_set))
+        // 1thread CLI routes
+        .route("/thread/:id/reply", post(thread_reply))
         // Agent routes
         .route("/agents", get(list_agents))
         .route("/agents/register", post(register_agent))
@@ -745,6 +748,52 @@ async fn team_reply(
     match state.db.create_team_message(&req) {
         Ok(message) => ok_json(message),
         Err(err) => error_json(team_message_error_status(&err), err),
+    }
+}
+
+#[derive(Deserialize)]
+struct ThreadReplyForm {
+    token: String,
+    #[serde(default)]
+    body: String,
+    /// Absolute image paths, one per line (`--image`, repeatable).
+    #[serde(default)]
+    images: String,
+}
+
+async fn thread_reply(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<ThreadReplyForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match crate::thread::get_thread(&state.db, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a 1thread session"),
+        Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+    let paths: Vec<String> = form
+        .images
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let images = match crate::thread::import_agent_images(&id, &paths) {
+        Ok(images) => images,
+        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+    };
+    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None, &images) {
+        Ok(message) => {
+            let _ = state
+                .browser
+                .app_handle()
+                .emit(crate::thread::THREAD_MESSAGE_EVENT, &message);
+            ok_json(message)
+        }
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
     }
 }
 

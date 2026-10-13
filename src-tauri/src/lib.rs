@@ -9,6 +9,7 @@ mod database;
 mod http_server;
 mod paths;
 mod pty;
+mod thread;
 mod session_cli;
 
 use agent_types::*;
@@ -1344,10 +1345,13 @@ fn write_file_binary(path: String, bytes: Vec<u8>) -> Result<(), String> {
     let parent = expanded
         .parent()
         .ok_or_else(|| "Invalid path".to_string())?;
-    let allowed_dir = paste_images_dir()?;
-    let allowed_canon = fs::canonicalize(&allowed_dir).map_err(|e| e.to_string())?;
     let parent_canon = fs::canonicalize(parent).map_err(|e| e.to_string())?;
-    if !parent_canon.starts_with(&allowed_canon) {
+    // Pasted images: the terminal paste folder, and 1thread's unsent images.
+    let allowed = [paste_images_dir()?, thread::pending_attachments_dir()?]
+        .iter()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .any(|dir| parent_canon.starts_with(dir));
+    if !allowed {
         return Err("Refusing to write outside paste images directory".to_string());
     }
     fs::write(&expanded, bytes).map_err(|e| e.to_string())
@@ -2054,6 +2058,19 @@ pub fn run() {
             cc_search::cc_last_assistant_turn,
             cc_search::codex_last_assistant_turn,
             cc_search::codex_latest_session_id,
+            thread::thread_create,
+            thread::thread_list,
+            thread::thread_messages_all,
+            thread::thread_add_message,
+            thread::thread_update_message_status,
+            thread::thread_set_pinned,
+            thread::thread_rename,
+            thread::thread_route,
+            thread::thread_mark_viewed,
+            thread::thread_agent_alive,
+            thread::thread_stage_launch,
+            thread::thread_save_clipboard_image,
+            thread::thread_codex_status,
             app_flavor,
         ])
         .setup(|app| {

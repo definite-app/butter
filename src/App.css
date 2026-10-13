@@ -62,17 +62,30 @@
 
 /* --- Sidebar Resize Handle --- */
 .sidebar-resize-handle {
+  position: relative;
+  z-index: 20;
   width: 1px;
   background: var(--border-subtle);
   cursor: col-resize;
   flex-shrink: 0;
-  transition: all 0.15s ease;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* Invisible 12px hit area so the 1px line is easy to grab */
+.sidebar-resize-handle::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -6px;
+  right: -6px;
+  cursor: col-resize;
 }
 
 .sidebar-resize-handle:hover,
 .sidebar-resize-handle.active {
-  width: 3px;
   background: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary);
 }
 
 .sidebar-reopen-btn {
@@ -3791,6 +3804,32 @@ body.butter-printing-markdown .butter-print-content hr {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.reopen-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.reopen-close {
+  width: 26px;
+  height: 26px;
+  margin: -4px -6px 0 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.reopen-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
 }
 
 .reopen-title {

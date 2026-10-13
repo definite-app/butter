@@ -525,6 +525,18 @@ impl AgentDatabase {
         Ok(db)
     }
 
+    /// Run `f` against the shared connection (used by feature modules such as `thread`).
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
+        f(&conn)
+    }
+
     /// Get the database file path
     pub fn get_db_path() -> Result<PathBuf, String> {
         Ok(crate::paths::butter_home()?.join("agent.db"))
@@ -873,6 +885,40 @@ impl AgentDatabase {
                     ));
                 }
             }
+        }
+
+        // 1thread: chat threads backed by terminal sessions (timestamps in ms).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS threads (
+                session_id TEXT PRIMARY KEY,
+                title TEXT,
+                cwd TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER,
+                last_activity_at INTEGER,
+                last_viewed_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS thread_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                body TEXT NOT NULL,
+                source TEXT,
+                status TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_thread_messages_session
+                ON thread_messages(session_id, created_at);
+            "#,
+        )
+        .map_err(|e| format!("Failed to initialize thread schema: {}", e))?;
+        // Added after the first 1thread build; fails harmlessly once the column exists.
+        let _ = conn.execute("ALTER TABLE thread_messages ADD COLUMN attachments TEXT", []);
+        for column in ["preset_id TEXT", "preset_name TEXT", "agent_command TEXT", "parent_id TEXT"] {
+            let _ = conn.execute(&format!("ALTER TABLE threads ADD COLUMN {column}"), []);
         }
 
         if let Err(err) = conn.execute_batch(

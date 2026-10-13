@@ -294,7 +294,7 @@ pub fn cc_last_assistant_turn(
 /// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`; line 1 is a
 /// `session_meta` entry whose payload includes the `cwd`. We scan
 /// newest-first by year/month/day so a cold scan is bounded.
-fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<PathBuf> {
+pub(crate) fn list_codex_jsonls_newest_first(root: &std::path::Path, cap: usize) -> Vec<PathBuf> {
     fn sorted_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();

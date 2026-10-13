@@ -713,14 +713,14 @@ pub struct JevCandidate {
     pub detail: String,
 }
 
-struct JevSettings {
-    key: Option<String>,
+pub(crate) struct JevSettings {
+    pub(crate) key: Option<String>,
     key_source: &'static str,
-    model: String,
-    timeout_ms: u64,
+    pub(crate) model: String,
+    pub(crate) timeout_ms: u64,
 }
 
-fn jev_settings() -> JevSettings {
+pub(crate) fn jev_settings() -> JevSettings {
     let cfg = crate::config::load_config()
         .ok()
         .and_then(|c| c.typesafe)
@@ -849,6 +849,17 @@ pub async fn composer_jev_rank(
         return Err("jev not configured".to_string());
     };
     let body = build_jev_request(&settings.model, &draft, &query, &workspace, &candidates);
+    let parsed = jev_post(&body, &key, settings.timeout_ms).await?;
+    Ok(parse_jev_answers(&parsed, candidates.len()))
+}
+
+/// POSTs a request to Jev and returns the parsed JSON body. The key goes to
+/// curl on stdin so it never shows up in `ps`, and errors never include it.
+pub(crate) async fn jev_post(
+    body: &serde_json::Value,
+    key: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, String> {
     let body_raw = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let config = format!(
         "url = {}\nrequest = \"POST\"\nheader = {}\nheader = \"Content-Type: application/json\"\ndata-binary = {}\n",
@@ -856,7 +867,7 @@ pub async fn composer_jev_rank(
         curl_config_quote(&format!("Authorization: Bearer {key}")),
         curl_config_quote(&body_raw),
     );
-    let timeout_ms = settings.timeout_ms.clamp(100, 10_000);
+    let timeout_ms = timeout_ms.clamp(100, 10_000);
     let max_time = format!("{:.3}", timeout_ms as f64 / 1000.0);
 
     let mut child = tokio::process::Command::new("/usr/bin/curl")
@@ -890,9 +901,7 @@ pub async fn composer_jev_rank(
     if status != 200 {
         return Err(format!("jev http {status}"));
     }
-    let parsed: serde_json::Value =
-        serde_json::from_str(payload).map_err(|_| "jev bad response".to_string())?;
-    Ok(parse_jev_answers(&parsed, candidates.len()))
+    serde_json::from_str(payload).map_err(|_| "jev bad response".to_string())
 }
 
 // ---------------------------------------------------------------------------
