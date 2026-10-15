@@ -291,6 +291,7 @@ final class Daemon {
     private func endDictationState() {
         dictationMic = nil
         dictationSink = nil
+        dictationStartedAt = nil
         dictationHandsFree = false
         dictationSession += 1  // invalidates in-flight previews
         previewTimer?.invalidate()
