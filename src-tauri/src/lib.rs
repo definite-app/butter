@@ -9,6 +9,7 @@ mod database;
 mod http_server;
 mod paths;
 mod pty;
+mod routine;
 mod thread;
 mod session_cli;
 
@@ -2066,6 +2067,11 @@ pub fn run() {
             thread::thread_set_pinned,
             thread::thread_rename,
             thread::thread_route,
+            routine::routine_list,
+            routine::routine_claim_due,
+            routine::routine_mark_fired,
+            routine::routine_mark_failed,
+            routine::routine_cancel,
             thread::thread_mark_viewed,
             thread::thread_agent_alive,
             thread::thread_stage_launch,

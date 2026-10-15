@@ -62,3 +62,8 @@ npm run test:composer
 - Drafts are files under the flavor data dir (`~/.butter/drafts`, `~/.butter-dev/drafts`); sent drafts move to `drafts/sent/` and `drafts/history.jsonl`.
 - Send = one bracketed paste via xterm `paste()`, then a separate `\r` after a short delay (`ENTER_DELAY_MS`).
 - Optional TypeSafe Jev reranking: `[typesafe] api_key = "..."` in `config.toml` (or env `TYPESAFE_API_KEY`); `timeout_ms` (default 300). The key never reaches the webview.
+
+## Routines
+- Scheduled check-ins for 1thread. `butter-cli routine create --in 2w "<prompt>"` (or `--at YYYY-MM-DD [HH:MM]`; date-only means 9:00 local) saves a routine in the `routines` table; `list`, `snooze`, `cancel` manage it. Backend in `src-tauri/src/routine.rs`, HTTP routes `/routine/:session/*`.
+- While Butter runs, the 1thread model checks once a minute (first check 15s after launch, which also catches routines missed while Butter was closed). A due routine starts a new agent looped into the conversation it came from, with the same preset and folder, the conversation so far, a pointer to the earlier agent's transcript, and the routine's prompt. From a plain terminal it starts a new thread in that folder.
+- The woken agent can run `butter-cli routine snooze --in 1w` (no id needed) to check again later.

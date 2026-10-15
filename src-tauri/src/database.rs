@@ -920,6 +920,34 @@ impl AgentDatabase {
         for column in ["preset_id TEXT", "preset_name TEXT", "agent_command TEXT", "parent_id TEXT"] {
             let _ = conn.execute(&format!("ALTER TABLE threads ADD COLUMN {column}"), []);
         }
+        // Routines: scheduled check-ins that start an agent in a 1thread
+        // conversation when they come due (see routine.rs).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS routines (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                due_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                thread_id TEXT,
+                source_session_id TEXT NOT NULL,
+                preset_id TEXT,
+                preset_name TEXT,
+                directory TEXT,
+                agent_command TEXT,
+                agent_kind TEXT,
+                agent_session_id TEXT,
+                fired_at INTEGER,
+                fired_session_id TEXT,
+                error TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_routines_status_due ON routines(status, due_at);
+            "#,
+        )
+        .map_err(|e| format!("Failed to initialize routines schema: {}", e))?;
 
         if let Err(err) = conn.execute_batch(
             r#"

@@ -7470,6 +7470,7 @@ export function useAppModel() {
       addTagToTerminal(id, tag);
     },
     renameSession: updateSessionTitle,
+    presets,
   });
 
   return {

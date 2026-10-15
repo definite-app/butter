@@ -9,6 +9,7 @@ import { assignHandles, filterHandles, findMention, insertMention, mentionAtCare
 import type { MentionToken } from "./mentions";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "./search";
 import type { SearchFrom } from "./search";
+import { routineDay, routineWhen } from "./routines";
 import "./OneThread.css";
 
 const TIME_GAP_MS = 10 * 60 * 1000;
@@ -57,7 +58,18 @@ function formatSeparator(at: number): string {
   return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
 }
 
-type IconName = "reply" | "pin" | "more" | "copy" | "terminal" | "open" | "check" | "chevron" | "edit" | "search";
+type IconName =
+  | "reply"
+  | "pin"
+  | "more"
+  | "copy"
+  | "terminal"
+  | "open"
+  | "check"
+  | "chevron"
+  | "edit"
+  | "search"
+  | "clock";
 
 // Inline stroke icons (16px, currentColor) for the bubble actions and menu.
 function Icon(props: { name: IconName; filled?: boolean }) {
@@ -108,6 +120,10 @@ function Icon(props: { name: IconName; filled?: boolean }) {
         <Match when={props.name === "search"}>
           <circle cx="11" cy="11" r="7" />
           <path d="m20 20-3.5-3.5" />
+        </Match>
+        <Match when={props.name === "clock"}>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
         </Match>
         <Match when={props.name === "open"}>
           <path d="M14 4h6v6" />
@@ -1372,6 +1388,12 @@ export function OneThread() {
                                 </For>
                               </div>
                             </Show>
+                            <Show when={m().source === "routine"}>
+                              <div class="ot-routine-tag">
+                                <Icon name="clock" />
+                                Routine
+                              </div>
+                            </Show>
                             <Show when={m().body}>
                               <div
                                 class={`ot-bubble ${m().role} ${m().source === "transcript" ? "transcript" : ""}`}
@@ -1462,6 +1484,24 @@ export function OneThread() {
               </Switch>
             )}
           </For>
+          <Show when={focusedId()}>
+            {(id) => (
+              <For each={model.routinesFor(id())}>
+                {(routine) => (
+                  <div class="ot-routine-row">
+                    <Icon name="clock" />
+                    <span class="ot-routine-when">{routineWhen(routine.due_at)}</span>
+                    <span class="ot-routine-title" title={routine.prompt}>
+                      {routine.title}
+                    </span>
+                    <button class="ot-receipt-link" onClick={() => void model.cancelRoutine(routine.id)}>
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </For>
+            )}
+          </Show>
           <Show when={!focusedId()}>
             <For each={held()}>
               {(item) => (
@@ -1545,6 +1585,14 @@ export function OneThread() {
             <div class="ot-reply-to">
               <span class="ot-reply-to-label">
                 Replying to <span class="ot-reply-to-name">{threadTitle(target())}</span>
+                <Show when={model.routinesFor(model.rootOf(target()))[0]}>
+                  {(next) => (
+                    <span class="ot-reply-to-routine" title={next().prompt}>
+                      {" · check-in "}
+                      {routineDay(next().due_at)}
+                    </span>
+                  )}
+                </Show>
               </span>
               <button
                 type="button"
@@ -1753,6 +1801,20 @@ export function OneThread() {
                 <dd>
                   {counts().total} · {counts().fromYou} from you
                 </dd>
+                <For each={model.routinesFor(thread().session_id)}>
+                  {(routine) => (
+                    <>
+                      <dt>Check-in</dt>
+                      <dd title={routine.prompt}>
+                        {routineWhen(routine.due_at)}
+                        {" · "}
+                        <button class="ot-receipt-link" onClick={() => void model.cancelRoutine(routine.id)}>
+                          Cancel
+                        </button>
+                      </dd>
+                    </>
+                  )}
+                </For>
               </dl>
               <div class="ot-popover-actions">
                 <button

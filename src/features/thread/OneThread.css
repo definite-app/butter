@@ -439,6 +439,50 @@
   color: var(--text-primary);
 }
 
+/* Routines: the tag on a routine's first message, and scheduled check-ins at
+   the end of a focused conversation. */
+.ot-routine-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px 3px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.ot-routine-tag svg,
+.ot-routine-row svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+
+.ot-routine-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.ot-routine-when {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.ot-routine-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ot-reply-to-routine {
+  color: var(--text-muted);
+}
+
 .ot-typing {
   display: inline-flex;
   align-items: center;

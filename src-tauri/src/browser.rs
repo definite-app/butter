@@ -1680,6 +1680,10 @@ Usage:
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
   butter-cli thread reply [--image <path>]... <message>
+  butter-cli routine create (--in <30m|4h|3d|2w> | --at <YYYY-MM-DD [HH:MM]>) [--title <name>] <prompt>
+  butter-cli routine list [--all]
+  butter-cli routine snooze [<id>] (--in <duration> | --at <when>) [<new prompt>]
+  butter-cli routine cancel <id>
   butter-cli help
 EOF
   else
@@ -1700,6 +1704,10 @@ Usage:
   butter-cli team channel list
   butter-cli team channel set --name <name> [--display-name <name>] [--description <text>]
   butter-cli thread reply [--image <path>]... <message>
+  butter-cli routine create (--in <30m|4h|3d|2w> | --at <YYYY-MM-DD [HH:MM]>) [--title <name>] <prompt>
+  butter-cli routine list [--all]
+  butter-cli routine snooze [<id>] (--in <duration> | --at <when>) [<new prompt>]
+  butter-cli routine cancel <id>
   butter-cli help
 EOF
   fi
@@ -1785,6 +1793,108 @@ case "$root" in
         usage 1
         ;;
     esac
+    ;;
+  routine)
+    need_env BUTTER_SESSION_ID
+    need_env BUTTER_TEAM_ENDPOINT
+    need_env BUTTER_TEAM_TOKEN
+    subcommand="${1:-}"
+    [ -n "$subcommand" ] || usage 1
+    shift || true
+    at=""
+    after=""
+    title=""
+    all=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --at)
+          [ -n "${2:-}" ] || usage 1
+          at="$2"
+          shift 2
+          ;;
+        --in)
+          [ -n "${2:-}" ] || usage 1
+          after="$2"
+          shift 2
+          ;;
+        --title)
+          [ -n "${2:-}" ] || usage 1
+          title="$2"
+          shift 2
+          ;;
+        --all)
+          all=1
+          shift
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+    endpoint="$BUTTER_TEAM_ENDPOINT/routine/$BUTTER_SESSION_ID"
+    case "$subcommand" in
+      create)
+        prompt="$(join_args "$@")"
+        if [ -z "$prompt" ] && [ ! -t 0 ]; then
+          prompt="$(cat)"
+        fi
+        [ -n "$prompt" ] || usage 1
+        curl -sS --fail-with-body -X POST \
+          --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
+          --data-urlencode "prompt=$prompt" \
+          --data-urlencode "title=$title" \
+          --data-urlencode "at=$at" \
+          --data-urlencode "after=$after" \
+          --data-urlencode "cwd=$PWD" \
+          "$endpoint/create"
+        ;;
+      list)
+        curl -sS --fail-with-body -G \
+          --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
+          --data-urlencode "all=$all" \
+          "$endpoint/list"
+        ;;
+      snooze)
+        routine=""
+        case "${1:-}" in
+          ""|-*) ;;
+          *)
+            # A bare first word is the routine id when it looks like one.
+            if printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}$'; then
+              routine="$1"
+              shift
+            fi
+            ;;
+        esac
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --at) [ -n "${2:-}" ] || usage 1; at="$2"; shift 2 ;;
+            --in) [ -n "${2:-}" ] || usage 1; after="$2"; shift 2 ;;
+            *) break ;;
+          esac
+        done
+        prompt="$(join_args "$@")"
+        curl -sS --fail-with-body -X POST \
+          --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
+          --data-urlencode "routine=$routine" \
+          --data-urlencode "at=$at" \
+          --data-urlencode "after=$after" \
+          --data-urlencode "prompt=$prompt" \
+          "$endpoint/snooze"
+        ;;
+      cancel)
+        [ -n "${1:-}" ] || usage 1
+        curl -sS --fail-with-body -X POST \
+          --data-urlencode "token=$BUTTER_TEAM_TOKEN" \
+          --data-urlencode "routine=$1" \
+          "$endpoint/cancel"
+        ;;
+      *)
+        usage 1
+        ;;
+    esac
+    printf '\n'
+    exit 0
     ;;
   *)
     usage 1

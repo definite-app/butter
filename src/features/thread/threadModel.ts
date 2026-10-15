@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { DbSession, TerminalPreset, WebSession } from "../../app/types";
 import { shellEscape } from "../../utils/shell";
 import { codexLaunchFlags, shellQuoteWord } from "../../utils/agentResume";
+import { ROUTINE_INSTRUCTIONS, routinePreamble, type RoutineRecord } from "./routines";
 
 // ===== 1thread =====
 // A chat stream where each thread is a real Butter terminal session running
@@ -35,7 +36,7 @@ export interface ThreadMessage {
   session_id: string;
   role: ThreadMessageRole;
   body: string;
-  source: "composer" | "cli" | "transcript" | null;
+  source: "composer" | "cli" | "transcript" | "routine" | null;
   status: ThreadMessageStatus | null;
   created_at: number;
   /** Absolute paths of attached images, under threads/attachments/<thread id>/. */
@@ -62,17 +63,19 @@ export interface ThreadModelDeps {
   tagSession: (id: string, tag: string) => void;
   /** Rename the thread's terminal session to match. */
   renameSession: (id: string, title: string) => void;
+  presets: Accessor<TerminalPreset[]>;
 }
 
 export const THREAD_TAG = "thread";
 
 const THREAD_INSTRUCTIONS =
-  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; open them to see them. To show the user an image you made or found, add --image <path> before the message (repeat it for several). Other agents may be in this conversation too; what they and the user said that you missed arrives in <conversation_context>.";
+  "You were started from Butter's 1thread chat. The user never sees your terminal, only the messages you send with butter-cli. Do the work. When you finish, or when you need a decision from the user, reply by running: butter-cli thread reply \"<message>\". Write like a text message: 1-3 short sentences, plain words, no code, no logs, no markdown. Always send a reply before you stop. Follow-up messages from the user arrive wrapped in <butter_message> tags. Images the user attaches are listed as file paths; open them to see them. To show the user an image you made or found, add --image <path> before the message (repeat it for several). Other agents may be in this conversation too; what they and the user said that you missed arrives in <conversation_context>. " +
+  ROUTINE_INSTRUCTIONS;
 
 // Pre-approve the reply command so the agent never blocks on a permission
 // prompt the user can't see. `--allowedTools` is variadic, so it must be
 // followed by another option before the positional prompt.
-const THREAD_ALLOWED_TOOLS = "Bash(butter-cli thread reply *)";
+const THREAD_ALLOWED_TOOLS = ["Bash(butter-cli thread reply *)", "Bash(butter-cli routine *)"];
 
 // Don't paste into a Claude that may still be booting / just got input.
 const LAUNCH_GRACE_MS = 8_000;
@@ -83,6 +86,9 @@ const UNKNOWN_ALIVE_MS = 5_000;
 // After a delivery, wait for "working" (or this long) before delivering again.
 const AWAIT_WORK_MS = 20_000;
 const FALLBACK_DELAY_MS = 5_000;
+// Routines: the first check waits for launch (and the reopen picker) to settle.
+const ROUTINE_FIRST_CHECK_MS = 15_000;
+const ROUTINE_CHECK_MS = 60_000;
 
 export const wrapButterMessage = (text: string) => `<butter_message>${text}</butter_message>`;
 
@@ -160,7 +166,7 @@ export function buildThreadAgentCommand(files: ThreadLaunchFiles, resumeId?: str
     "--add-dir",
     shellEscape(files.attachments_dir),
     "--allowedTools",
-    shellEscape(THREAD_ALLOWED_TOOLS),
+    ...THREAD_ALLOWED_TOOLS.map(shellEscape),
     "--append-system-prompt",
     `"$(cat ${shellEscape(files.instructions_path)})"`
   );
@@ -203,6 +209,25 @@ export function threadTitleFromMessage(text: string): string {
     .slice(0, 5);
   const slug = words.join("-").replace(/-+/g, "-").slice(0, 40).replace(/-$/, "");
   return slug || "thread";
+}
+
+/** How a thread's agent launches: from a preset, or spelled out by a routine. */
+interface ThreadLaunch {
+  presetId: string | null;
+  presetName: string | null;
+  directory: string | null;
+  agentCommand: string | null;
+}
+
+interface StartThreadOptions {
+  /** The first bubble's source; "composer" by default. */
+  source?: ThreadMessage["source"];
+  /** Goes before the message in the agent's first prompt. */
+  preamble?: string;
+  /** Used instead of `preset` (e.g. a routine whose preset was deleted). */
+  launch?: ThreadLaunch;
+  /** A new top-level thread's name; otherwise taken from the message. */
+  title?: string;
 }
 
 interface ThreadRuntime {
@@ -450,12 +475,19 @@ export function createThreadModel(deps: ThreadModelDeps) {
     text: string,
     attachments: string[] = [],
     preset: TerminalPreset | null = null,
-    parentId: string | null = null
+    parentId: string | null = null,
+    options: StartThreadOptions = {}
   ) => {
     const body = text.trim();
     if (!body && attachments.length === 0) return null;
     const parent = parentId ? threadById()[rootOf(parentId)] : undefined;
-    const title = parent ? parent.title : body ? threadTitleFromMessage(body) : "image";
+    const title = parent ? parent.title : options.title || (body ? threadTitleFromMessage(body) : "image");
+    const launch: ThreadLaunch = options.launch ?? {
+      presetId: preset?.id ?? null,
+      presetName: preset?.name ?? null,
+      directory: preset?.directory ?? null,
+      agentCommand: preset ? threadPresetAgentCommand(preset) : null,
+    };
     // Create the session without a stored command: if the app restarts, the
     // restored shell must not replay the first prompt as a new conversation.
     // Resume goes through the persisted agent snapshot instead.
@@ -463,24 +495,22 @@ export function createThreadModel(deps: ThreadModelDeps) {
     const record = await invoke<ThreadRecord>("thread_create", {
       sessionId,
       title,
-      presetId: preset?.id ?? null,
-      presetName: preset?.name ?? null,
-      directory: preset?.directory ?? null,
-      agentCommand: preset ? threadPresetAgentCommand(preset) : null,
+      ...launch,
       parentId: parent?.session_id ?? null,
     });
     setThreads((prev) => [record, ...prev.filter((t) => t.session_id !== record.session_id)]);
     const sessionTitle = parent ? `${title} · ${threadAgentLabel(record)}` : title;
     const id = deps.createSession(undefined, undefined, record.cwd ?? undefined, sessionTitle, sessionId);
     deps.tagSession(id, THREAD_TAG);
-    const message = await addMessage(id, "user", body, "composer", "delivered", attachments);
+    const message = await addMessage(id, "user", body, options.source ?? "composer", "delivered", attachments);
     const entry = rt(id);
     entry.lastLaunchAt = Date.now();
     entry.awaitingWork = true;
     try {
       await deps.startSessionTerminal(id);
-      const context = parent ? missedContext(id, message.created_at) : "";
-      const prompt = context ? `${context}\n\n${wrapButterMessage(agentTextForMessage(message))}` : agentTextForMessage(message);
+      const lead = [parent ? missedContext(id, message.created_at) : "", options.preamble ?? ""].filter(Boolean);
+      const text = agentTextForMessage(message);
+      const prompt = lead.length > 0 ? [...lead, wrapButterMessage(text)].join("\n\n") : text;
       await launchAgent(id, prompt, null);
     } catch (err) {
       console.error("[thread] failed to launch thread terminal", err);
@@ -700,6 +730,89 @@ export function createThreadModel(deps: ThreadModelDeps) {
     unlisten?.();
   });
 
+  // ----- Routines -----
+  const [routines, setRoutines] = createSignal<RoutineRecord[]>([]);
+
+  const loadRoutines = async () => {
+    try {
+      setRoutines(await invoke<RoutineRecord[]>("routine_list"));
+    } catch (err) {
+      console.error("[thread] routine list failed", err);
+    }
+  };
+
+  /**
+   * A due routine starts a new agent in its conversation (or a new thread),
+   * in the preset and folder it was made from, with the routine's prompt.
+   */
+  const fireRoutine = async (routine: RoutineRecord) => {
+    try {
+      const parent = routine.thread_id && threadById()[routine.thread_id] ? routine.thread_id : null;
+      const preset = routine.preset_id ? (deps.presets().find((p) => p.id === routine.preset_id) ?? null) : null;
+      const launch: ThreadLaunch | undefined = preset
+        ? undefined
+        : {
+            presetId: routine.preset_id,
+            presetName: routine.preset_name,
+            directory: routine.directory,
+            agentCommand: routine.agent_command,
+          };
+      const sessionId = await startThread(routine.prompt, [], preset, parent, {
+        source: "routine",
+        preamble: routinePreamble(routine),
+        launch,
+        title: routine.title,
+      });
+      if (!sessionId) throw new Error("The routine has no prompt");
+      await invoke("routine_mark_fired", { id: routine.id, sessionId });
+    } catch (err) {
+      console.error("[thread] routine failed to start", err);
+      await invoke("routine_mark_failed", { id: routine.id, error: String(err) }).catch(() => {});
+    }
+  };
+
+  let checkingRoutines = false;
+  const checkRoutines = async () => {
+    if (!loaded() || checkingRoutines) return;
+    checkingRoutines = true;
+    try {
+      const due = await invoke<RoutineRecord[]>("routine_claim_due");
+      for (const routine of due) await fireRoutine(routine);
+      if (due.length > 0) await loadRoutines();
+    } catch (err) {
+      console.error("[thread] routine check failed", err);
+    } finally {
+      checkingRoutines = false;
+    }
+  };
+
+  const cancelRoutine = async (id: string) => {
+    try {
+      await invoke("routine_cancel", { id });
+    } catch (err) {
+      console.error("[thread] routine cancel failed", err);
+    }
+    await loadRoutines();
+  };
+
+  /** Routines still to come in a conversation, soonest first. */
+  const routinesFor = (rootId: string) =>
+    routines().filter((r) => r.status === "pending" && r.thread_id !== null && rootOf(r.thread_id) === rootId);
+
+  const firstRoutineCheck = setTimeout(() => void checkRoutines(), ROUTINE_FIRST_CHECK_MS);
+  const routineTimer = setInterval(() => void checkRoutines(), ROUTINE_CHECK_MS);
+  let unlistenRoutines: (() => void) | undefined;
+  void listen("routines-changed", () => void loadRoutines()).then((fn) => {
+    if (disposed) fn();
+    else unlistenRoutines = fn;
+  });
+  void loadRoutines();
+  onCleanup(() => {
+    clearTimeout(firstRoutineCheck);
+    clearInterval(routineTimer);
+    unlistenRoutines?.();
+  });
+
   // ----- UI-facing helpers -----
   const setPinned = async (threadId: string, pinned: boolean) => {
     patchThread(threadId, { pinned });
@@ -766,6 +879,9 @@ export function createThreadModel(deps: ThreadModelDeps) {
     hasUnread,
     isWorking,
     isSessionWorking,
+    routines,
+    routinesFor,
+    cancelRoutine,
     reload: load,
   };
 }
