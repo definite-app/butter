@@ -720,7 +720,7 @@ export function useAppModel() {
     return stored === "canvas" || stored === "team" || stored === "thread" ? stored : "terminal";
   })());
   const [showCommandPalette, setShowCommandPalette] = createSignal(false);
-  const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher">(
+  const [commandPaletteMode, setCommandPaletteMode] = createSignal<"commands" | "switcher" | "recordings">(
     "commands"
   );
   const [teamSearchRequestId, setTeamSearchRequestId] = createSignal(0);
@@ -2062,6 +2062,15 @@ export function useAppModel() {
           ? "Browse files to add to canvas (Cmd+Shift+E)"
           : "Browse directory of current terminal (Cmd+Shift+E)",
         action: () => void openFileBrowser(),
+      },
+      {
+        id: "recordings",
+        label: "Recordings",
+        description: "Meetings and dictations from butter-rec",
+        action: () => {
+          setCommandPaletteMode("recordings");
+          setCommandQuery("");
+        },
       },
       {
         id: "cc-search",
@@ -3515,6 +3524,7 @@ export function useAppModel() {
 
   createEffect(() => {
     if (!showCommandPalette()) return;
+    commandPaletteMode(); // refocus when Recordings goes back to the command list
     requestAnimationFrame(() => {
       commandInputRef?.focus();
       commandInputRef?.select();

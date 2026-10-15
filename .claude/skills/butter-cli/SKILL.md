@@ -1,6 +1,6 @@
 ---
 name: butter-cli
-description: How an agent running in a Butter terminal talks to Butter with `butter-cli`. Use to schedule a check-in for later (a routine: "check back on this in two weeks", "remind me on Oct 29", a blocker that needs a follow-up), to reply in Butter's 1thread chat, or to send, reply to and read Butter Team Mode messages and manage Team Mode users and channels.
+description: How an agent running in a Butter terminal talks to Butter with `butter-cli`. Use to schedule a check-in for later (a routine: "check back on this in two weeks", "remind me on Oct 29", a blocker that needs a follow-up), to read the user's meeting transcripts and dictations ("what did we decide in this morning's meeting?", "what did I just dictate?"), to reply in Butter's 1thread chat, or to send, reply to and read Butter Team Mode messages and manage Team Mode users and channels.
 ---
 
 # Butter CLI
@@ -15,7 +15,7 @@ BUTTER_TEAM_ENDPOINT
 BUTTER_TEAM_TOKEN
 ```
 
-If a command reports a missing env var, this shell wasn't started by Butter, and `butter-cli` can't be used here.
+If a command reports a missing env var, this shell wasn't started by Butter, and `butter-cli` can't be used here. `butter-cli rec` is the exception: it works in any terminal (as `~/.butter/bin/butter-cli rec` if `butter-cli` isn't on the PATH).
 
 ## Routines
 
@@ -112,5 +112,20 @@ butter-cli team channel set --name planning --display-name planning --descriptio
 ```
 
 `user set` upserts by username and `channel set` by channel name. `cmd` is a template: Team Mode replaces `{user_msg}` with the triggering message before launching the agent. Mention-triggered agent runs should post replies in the original message thread.
+
+## Recordings
+
+The user records meetings and dictates with butter-rec, which keeps everything on this Mac. Each meeting has a speaker-labelled transcript (Me / Them) and, if a summarizer is set up, a summary.
+
+```bash
+butter-cli rec list                        # meetings, newest first, with ids and status
+butter-cli rec transcript [<id>|latest]    # print a transcript (latest by default)
+butter-cli rec summary [<id>]              # print a summary, if the meeting has one
+butter-cli rec path [<id>]                 # the meeting's folder
+butter-cli rec history [-n N] [--search q] # recent dictations
+butter-cli rec last                        # the last dictation
+```
+
+For "what did we decide in this morning's meeting?", run `butter-cli rec list`, pick the meeting by title and time, then `butter-cli rec transcript <id>` and answer from it. A meeting whose status isn't `done` is still being recorded or transcribed; say so rather than reading a partial transcript. Transcripts can be long, so quote only the parts that answer the question.
 
 `butter-browser` is a separate tool for driving Butter's browser pane.

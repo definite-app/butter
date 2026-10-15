@@ -11,6 +11,7 @@ import { OneThread } from "../features/thread/OneThread";
 import { FooterBar } from "../features/footer/FooterBar";
 import { CommandPalette } from "../features/overlays/CommandPalette";
 import { TerminalSwitcher } from "../features/overlays/TerminalSwitcher";
+import { RecordingsPalette } from "../features/recordings/RecordingsPalette";
 import { FileBrowser } from "../features/overlays/FileBrowser";
 import { CcSearch } from "../features/overlays/CcSearch";
 import { ContextMenus } from "../features/overlays/ContextMenus";
@@ -125,6 +126,7 @@ export function AppShell() {
       </Show>
       <CommandPalette />
       <TerminalSwitcher />
+      <RecordingsPalette />
       <FileBrowser />
       <CcSearch />
       <ContextMenus />
