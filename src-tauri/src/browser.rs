@@ -1684,6 +1684,7 @@ Usage:
   butter-cli routine list [--all]
   butter-cli routine snooze [<id>] (--in <duration> | --at <when>) [<new prompt>]
   butter-cli routine cancel <id>
+  butter-cli rec <status|meeting start|meeting stop|dictate|list|transcript|...>  (local recorder; butter-cli rec help)
   butter-cli help
 EOF
   else
@@ -1708,6 +1709,7 @@ Usage:
   butter-cli routine list [--all]
   butter-cli routine snooze [<id>] (--in <duration> | --at <when>) [<new prompt>]
   butter-cli routine cancel <id>
+  butter-cli rec <status|meeting start|meeting stop|dictate|list|transcript|...>  (local recorder; butter-cli rec help)
   butter-cli help
 EOF
   fi
@@ -1745,6 +1747,14 @@ case "$root" in
     ;;
   session)
     exec "$(dirname "$0")/butter-session-cli" "$@"
+    ;;
+  rec)
+    rec="$(dirname "$0")/butter-rec"
+    if [ ! -x "$rec" ]; then
+      echo "butter-cli: butter-rec isn't installed; build it with recorder/build.sh in the Butter repo" >&2
+      exit 1
+    fi
+    exec "$rec" "$@"
     ;;
   team)
     ;;
