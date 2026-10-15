@@ -11,6 +11,8 @@ import {
   stripMention,
 } from "../src/features/thread/mentions.ts";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "../src/features/thread/search.ts";
+import { routinePreamble, routineWhen } from "../src/features/thread/routines.ts";
+import type { RoutineRecord } from "../src/features/thread/routines.ts";
 
 test("agentHandle slugs preset names", () => {
   assert.equal(agentHandle("CC Mike3"), "cc-mike3");
@@ -94,4 +96,40 @@ test("searchSnippet highlights matches and trims long text", () => {
   assert.equal(parts[0].text, "…");
   assert.equal(parts.at(-1)?.text, "…");
   assert.ok(parts.some((p) => p.hit && p.text === "Barkley"));
+});
+
+test("routine preamble points the woken agent at the earlier session", () => {
+  const routine: RoutineRecord = {
+    id: "a1b2c3d4",
+    title: "parking benefit",
+    prompt: "Check whether the parking benefit is live.",
+    due_at: new Date(2026, 9, 29, 9, 0).getTime(),
+    due: "",
+    status: "firing",
+    created_at: new Date(2026, 9, 15, 14, 0).getTime(),
+    thread_id: "root",
+    source_session_id: "root",
+    preset_id: null,
+    preset_name: null,
+    directory: "/Users/me/mike3",
+    agent_command: null,
+    agent_kind: "claude",
+    agent_session_id: "uuid-1",
+    fired_at: null,
+    fired_session_id: null,
+    error: null,
+  };
+  const text = routinePreamble(routine);
+  assert.match(text, /scheduled on Thu, Oct 15 to check back on Thu, Oct 29/);
+  assert.match(text, /Claude Code session uuid-1 in \/Users\/me\/mike3/);
+  assert.match(text, /uuid-1\.jsonl under ~\/\.claude\/projects\//);
+  assert.match(text, /butter-cli routine snooze a1b2c3d4 --in/);
+
+  const codex = routinePreamble({ ...routine, agent_kind: "codex" });
+  assert.match(codex, /Codex session uuid-1/);
+  assert.match(codex, /~\/\.codex\/sessions\//);
+
+  const fromShell = routinePreamble({ ...routine, agent_session_id: null });
+  assert.doesNotMatch(fromShell, /transcript/);
+  assert.equal(routineWhen(routine.due_at), "Thu, Oct 29, 9:00 AM");
 });

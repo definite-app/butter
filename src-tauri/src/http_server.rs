@@ -68,6 +68,10 @@ pub async fn start_server(
         .route("/team/:id/channels/set", post(team_channel_set))
         // 1thread CLI routes
         .route("/thread/:id/reply", post(thread_reply))
+        .route("/routine/:id/create", post(routine_create))
+        .route("/routine/:id/list", get(routine_list))
+        .route("/routine/:id/snooze", post(routine_snooze))
+        .route("/routine/:id/cancel", post(routine_cancel))
         // Agent routes
         .route("/agents", get(list_agents))
         .route("/agents/register", post(register_agent))
@@ -792,6 +796,130 @@ async fn thread_reply(
                 .app_handle()
                 .emit(crate::thread::THREAD_MESSAGE_EVENT, &message);
             ok_json(message)
+        }
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+#[derive(Deserialize)]
+struct RoutineCreateForm {
+    token: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    at: String,
+    /// `--in`: a duration like 2w or 3d.
+    #[serde(default)]
+    after: String,
+    /// The CLI's working directory, for routines made outside 1thread.
+    #[serde(default)]
+    cwd: String,
+}
+
+#[derive(Deserialize)]
+struct RoutineListQuery {
+    token: String,
+    #[serde(default)]
+    all: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RoutineSnoozeForm {
+    token: String,
+    #[serde(default)]
+    routine: String,
+    #[serde(default)]
+    at: String,
+    #[serde(default)]
+    after: String,
+    #[serde(default)]
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct RoutineCancelForm {
+    token: String,
+    routine: String,
+}
+
+fn routines_changed(state: &AppState) {
+    let _ = state
+        .browser
+        .app_handle()
+        .emit(crate::routine::ROUTINES_CHANGED_EVENT, ());
+}
+
+async fn routine_create(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<RoutineCreateForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let due_at = match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
+        Ok(due_at) => due_at,
+        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+    };
+    match crate::routine::create_routine(&state.db, &id, &form.prompt, Some(&form.title), due_at, Some(&form.cwd)) {
+        Ok(routine) => {
+            routines_changed(&state);
+            ok_json(routine)
+        }
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn routine_list(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<RoutineListQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &query.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let all = query.all.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    match crate::routine::list_for_session(&state.db, &id, all) {
+        Ok(routines) => ok_json(routines),
+        Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn routine_snooze(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<RoutineSnoozeForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    let due_at = match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
+        Ok(due_at) => due_at,
+        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+    };
+    match crate::routine::snooze_routine(&state.db, &id, Some(&form.routine), due_at, Some(&form.prompt)) {
+        Ok(routine) => {
+            routines_changed(&state);
+            ok_json(routine)
+        }
+        Err(err) => error_json(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn routine_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<RoutineCancelForm>,
+) -> impl IntoResponse {
+    if let Err(err) = state.browser.validate_token(&id, &form.token) {
+        return error_json(StatusCode::UNAUTHORIZED, err);
+    }
+    match crate::routine::cancel_routine(&state.db, &form.routine) {
+        Ok(routine) => {
+            routines_changed(&state);
+            ok_json(routine)
         }
         Err(err) => error_json(StatusCode::BAD_REQUEST, err),
     }
