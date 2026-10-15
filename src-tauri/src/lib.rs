@@ -1,3 +1,4 @@
+mod agent_skill;
 mod agent_types;
 mod browser;
 mod cc_search;
@@ -2102,6 +2103,8 @@ pub fn run() {
             if let Err(err) = browser_manager.install_cli_shim() {
                 eprintln!("Failed to install butter-browser CLI shim: {}", err);
             }
+            // Teach agents in any folder about butter-cli (routines, 1thread, Team Mode).
+            std::thread::spawn(agent_skill::install_agent_skill);
             app.manage(browser_manager);
 
             // Start the HTTP server for agent API in background
