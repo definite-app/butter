@@ -1,4 +1,4 @@
 interface:
   display_name: "Butter CLI"
-  short_description: "Quick reference for Team Mode CLI"
-  default_prompt: "Use $butter-cli to send Team Mode messages or configure agents and channels."
+  short_description: "Routines, 1thread replies and Team Mode from a Butter terminal"
+  default_prompt: "Use $butter-cli to schedule a check-in for later, reply in 1thread, or send Team Mode messages."
