@@ -113,7 +113,8 @@ export function CommandPalette() {
         onClose={() => app.setShowCommandPalette(false)}
         onSelect={(command) => {
           command.action();
-          app.setShowCommandPalette(false);
+          // A command that switches the palette's mode (Recordings) keeps it open.
+          if (app.commandPaletteMode() === "commands") app.setShowCommandPalette(false);
           app.setCommandQuery("");
         }}
       />

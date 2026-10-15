@@ -10,6 +10,7 @@ mod database;
 mod http_server;
 mod paths;
 mod pty;
+mod recordings;
 mod routine;
 mod thread;
 mod session_cli;
@@ -1945,6 +1946,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             session_cli::session_cli_pending,
+            recordings::recordings_list_meetings,
+            recordings::recordings_list_dictations,
+            recordings::recordings_read_meeting,
             focus_manager_window,
             set_window_width,
             minimize_manager_window,
