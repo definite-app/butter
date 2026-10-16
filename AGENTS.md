@@ -69,6 +69,31 @@ npm run test:composer
 - The woken agent can run `butter-cli routine snooze --in 1w` (no id needed) to check again later.
 - Agents learn the commands from the `butter-cli` skill (`.claude/skills/butter-cli/`). Butter copies it into `~/.claude/skills/` and `~/.codex/skills/` on every launch (`src-tauri/src/agent_skill.rs`), unless the user has their own copy there (a SKILL.md without Butter's marker line).
 
+## Browser profiles, apps and browser.toml
+- `<config dir>/browser.toml` (`~/.config/butter/browser.toml`, Butter Dev: `~/.config/butter-dev/browser.toml`) holds browser profiles, pinned web apps and URL palette commands. It's separate from `config.toml` because saving settings from the UI rewrites that file and drops sections it doesn't know. Butter creates it with commented examples on first launch and never overwrites it. It's re-read when its mtime changes: when Cmd+K opens, when the window gets focus, and when a pane opens. Code: `src-tauri/src/browser_config.rs` (parsing, edits), `src/features/browser/logic.ts` (URL resolution, match filtering).
+  ```toml
+  [[profile]]
+  id = "work"            # letters, digits, - and _
+  name = "Work"
+  color = "#7aa2f7"      # optional hex color
+
+  [[app]]                # pinned web app: sidebar "Apps" section and Cmd+K "Open Gmail"
+  id = "gmail"
+  name = "Gmail"
+  url = "https://mail.google.com/mail/u/0/"
+  profile = "work"       # optional, default "default"
+
+  [[command]]            # Cmd+K item that opens a URL
+  name = "Gmail: Search"
+  url = "#search/{query}"            # absolute, or relative to the current page
+  match = "https://mail.google.com/*" # optional Chrome match pattern
+  ```
+- **Profiles.** A `default` profile always exists. Every profile, `default` included, gets its own WebKit data store from a hash of its id (`data_store_identifier`), never WebKit's default store, which Butter's UI uses. A pane starts on its preset's `browser_profile` (config.toml, also in the preset editor), or on an app's `profile`, and keeps it until switched from the footer chip; switching recreates the webview and reloads the page. Unknown ids mean `default`. The terminal's folder plays no part. URL history (localStorage `butter.browser-url-history.v1`) is keyed by profile id. Cmd+K "Browser Profiles" (or "Manage profiles…" in the chip) lists profiles with what uses them, open panes and the sites with data (`WKWebsiteDataStore fetchDataRecordsOfTypes:`), and can remove one site's data, clear a profile, create one or rename/recolor one. Create and rename edit browser.toml with `toml_edit`, keeping comments.
+- **Apps.** An app is a browser not tied to a terminal, session id `app:<id>` (`pty_create` rejects that prefix; apps never enter the sessions store, DB or reopen picker). It shows full-window (Cmd+Shift+F or the toolbar button puts it beside the sidebar instead), and switching to a terminal or another app hides its webview without closing it.
+- **Commands.** `{query}` makes the palette ask for text first (Enter or Tab on the item), URL-encoded into the url. A relative url resolves against the active browser's page; a fragment-only change is handed to the page (`location.href`) instead of reloading. Commands with `match` show only while the active browser (the app on screen, else the terminal's open pane) is on a matching page, first, under the page's host. Commands without `match` are bookmarks: they open in the active pane, or open the terminal's pane.
+- **Shortcuts in pages.** The initialization script catches Cmd+K, Cmd+Shift+K and Cmd+Shift+F in the window capture phase, before the page's handlers, and posts them to `/browser/shortcut`. Butter's webview takes focus for the palettes and the page gets focus back when the palette closes. While any palette or menu is open the native webviews are hidden (`anyOverlayOpen`) and a dimmed JPEG snapshot (`browser_suspend`) stands in for each.
+- **Inbox Keys in Cmd+K.** On a Gmail page Cmd+K lists Inbox Keys' commands under "Inbox Keys": Butter evaluates a page-world script that sends `butter:inboxkeys-request` DOM events, and the shim in the userscript's isolated world answers. Inbox Keys' own palette moved to Cmd+J (see `vendor/inbox-keys/SOURCE.md`).
+
 ## Userscripts (browser pane)
 - Tampermonkey-style scripts for the browser pane live in `~/.config/butter/userscripts/` (Butter Dev: `~/.config/butter-dev/userscripts/`). Every `*.js` file there with a header is loaded, in name order, when a browser pane is created, and again when Butter's reload button or a navigation from Butter runs. A reload from inside the page doesn't re-read the folder. Code: `src-tauri/src/userscripts.rs` (parsing, matching, installing) and `replace_userscripts` in `src-tauri/src/browser.rs` (injection).
 - Header:
@@ -82,5 +107,5 @@ npm run test:composer
   ```
   `@match` takes Chrome match patterns and can repeat. A script without `@match` is skipped, and `@include`/`@exclude` are ignored. `@run-at` is `document-start`, `document-end` or `document-idle` (the default). `@noframes` keeps the script out of iframes. `@inject-into page` runs it in the page's own JavaScript world instead of an isolated one.
 - By default each script runs in its own isolated `WKContentWorld`, like a Chrome content script. It shares the DOM with the page but not its globals, and the page's CSP doesn't block it. WebKit 26 enforces Trusted Types, so on Gmail `innerHTML` throws in the page world but works in an isolated world. Scripts get `GM_addStyle(css)` and `GM_info`. Their console output goes to Web Inspector, not to `butter-browser console`.
-- **Inbox Keys** (Gmail Cmd+K palette, hotkeys, split inbox, account switching; MIT, vendored in `src-tauri/vendor/inbox-keys/`, source commit in `SOURCE.md`) is installed on every launch as `inbox-keys.user.js` (Gmail), `inbox-keys-calendar.user.js` (Google Calendar) and `inbox-keys-account-bridge.user.js` (runs in the page world to read the account list). `butter-chrome-shim.js` stands in for `chrome.storage` (backed by the page's localStorage) and `chrome.runtime`. Settings are in the in-Gmail settings modal. The extension's popup and options page aren't included.
+- **Inbox Keys** (Gmail palette on Cmd+J, hotkeys, split inbox, account switching; MIT, vendored in `src-tauri/vendor/inbox-keys/`, source commit in `SOURCE.md`) is installed on every launch as `inbox-keys.user.js` (Gmail), `inbox-keys-calendar.user.js` (Google Calendar) and `inbox-keys-account-bridge.user.js` (runs in the page world to read the account list). `butter-chrome-shim.js` stands in for `chrome.storage` (backed by the page's localStorage) and `chrome.runtime`. Settings are in the in-Gmail settings modal. The extension's popup and options page aren't included.
 - Butter rewrites those files on every launch while they contain the line `// Installed by Butter, which rewrites this file on every launch. Delete this line to keep your own version.` To keep your own copy, delete that line. To turn one off, replace the file with an empty file.

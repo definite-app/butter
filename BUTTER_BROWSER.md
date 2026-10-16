@@ -14,10 +14,7 @@ It is intended for agents running inside Butter, not for use from an arbitrary s
 - `BUTTER_BROWSER_BIN`
 - `butter-browser` uses those env vars to call Butter's local browser control API.
 - Commands are scoped to the current Butter session, so one terminal can only control its own linked browser pane.
-- Browser storage is scoped by profile key:
-  - Git worktree or repo root when the terminal is inside a repository
-  - Otherwise the terminal directory
-- `open` and `goto` refresh that profile key from the terminal's current `$PWD`.
+- Browser storage belongs to a named profile from `~/.config/butter/browser.toml` (Butter Dev: `~/.config/butter-dev/browser.toml`). A pane starts on its preset's `browser_profile`, or `default`, and keeps that profile until it's switched from the pane's footer or with `open --profile`. The terminal's folder doesn't matter.
 
 ## Requirements
 
@@ -45,7 +42,7 @@ butter-browser: missing BUTTER_BROWSER_TOKEN
 ## Commands
 
 ```text
-butter-browser open [url]
+butter-browser open [--profile <id>] [url]
 butter-browser goto <url>
 butter-browser close
 butter-browser console [all|errors|warn|info|log|debug] [limit]
@@ -71,15 +68,16 @@ butter-browser -h
 
 ## Command Details
 
-### `open [url]`
+### `open [--profile <id>] [url]`
 
-Opens the browser for the current session. If a URL is provided, Butter navigates to it.
+Opens the browser for the current session. If a URL is provided, Butter navigates to it. `--profile` switches the pane to that browser.toml profile first (an unknown id means `default`); the page reloads in the new profile.
 
 Examples:
 
 ```bash
 butter-browser open
 butter-browser open https://example.com
+butter-browser open --profile work https://mail.google.com/
 ```
 
 ### `goto <url>`
@@ -196,7 +194,7 @@ Current fields include:
 - `loading`
 - `url`
 - `title`
-- `profilePath`
+- `profileId`
 - `canGoBack`
 - `canGoForward`
 - `bounds`
@@ -325,8 +323,8 @@ butter-browser snapshot dom > /tmp/tauri-page.json
 - Browser control is tied to the Butter terminal session that launched the command.
 - Auth is enforced with `BUTTER_BROWSER_TOKEN`.
 - A session cannot control another session's browser by default.
-- Browser cookies, local storage, and login state are shared only with other sessions using the same profile key.
-- In practice, that means sessions in the same repo/worktree share auth, while different repos or directories get separate browser storage.
+- Browser cookies, local storage, and login state are shared by every pane on the same profile, and only by them.
+- Every profile, `default` included, has its own WebKit data store, separate from the one Butter's own UI uses.
 
 ## Notes And Limits
 
