@@ -22,8 +22,8 @@ To update, run `git pull && scripts/install-app.sh --ci` in the same folder. The
 
 ### Without a clone
 
-1. Open the [latest successful **Build macOS App** run on `main`](https://github.com/definite-app/butter/actions/workflows/build-macos.yml?query=branch%3Amain+is%3Asuccess). Download the **Butter-macos-arm64** artifact.
-2. Unzip it, then unzip the `Butter.app.zip` inside.
+1. Open the [latest successful **Build macOS App** run on `main`](https://github.com/definite-app/butter/actions/workflows/build-macos.yml?query=branch%3Amain+is%3Asuccess). Download the **Butter-macos-arm64** artifact at the bottom of the page.
+2. Unzip it to get `Butter.app`. Builds from before Oct 16, 2026 contain a `Butter.app.zip` instead; unzip that too.
 3. Quit Butter. This closes its terminals.
 4. Move the new `Butter.app` into `/Applications`, replacing the old one.
 5. The app is ad-hoc signed, so clear the download quarantine before opening it:
@@ -36,9 +36,13 @@ The same steps from a terminal, with `gh` signed in:
 ```sh
 run=$(gh run list -R definite-app/butter -b main -e push -s success -L 20 \
   --json databaseId,workflowName -q '[.[] | select(.workflowName=="Build macOS App")][0].databaseId')
+artifact=$(gh api "repos/definite-app/butter/actions/runs/$run/artifacts" \
+  -q '[.artifacts[] | select(.expired | not) | select(.name | startswith("Butter-macos-arm64"))][0].id')
 tmp=$(mktemp -d)
-gh run download "$run" -R definite-app/butter -n Butter-macos-arm64 -D "$tmp"
-ditto -x -k "$tmp/Butter.app.zip" "$tmp"
+# `gh run download` can't fetch this artifact (cli/cli#13012), so go through the API.
+gh api "repos/definite-app/butter/actions/artifacts/$artifact/zip" > "$tmp/artifact.zip"
+ditto -x -k "$tmp/artifact.zip" "$tmp"
+[ -f "$tmp/Butter.app.zip" ] && ditto -x -k "$tmp/Butter.app.zip" "$tmp"   # older builds
 osascript -e 'quit app "Butter"'; sleep 3
 [ -d /Applications/Butter.app ] && mv /Applications/Butter.app ~/Butter.app.bak-$(date +%Y%m%d-%H%M%S)
 ditto "$tmp/Butter.app" /Applications/Butter.app
