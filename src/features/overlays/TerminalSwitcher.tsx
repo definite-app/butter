@@ -407,7 +407,7 @@ export function TerminalSwitcher() {
               <kbd class="switcher-kbd">⌘1–9</kbd>jump
             </span>
             <span class="switcher-footer-hint">
-              <kbd class="switcher-kbd">⌘⇧K</kbd>commands
+              <kbd class="switcher-kbd">⌘K</kbd>commands
             </span>
           </div>
         </div>

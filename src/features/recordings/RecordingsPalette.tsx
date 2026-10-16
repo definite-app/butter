@@ -29,7 +29,7 @@ const REFRESH_MS = 5000;
 const COPIED_CLOSE_MS = 450;
 
 /**
- * butter-rec's meetings and dictations, read from disk (Cmd+Shift+K →
+ * butter-rec's meetings and dictations, read from disk (Cmd+K →
  * "Recordings"). Enter opens a meeting's transcript in a file tab or copies a
  * dictation; Cmd+Enter starts a Claude session about the meeting.
  */
