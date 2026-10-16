@@ -82,8 +82,6 @@ export function PresetEditor() {
               <label>Browser profile</label>
               <select
                 class="preset-select"
-                value={app.browserProfileFor(app.editingPreset()?.browserProfile).id}
-                onFocus={() => void app.refreshBrowserConfig()}
                 onChange={(e) => {
                   const value = e.currentTarget.value;
                   app.setEditingPreset({
@@ -93,7 +91,14 @@ export function PresetEditor() {
                 }}
               >
                 <For each={app.browserConfig().profiles}>
-                  {(profile) => <option value={profile.id}>{profile.name}</option>}
+                  {(profile) => (
+                    <option
+                      value={profile.id}
+                      selected={profile.id === app.browserProfileFor(app.editingPreset()?.browserProfile).id}
+                    >
+                      {profile.name}
+                    </option>
+                  )}
                 </For>
               </select>
             </div>

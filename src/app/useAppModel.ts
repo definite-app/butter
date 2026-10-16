@@ -6096,7 +6096,9 @@ export function useAppModel() {
   // when the palette opens and when the window gets focus.
   const refreshBrowserConfig = async () => {
     try {
-      setBrowserConfig(await invoke<BrowserConfig>("browser_config_get"));
+      const next = await invoke<BrowserConfig>("browser_config_get");
+      // Same content: keep the old objects so lists don't re-render.
+      if (JSON.stringify(next) !== JSON.stringify(browserConfig())) setBrowserConfig(next);
     } catch (err) {
       console.error("Failed to read browser.toml:", err);
     }
@@ -6417,10 +6419,12 @@ export function useAppModel() {
   };
 
   const openBrowserProfiles = () => {
+    // Open the view before closing the menu or palette, so the pages stay
+    // hidden in between instead of flashing back.
+    setShowBrowserProfiles(true);
     setBrowserProfileMenuFor(null);
     setShowCommandPalette(false);
     void refreshBrowserConfig();
-    setShowBrowserProfiles(true);
   };
 
   /** Clears cookies, storage and cache, and that profile's URL history. */
