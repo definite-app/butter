@@ -446,6 +446,19 @@
   color: var(--text-secondary);
 }
 
+.ot-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.ot-link:hover {
+  text-decoration-color: currentColor;
+}
+
 .ot-receipt {
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -568,6 +581,11 @@
 .ot-composer {
   position: relative;
   flex-wrap: wrap;
+}
+
+.ot-composer.dragging {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px rgba(245, 215, 110, 0.15);
 }
 
 .ot-attachments {

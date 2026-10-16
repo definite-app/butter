@@ -7609,6 +7609,8 @@ export function useAppModel() {
       async (event) => {
         const { paths } = event.payload;
         if (!paths || paths.length === 0) return;
+        // 1thread takes its own drops (OneThread.tsx).
+        if (appView() === "thread") return;
 
         const sessionId = activeSessionId();
         if (!sessionId) return;

@@ -12,6 +12,7 @@ import {
 } from "../src/features/thread/mentions.ts";
 import { filterSkills, insertSkill, leadingSkill, skillAtCaret, withLeadingSkill } from "../src/features/thread/skills.ts";
 import type { SkillAction } from "../src/features/thread/skills.ts";
+import { linkify } from "../src/features/thread/links.ts";
 import { timeAgo } from "../src/features/thread/time.ts";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "../src/features/thread/search.ts";
 import { routinePreamble, routineWhen } from "../src/features/thread/routines.ts";
@@ -206,4 +207,20 @@ test("timeAgo counts up to days, then shows the date", () => {
   assert.equal(timeAgo(now - 86_400_000, now), "1 day ago");
   assert.equal(timeAgo(new Date(2026, 8, 1).getTime(), now), "Sep 1");
   assert.equal(timeAgo(new Date(2025, 8, 1).getTime(), now), "Sep 1, 2025");
+});
+
+test("linkify splits out URLs and leaves trailing punctuation as text", () => {
+  assert.deepEqual(linkify("no links"), [{ text: "no links" }]);
+  assert.deepEqual(linkify("Source: https://www.bbb.org/us/pa/x-0241."), [
+    { text: "Source: " },
+    { text: "https://www.bbb.org/us/pa/x-0241", url: "https://www.bbb.org/us/pa/x-0241" },
+    { text: "." },
+  ]);
+  assert.deepEqual(linkify("(see https://a.com/b)"), [
+    { text: "(see " },
+    { text: "https://a.com/b", url: "https://a.com/b" },
+    { text: ")" },
+  ]);
+  assert.deepEqual(linkify("https://en.wikipedia.org/wiki/Foo_(bar)")[0].url, "https://en.wikipedia.org/wiki/Foo_(bar)");
+  assert.deepEqual(linkify("http:// nope"), [{ text: "http:// nope" }]);
 });

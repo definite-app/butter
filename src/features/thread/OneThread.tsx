@@ -1,5 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
@@ -13,6 +15,7 @@ import { matchesTerms, parseSearchQuery, searchSnippet } from "./search";
 import type { SearchFrom } from "./search";
 import { routineDay, routineWhen } from "./routines";
 import { fullTimestamp, timeAgo } from "./time";
+import { linkify } from "./links";
 import "./OneThread.css";
 
 const TIME_GAP_MS = 10 * 60 * 1000;
@@ -47,6 +50,31 @@ const sameItem = (a: StreamItem, b: StreamItem): boolean => {
 };
 
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/** Message text with its URLs as links that open in the default browser. */
+function LinkedText(props: { text: string }) {
+  return (
+    <For each={linkify(props.text)}>
+      {(part) =>
+        part.url ? (
+          <a
+            class="ot-link"
+            href={part.url}
+            title={part.url}
+            onClick={(e) => {
+              e.preventDefault();
+              void openUrl(part.url as string);
+            }}
+          >
+            {part.text}
+          </a>
+        ) : (
+          part.text
+        )
+      }
+    </For>
+  );
+}
 
 /** What else the ⋯ menu says about a message: delivery for yours, where an agent's came from. */
 function messageMetaDetail(m: ThreadMessage): string | null {
@@ -905,6 +933,55 @@ export function OneThread() {
     inputRef?.focus();
   };
 
+  // Files dropped anywhere on 1thread: images attach like a pasted one (a
+  // copy, the original stays put), anything else goes in the message as its
+  // path. The app-wide drop handler leaves this view alone.
+  const [dragging, setDragging] = createSignal(false);
+  const insertAtCaret = (text: string) => {
+    const value = draft();
+    const start = inputRef?.selectionStart ?? value.length;
+    const end = inputRef?.selectionEnd ?? value.length;
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const inserted = `${before && !/\s$/.test(before) ? " " : ""}${text}${after && !/^\s/.test(after) ? " " : ""}`;
+    const next = before + inserted + after;
+    setDraft(next);
+    if (!inputRef) return;
+    inputRef.value = next;
+    const caret = before.length + inserted.length;
+    inputRef.setSelectionRange(caret, caret);
+    resizeInput();
+  };
+  const handleDrop = async (paths: string[]) => {
+    setPasteError(null);
+    const isImage = (path: string) => /\.(png|jpe?g|gif|webp)$/i.test(path);
+    for (const path of paths.filter(isImage)) {
+      try {
+        const copy = await invoke<string>("thread_attach_dropped_image", { path });
+        setPendingImages((prev) => [...prev, copy]);
+      } catch (err) {
+        console.error("[thread] image drop failed", err);
+        setPasteError(typeof err === "string" ? err : "Couldn't attach that image");
+      }
+    }
+    const others = paths.filter((path) => !isImage(path)).map((path) => (/\s/.test(path) ? `"${path}"` : path));
+    if (others.length > 0) insertAtCaret(others.join(" "));
+    inputRef?.focus();
+  };
+  onMount(() => {
+    const unlisteners = [
+      listen("tauri://drag-enter", () => setDragging(true)),
+      listen("tauri://drag-leave", () => setDragging(false)),
+      listen<{ paths: string[] }>("tauri://drag-drop", (event) => {
+        setDragging(false);
+        if (event.payload.paths?.length) void handleDrop(event.payload.paths);
+      }),
+    ];
+    onCleanup(() => {
+      for (const unlisten of unlisteners) void unlisten.then((stop) => stop());
+    });
+  });
+
   const openTerminal = async (threadId: string) => {
     const exists = app.sessions.some((s) => s.id === threadId);
     const opened = exists ? threadId : await app.reopenClosedSession(threadId);
@@ -1475,7 +1552,7 @@ export function OneThread() {
                                 class={`ot-bubble ${m().role} ${m().source === "transcript" ? "transcript" : ""}`}
                                 title={m().source === "transcript" ? "From the session transcript" : undefined}
                               >
-                                {m().body}
+                                <LinkedText text={m().body} />
                               </div>
                             </Show>
                           </div>
@@ -1604,7 +1681,9 @@ export function OneThread() {
                         </div>
                       </Show>
                       <Show when={item.text}>
-                        <div class="ot-bubble user">{item.text}</div>
+                        <div class="ot-bubble user">
+                          <LinkedText text={item.text} />
+                        </div>
                       </Show>
                     </div>
                   </div>
@@ -1697,7 +1776,7 @@ export function OneThread() {
           )}
         </Show>
         <form
-          class="ot-composer"
+          class={`ot-composer ${dragging() ? "dragging" : ""}`}
           onSubmit={(e) => {
             e.preventDefault();
             void send();
