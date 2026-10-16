@@ -1686,6 +1686,9 @@ export function OneThread() {
             placeholder={placeholder()}
             value={draft()}
             onInput={(e) => {
+              // An Enter meant for something else (a palette, a picker) can land
+              // here as a lone newline. An empty message never starts with one.
+              if (!draft() && /^\s+$/.test(e.currentTarget.value)) e.currentTarget.value = "";
               setDraft(e.currentTarget.value);
               resizeInput();
               updateMention();
