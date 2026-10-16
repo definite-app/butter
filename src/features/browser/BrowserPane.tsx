@@ -89,6 +89,20 @@ export function BrowserPane(props: { sessionId: string; app?: BrowserApp }) {
     });
   });
 
+  // The page is a native view drawn above the DOM, so it would cover the URL
+  // suggestions. Hide it while they're open.
+  let hiddenForSuggestions = false;
+  createEffect(() => {
+    const open = showSuggestions() && addressSuggestions().length > 0;
+    if (open && !hiddenForSuggestions && browserState()?.visible) {
+      hiddenForSuggestions = true;
+      void app.setBrowserVisibility(props.sessionId, false);
+    } else if (!open && hiddenForSuggestions) {
+      hiddenForSuggestions = false;
+      void app.setBrowserVisibility(props.sessionId, true);
+    }
+  });
+
   createEffect(() => {
     const state = browserState();
     if (!editing()) {
