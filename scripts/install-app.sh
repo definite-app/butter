@@ -9,10 +9,15 @@
 #   scripts/install-app.sh --skip-build install the existing local bundle
 #   scripts/install-app.sh --rollback   put the most recent backup back
 #
+# Every bundle is re-signed before it goes in (scripts/sign-app.sh), with
+# $BUTTER_SIGN_IDENTITY or the keychain's Developer ID / Apple Development
+# identity, so macOS keeps Butter's permission grants from one install to the
+# next. Without an identity it's signed ad-hoc and grants reset each time.
+#
 # Options:
 #   --wait     wait for busy Claude sessions to finish instead of stopping
 #   --force    quit even if agents are busy
-#   --dry-run  build and check, but don't quit or install anything
+#   --dry-run  build, sign and check, but don't quit or install anything
 #
 # Quitting Butter ends every terminal in it. Restart restores them through the
 # reopen picker, and Claude/Codex sessions resume their conversations, but a
@@ -43,7 +48,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     __swap) SOURCE=swap ;;  # internal: detached second stage
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -181,7 +186,10 @@ if [ "$SOURCE" = rollback ]; then
   wait_until_safe
   mkdir -p "$(dirname "$STAGED")"
   rm -rf "$STAGED"
-  mv "$latest" "$STAGED"
+  ditto "$latest" "$STAGED"
+  # Older backups are ad-hoc; signing keeps the grants the current app has.
+  "$REPO/scripts/sign-app.sh" "$STAGED" || die "signing $STAGED failed; nothing was changed."
+  rm -rf "$latest"
   SOURCE=staged
 fi
 
@@ -233,6 +241,9 @@ if [ "$SOURCE" != staged ]; then
   mkdir -p "$(dirname "$STAGED")"
   rm -rf "$STAGED"
   ditto "$NEW" "$STAGED"
+  # Sign the staged copy, not the build output, so the bundle in target/ (or
+  # the CI download) stays as built.
+  "$REPO/scripts/sign-app.sh" "$STAGED" || die "signing $STAGED failed; nothing was changed."
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
