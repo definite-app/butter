@@ -130,7 +130,7 @@ final class Daemon {
                 (entry["text"] as? String).map { HUDHistoryItem(text: $0, at: parseISO(entry["at"] as? String)) }
             }
         }
-        hud.onPickHistory = { [unowned self] text in self.paste(text) }
+        hud.onPickHistory = { [unowned self] text in self.setClipboard(text) }
         hotkeys.install()
         registerHotkeys()
         requestPermissions()
