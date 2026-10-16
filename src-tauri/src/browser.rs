@@ -624,18 +624,33 @@ impl<R: Runtime> BrowserManager<R> {
         let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
         let webview = self.require_webview(session_id)?;
         self.sync_userscripts(session_id, &webview, Userscripts::load());
-        {
+        let same_document = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "Browser sessions lock poisoned".to_string())?;
-            if let Some(entry) = sessions.get_mut(session_id) {
-                entry.url = url.to_string();
-                entry.loading = true;
-                entry.last_error = None;
+            match sessions.get_mut(session_id) {
+                Some(entry) => {
+                    let same_document = is_fragment_navigation(&entry.url, url);
+                    entry.url = url.to_string();
+                    entry.loading = !same_document;
+                    entry.last_error = None;
+                    same_document
+                }
+                None => false,
             }
+        };
+        if same_document {
+            // Only the #fragment changes (a browser.toml command such as
+            // "#search/is:unread"): let the page's router handle it, as a click
+            // on a link would, instead of a load that never reports finishing.
+            let target = serde_json::to_string(url).map_err(|e| e.to_string())?;
+            webview
+                .eval(format!("location.href = {target};"))
+                .map_err(|e| e.to_string())?;
+        } else {
+            webview.navigate(parsed).map_err(|e| e.to_string())?;
         }
-        webview.navigate(parsed).map_err(|e| e.to_string())?;
         self.emit_state(session_id)?;
         self.get_state(session_id)
     }
@@ -1063,8 +1078,11 @@ impl<R: Runtime> BrowserManager<R> {
             "commands" | "switcher" | "fullscreen" => payload.action.clone(),
             other => return Err(format!("Unknown browser shortcut {other:?}")),
         };
-        if let Some(main) = self.app.get_webview("main") {
-            let _ = main.set_focus();
+        // Palettes take typing; full screen leaves focus in the page.
+        if action != "fullscreen" {
+            if let Some(main) = self.app.get_webview("main") {
+                let _ = main.set_focus();
+            }
         }
         self.app
             .emit(
@@ -1575,6 +1593,15 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// `to` is the page `from` is on, with a #fragment.
+fn is_fragment_navigation(from: &str, to: &str) -> bool {
+    let Some((to_page, _)) = to.split_once('#') else {
+        return false;
+    };
+    let from_page = from.split_once('#').map_or(from, |(page, _)| page);
+    is_reloadable_url(from_page) && from_page == to_page
 }
 
 /// A page worth loading again after a profile switch.
@@ -3156,6 +3183,30 @@ fn capture_snapshot_sized<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigations() {
+        let inbox = "https://mail.google.com/mail/u/0/#inbox";
+        assert!(is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/0/#search/is%3Aunread"
+        ));
+        assert!(is_fragment_navigation(
+            "https://a.com/x",
+            "https://a.com/x#top"
+        ));
+        // The pane may not know about in-page hash changes, so same is fine too.
+        assert!(is_fragment_navigation(inbox, inbox));
+        assert!(!is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/1/#inbox"
+        ));
+        assert!(!is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/0/"
+        ));
+        assert!(!is_fragment_navigation("about:blank", "about:blank#x"));
+    }
 
     #[test]
     fn user_agent_looks_like_safari() {
