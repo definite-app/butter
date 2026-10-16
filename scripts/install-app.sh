@@ -214,8 +214,15 @@ case "$SOURCE" in
     [ -n "$CI_RUN" ] || die "no successful main build found."
     say "Downloading CI build $CI_RUN ($(gh run view "$CI_RUN" -R definite-app/butter --json headSha -q .headSha | cut -c1-7))"
     tmp="$(mktemp -d)"
-    gh run download "$CI_RUN" -R definite-app/butter -n Butter-macos-arm64 -D "$tmp"
-    ditto -x -k "$tmp/Butter.app.zip" "$tmp"
+    # `gh run download` can't fetch artifacts uploaded with archive: false
+    # (cli/cli#13012), so download through the API. Builds before that change
+    # are named Butter-macos-arm64 and wrap Butter.app.zip in a second zip.
+    artifact="$(gh api "repos/definite-app/butter/actions/runs/$CI_RUN/artifacts" \
+      -q '[.artifacts[] | select(.expired | not) | select(.name | startswith("Butter-macos-arm64"))][0].id')"
+    [ -n "$artifact" ] || die "run $CI_RUN has no Butter artifact (expired?)."
+    gh api "repos/definite-app/butter/actions/artifacts/$artifact/zip" > "$tmp/artifact.zip"
+    ditto -x -k "$tmp/artifact.zip" "$tmp"
+    [ -f "$tmp/Butter.app.zip" ] && ditto -x -k "$tmp/Butter.app.zip" "$tmp"
     NEW="$tmp/Butter.app"
     ;;
 esac

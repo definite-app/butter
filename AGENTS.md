@@ -41,7 +41,7 @@ cd src-tauri && cargo tauri build --bundles app
 ## Building and Installing
 Mike runs Butter nearly 24/7, often with Claude/Codex sessions inside it. Quitting Butter ends every terminal. The reopen picker restores them on relaunch, and agents resume their conversations, but a turn that's running gets cut off.
 
-- **CI** (`.github/workflows/build-macos.yml`) builds an ad-hoc-signed `Butter.app` for every PR and every push to `main` and uploads it as the `Butter-macos-arm64` artifact. It runs no tests and installs nothing.
+- **CI** (`.github/workflows/build-macos.yml`) builds an ad-hoc-signed `Butter.app` for every PR and every push to `main` and uploads it as the `Butter-macos-arm64.zip` artifact, which unzips straight to `Butter.app`. It runs no tests and installs nothing.
 - **Install with `scripts/install-app.sh`**, never by hand. It builds, checks the bundle id, waits until no Claude session is working (`--wait`), quits Butter cleanly, saves the old app to `~/Butter.app.bak-<timestamp>` (keeps 3), installs and reopens it. It is safe to run from a terminal inside Butter: the swap runs in a detached process and logs to `$TMPDIR/butter-install-prod.log`.
   - `--dev`: Butter Dev (`com.butter.app.dev`, data in `~/.butter-dev`). Use it to try changes without touching the Butter you work in.
   - `--ci [RUN_ID]`: install the latest green `main` CI build (or that run) instead of building locally.
