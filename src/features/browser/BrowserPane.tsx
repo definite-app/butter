@@ -1,5 +1,6 @@
-import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { useAppContext } from "../../app/context/AppContext";
+import type { BrowserApp } from "../../app/types";
 
 const Icon = (props: { path: string; size?: number }) => (
   <svg
@@ -24,23 +25,24 @@ const ICONS = {
   minimize: `<path d="m14 10 7-7"/><path d="M20 10h-6V4"/><path d="m3 21 7-7"/><path d="M4 14h6v6"/>`,
   inspect: `<path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>`,
   close: `<path d="M18 6 6 18"/><path d="m6 6 12 12"/>`,
-  trash: `<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`,
+  check: `<path d="M20 6 9 17l-5-5"/>`,
+  caret: `<path d="m6 15 6-6 6 6"/>`,
 };
 
-export function BrowserPane(props: { sessionId: string }) {
+/** A terminal's browser pane, or a pinned app's (`app` set: full-window,
+ * not tied to a terminal). */
+export function BrowserPane(props: { sessionId: string; app?: BrowserApp }) {
   const app = useAppContext();
   const [address, setAddress] = createSignal("");
   const [editing, setEditing] = createSignal(false);
-  const [clearingProfile, setClearingProfile] = createSignal(false);
   let hostRef: HTMLDivElement | undefined;
   let addressInputRef: HTMLInputElement | undefined;
 
   const browserState = () => app.browserSessions()[props.sessionId] || null;
-  const profilePath = () => browserState()?.profilePath || null;
-  const profileDescription = () =>
-    profilePath()
-      ? "Cookies, storage, and logins are shared with other sessions using this project or directory."
-      : "Using Butter's default shared browser profile.";
+  const profile = () => app.browserProfileFor(browserState()?.profileId);
+  const profileMenuOpen = () => app.browserProfileMenuFor() === props.sessionId;
+  const fullscreen = () => (props.app ? app.appFullWindow() : app.browserFullscreen());
+  const preview = () => app.browserPreviews()[props.sessionId] || null;
   const addressSuggestions = createMemo(() => app.getBrowserUrlSuggestions(props.sessionId, address()));
   const [showSuggestions, setShowSuggestions] = createSignal(false);
   const [highlightedSuggestion, setHighlightedSuggestion] = createSignal(-1);
@@ -68,25 +70,24 @@ export function BrowserPane(props: { sessionId: string }) {
     addressInputRef?.blur();
   };
 
-  const profileLabel = () => (profilePath() ? "Scoped" : "Shared");
-
-  const clearProfileState = async () => {
-    const confirmed = await app.askConfirm({
-      title: "Clear browser profile?",
-      message:
-        "This clears cookies, local storage, cache, and saved URL history for this profile, and resets every open browser pane that shares it.",
-      confirmLabel: "Clear profile",
-      cancelLabel: "Cancel",
-      destructive: true,
+  // The profile menu sits over the page (the page hides while it's open), so
+  // close it on Escape or a click anywhere else.
+  createEffect(() => {
+    if (!profileMenuOpen()) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") app.setBrowserProfileMenuFor(null);
+    };
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest(".butter-browser-profile-picker")) app.setBrowserProfileMenuFor(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerdown", onPointer, true);
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerdown", onPointer, true);
     });
-    if (!confirmed) return;
-    setClearingProfile(true);
-    try {
-      await app.clearBrowserProfileState(props.sessionId);
-    } finally {
-      setClearingProfile(false);
-    }
-  };
+  });
 
   createEffect(() => {
     const state = browserState();
@@ -119,7 +120,9 @@ export function BrowserPane(props: { sessionId: string }) {
   });
 
   return (
-    <section class={`butter-browser-pane ${app.browserFullscreen() ? "fullscreen" : ""}`}>
+    <section
+      class={`butter-browser-pane ${fullscreen() ? "fullscreen" : ""} ${props.app ? "app" : ""}`}
+    >
       <div class="butter-browser-toolbar">
         <div class="butter-browser-toolbar-actions">
           <button
@@ -235,11 +238,11 @@ export function BrowserPane(props: { sessionId: string }) {
           <button
             class="butter-browser-toolbar-btn icon"
             type="button"
-            title={app.browserFullscreen() ? "Exit Full Screen" : "Full Screen"}
-            aria-label={app.browserFullscreen() ? "Exit Full Screen" : "Full Screen"}
+            title={fullscreen() ? "Exit Full Screen (⌘⇧F)" : "Full Screen (⌘⇧F)"}
+            aria-label={fullscreen() ? "Exit Full Screen" : "Full Screen"}
             onClick={() => void app.toggleBrowserFullscreen()}
           >
-            <Icon path={app.browserFullscreen() ? ICONS.minimize : ICONS.maximize} />
+            <Icon path={fullscreen() ? ICONS.minimize : ICONS.maximize} />
           </button>
           <button
             class="butter-browser-toolbar-btn icon"
@@ -253,37 +256,85 @@ export function BrowserPane(props: { sessionId: string }) {
           <button
             class="butter-browser-toolbar-btn icon close"
             type="button"
-            title="Close Browser"
-            aria-label="Close Browser"
-            onClick={() => void app.closeBrowserForSession(props.sessionId)}
+            title={props.app ? "Back to terminals (the app keeps running)" : "Close Browser"}
+            aria-label={props.app ? "Back to terminals" : "Close Browser"}
+            onClick={() =>
+              props.app ? app.closeActiveApp() : void app.closeBrowserForSession(props.sessionId)
+            }
           >
             <Icon path={ICONS.close} />
           </button>
         </div>
       </div>
       <div class="butter-browser-host-shell">
-        <div class="butter-browser-host" ref={(el) => (hostRef = el)} />
+        <div class="butter-browser-host" ref={(el) => (hostRef = el)}>
+          <Show when={preview()}>
+            {(src) => <img class="butter-browser-preview" src={src()} alt="" draggable={false} />}
+          </Show>
+        </div>
       </div>
-      <footer class="butter-browser-footer" title={profileDescription()}>
-        <span class={`butter-browser-footer-badge ${profilePath() ? "scoped" : "shared"}`}>
-          {profileLabel()}
+      <footer class="butter-browser-footer">
+        <div class="butter-browser-profile-picker">
+          <button
+            class={`butter-browser-profile-chip ${profileMenuOpen() ? "open" : ""}`}
+            type="button"
+            title="This pane's browser profile: its own cookies, logins and site data"
+            aria-haspopup="menu"
+            aria-expanded={profileMenuOpen()}
+            onClick={() => {
+              if (profileMenuOpen()) {
+                app.setBrowserProfileMenuFor(null);
+              } else {
+                void app.refreshBrowserConfig();
+                app.setBrowserProfileMenuFor(props.sessionId);
+              }
+            }}
+          >
+            <span class="butter-profile-dot" style={{ background: profile().color }} />
+            <span class="butter-browser-profile-name">{profile().name}</span>
+            <Icon path={ICONS.caret} size={11} />
+          </button>
+          <Show when={profileMenuOpen()}>
+            <div class="butter-browser-profile-menu" role="menu">
+              <div class="butter-browser-profile-menu-label">Profile</div>
+              <For each={app.browserConfig().profiles}>
+                {(entry) => (
+                  <button
+                    class={`butter-browser-profile-option ${entry.id === profile().id ? "current" : ""}`}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={entry.id === profile().id}
+                    onClick={() => {
+                      if (entry.id === profile().id) {
+                        app.setBrowserProfileMenuFor(null);
+                      } else {
+                        void app.switchBrowserProfile(props.sessionId, entry.id);
+                      }
+                    }}
+                  >
+                    <span class="butter-profile-dot" style={{ background: entry.color }} />
+                    <span class="butter-browser-profile-option-name">{entry.name}</span>
+                    <Show when={entry.id === profile().id}>
+                      <Icon path={ICONS.check} size={12} />
+                    </Show>
+                  </button>
+                )}
+              </For>
+              <div class="butter-browser-profile-menu-sep" />
+              <button
+                class="butter-browser-profile-option manage"
+                type="button"
+                role="menuitem"
+                onClick={() => app.openBrowserProfiles()}
+              >
+                Manage profiles…
+              </button>
+            </div>
+          </Show>
+        </div>
+        <span class="butter-browser-footer-value" title={browserState()?.title || ""}>
+          {props.app ? props.app.name : browserState()?.title || ""}
         </span>
-        <span
-          class={`butter-browser-footer-value ${profilePath() ? "" : "empty"}`}
-          title={profilePath() || "Shared default profile"}
-        >
-          {profilePath() || "Shared default profile"}
-        </span>
-        <button
-          class="butter-browser-footer-action danger icon"
-          type="button"
-          disabled={clearingProfile()}
-          onClick={() => void clearProfileState()}
-          title={clearingProfile() ? "Clearing profile…" : "Clear profile state"}
-          aria-label="Clear profile state"
-        >
-          <Icon path={ICONS.trash} size={13} />
-        </button>
       </footer>
       <Show when={browserState()?.lastError}>
         <div class="butter-browser-error">{browserState()?.lastError}</div>

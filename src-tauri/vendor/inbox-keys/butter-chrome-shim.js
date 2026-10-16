@@ -160,3 +160,80 @@ var chrome = (function () {
   };
 })();
 
+// Butter's Cmd+K palette lists and runs Inbox Keys' commands. Butter runs a
+// script in the page's world (browser.rs, inbox_keys_request_script) that
+// dispatches "butter:inboxkeys-request" on document with a JSON string
+// detail; this isolated-world listener answers with
+// "butter:inboxkeys-response". Strings cross between worlds; objects don't.
+//   { type: "list" }                -> [{ id, title, group, hint, keys }]
+//   { type: "run", command: "<id>" } -> true, or false when there's no such command
+(function () {
+  function respond(id, payload) {
+    document.dispatchEvent(
+      new CustomEvent("butter:inboxkeys-response", { detail: JSON.stringify({ id: id, payload: payload }) })
+    );
+  }
+
+  function registry() {
+    var ik = window.InboxKeys;
+    return ik && ik.commands && typeof ik.commands.all === "function" ? ik.commands : null;
+  }
+
+  function titleOf(cmd) {
+    return typeof cmd.title === "function" ? cmd.title() : String(cmd.title || cmd.id);
+  }
+
+  function keysOf(cmd) {
+    var first = (cmd.keys || [])[0];
+    if (!first) return cmd.hint || "";
+    var keymap = window.InboxKeys_KEYMAP;
+    return keymap && typeof keymap.displayBinding === "function" ? keymap.displayBinding(first) : first;
+  }
+
+  document.addEventListener("butter:inboxkeys-request", function (event) {
+    var request;
+    try {
+      request = JSON.parse(event.detail);
+    } catch (e) {
+      return;
+    }
+    if (!request || typeof request.id !== "string") return;
+    var commands = registry();
+    if (!commands) return; // Not Gmail (or not ready): Butter times out to null.
+    if (request.type === "list") {
+      var list = [];
+      try {
+        list = commands.all().map(function (cmd) {
+          return {
+            id: String(cmd.id),
+            title: titleOf(cmd),
+            group: cmd.group ? String(cmd.group) : "",
+            hint: cmd.hint ? String(cmd.hint) : "",
+            keys: keysOf(cmd),
+          };
+        });
+      } catch (e) {
+        console.error("[InboxKeys] could not list commands for Butter", e);
+      }
+      respond(request.id, list);
+    } else if (request.type === "run") {
+      var target = null;
+      try {
+        target = commands.all().find(function (cmd) {
+          return String(cmd.id) === request.command;
+        });
+      } catch (e) {}
+      respond(request.id, !!target);
+      if (target) {
+        setTimeout(function () {
+          try {
+            target.run();
+          } catch (e) {
+            console.error("[InboxKeys] command failed", request.command, e);
+          }
+        }, 0);
+      }
+    }
+  });
+})();
+

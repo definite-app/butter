@@ -7,7 +7,7 @@ use objc2::MainThreadOnly;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -35,6 +35,14 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(20);
 const CONSOLE_BUFFER_LIMIT: usize = 400;
 const NETWORK_BUFFER_LIMIT: usize = 400;
 
+/// Browser sessions for pinned web apps (browser.toml `[[app]]`) are
+/// `app:<id>`; every other browser session id is a terminal's.
+pub const APP_SESSION_PREFIX: &str = "app:";
+
+pub fn is_app_session(session_id: &str) -> bool {
+    session_id.starts_with(APP_SESSION_PREFIX)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserBounds {
@@ -53,7 +61,8 @@ pub struct BrowserSessionState {
     pub loading: bool,
     pub url: String,
     pub title: String,
-    pub profile_path: Option<String>,
+    /// The browser.toml profile whose data store this pane uses.
+    pub profile_id: String,
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub bounds: Option<BrowserBounds>,
@@ -174,6 +183,16 @@ pub struct BrowserNetworkEvent {
     pub content_type: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// A page's Cmd+K / Cmd+Shift+K / Cmd+Shift+F, posted by the
+/// initialization script.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserShortcutEvent {
+    pub session_id: String,
+    pub token: String,
+    /// "commands", "switcher" or "fullscreen".
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,8 +317,12 @@ struct BrowserSession {
     session_id: String,
     token: String,
     webview_label: Option<String>,
-    profile_key: Option<String>,
-    data_store_identifier: Option<[u8; 16]>,
+    /// browser.toml profile id. Fixed once a webview exists, until the user
+    /// switches it (`switch_profile`).
+    profile_id: String,
+    /// Set when the first webview is created or the user picks a profile, so
+    /// a later `assign_initial_profile` doesn't move the pane.
+    profile_locked: bool,
     url: String,
     title: String,
     loading: bool,
@@ -321,8 +344,8 @@ impl BrowserSession {
             session_id: session_id.to_string(),
             token: Uuid::new_v4().to_string(),
             webview_label: None,
-            profile_key: None,
-            data_store_identifier: None,
+            profile_id: crate::browser_config::DEFAULT_PROFILE_ID.to_string(),
+            profile_locked: false,
             url: "about:blank".to_string(),
             title: String::new(),
             loading: false,
@@ -350,7 +373,7 @@ impl BrowserSession {
             loading: self.loading,
             url: self.url.clone(),
             title: self.title.clone(),
-            profile_path: self.profile_key.clone(),
+            profile_id: self.profile_id.clone(),
             can_go_back: self.can_go_back,
             can_go_forward: self.can_go_forward,
             bounds: self.bounds.clone(),
@@ -483,17 +506,37 @@ impl<R: Runtime> BrowserManager<R> {
         }
     }
 
-    pub fn register_session_directory(
+    /// Gives the pane its starting profile (a preset's `browser_profile`, an
+    /// app's `profile`). No-op once the pane has a webview or the user picked
+    /// a profile: a pane keeps its profile until switched from the footer.
+    pub fn assign_initial_profile(
         &self,
         session_id: &str,
-        directory: Option<&str>,
+        requested: Option<&str>,
     ) -> Result<(), String> {
-        let profile_key = resolve_browser_profile_key(directory);
-        let data_store_identifier = profile_key
-            .as_deref()
-            .map(stable_profile_identifier_from_key);
+        let profile_id = crate::browser_config::current().resolve_profile(requested);
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Browser sessions lock poisoned".to_string())?;
+        let entry = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| BrowserSession::new(session_id));
+        if !entry.profile_locked && entry.webview_label.is_none() {
+            entry.profile_id = profile_id;
+        }
+        Ok(())
+    }
 
-        let label_to_close = {
+    /// Moves the pane to another profile: recreates its webview on that
+    /// profile's data store and reloads the page it was on.
+    pub fn switch_profile(
+        &self,
+        session_id: &str,
+        requested: &str,
+    ) -> Result<BrowserSessionState, String> {
+        let profile_id = crate::browser_config::current().resolve_profile(Some(requested));
+        let (label_to_close, reload_url) = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -501,30 +544,40 @@ impl<R: Runtime> BrowserManager<R> {
             let entry = sessions
                 .entry(session_id.to_string())
                 .or_insert_with(|| BrowserSession::new(session_id));
-
-            if entry.profile_key == profile_key
-                && entry.data_store_identifier == data_store_identifier
-            {
-                None
+            entry.profile_locked = true;
+            if entry.profile_id == profile_id {
+                (None, None)
             } else {
-                entry.profile_key = profile_key;
-                entry.data_store_identifier = data_store_identifier;
+                entry.profile_id = profile_id;
                 entry.loading = false;
                 entry.can_go_back = false;
                 entry.can_go_forward = false;
                 entry.console_entries.clear();
                 entry.network_entries.clear();
-                entry.webview_label.take()
+                let label = entry.webview_label.take();
+                let url = entry.url.clone();
+                let reload = label.is_some() && is_reloadable_url(&url);
+                (label, reload.then_some(url))
             }
         };
-
+        let had_webview = label_to_close.is_some();
         if let Some(label) = label_to_close {
             if let Some(webview) = self.app.get_webview(&label) {
                 let _ = webview.close();
             }
         }
-
-        Ok(())
+        if had_webview {
+            match reload_url {
+                Some(url) => {
+                    self.open(session_id, Some(url))?;
+                }
+                None => {
+                    self.ensure_webview(session_id, None)?;
+                }
+            }
+        }
+        self.emit_state(session_id)?;
+        self.get_state(session_id)
     }
 
     pub fn open(
@@ -571,18 +624,33 @@ impl<R: Runtime> BrowserManager<R> {
         let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
         let webview = self.require_webview(session_id)?;
         self.sync_userscripts(session_id, &webview, Userscripts::load());
-        {
+        let same_document = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "Browser sessions lock poisoned".to_string())?;
-            if let Some(entry) = sessions.get_mut(session_id) {
-                entry.url = url.to_string();
-                entry.loading = true;
-                entry.last_error = None;
+            match sessions.get_mut(session_id) {
+                Some(entry) => {
+                    let same_document = is_fragment_navigation(&entry.url, url);
+                    entry.url = url.to_string();
+                    entry.loading = !same_document;
+                    entry.last_error = None;
+                    same_document
+                }
+                None => false,
             }
+        };
+        if same_document {
+            // Only the #fragment changes (a browser.toml command such as
+            // "#search/is:unread"): let the page's router handle it, as a click
+            // on a link would, instead of a load that never reports finishing.
+            let target = serde_json::to_string(url).map_err(|e| e.to_string())?;
+            webview
+                .eval(format!("location.href = {target};"))
+                .map_err(|e| e.to_string())?;
+        } else {
+            webview.navigate(parsed).map_err(|e| e.to_string())?;
         }
-        webview.navigate(parsed).map_err(|e| e.to_string())?;
         self.emit_state(session_id)?;
         self.get_state(session_id)
     }
@@ -893,32 +961,29 @@ impl<R: Runtime> BrowserManager<R> {
         Ok(())
     }
 
-    pub fn clear_profile_state(&self, session_id: &str) -> Result<(), String> {
-        let webview = self.require_webview(session_id)?;
-        clear_webview_data_store(&webview)?;
+    /// Deletes every cookie, cache and site storage in `profile_id`'s data
+    /// store and resets the panes that use it. Returns the panes that were
+    /// open, for the caller to reopen. Call off the main thread.
+    pub fn clear_profile(&self, profile_id: &str) -> Result<Vec<String>, String> {
+        clear_profile_data_store(&self.app, profile_id)?;
 
-        let (affected_session_ids, labels) = {
+        let (reopen, affected_session_ids, labels) = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "Browser sessions lock poisoned".to_string())?;
-            let target = sessions
-                .get(session_id)
-                .ok_or_else(|| "Unknown browser session".to_string())?;
-            let target_profile_key = target.profile_key.clone();
-            let target_data_store_identifier = target.data_store_identifier;
-
+            let mut reopen = Vec::new();
             let mut affected_session_ids = Vec::new();
             let mut labels = Vec::new();
 
             for entry in sessions.values_mut() {
-                if entry.profile_key != target_profile_key
-                    || entry.data_store_identifier != target_data_store_identifier
-                {
+                if entry.profile_id != profile_id {
                     continue;
                 }
-
                 affected_session_ids.push(entry.session_id.clone());
+                if entry.open {
+                    reopen.push(entry.session_id.clone());
+                }
                 if let Some(label) = entry.webview_label.take() {
                     labels.push(label);
                 }
@@ -934,7 +999,7 @@ impl<R: Runtime> BrowserManager<R> {
                 entry.network_entries.clear();
             }
 
-            (affected_session_ids, labels)
+            (reopen, affected_session_ids, labels)
         };
 
         for label in labels {
@@ -947,7 +1012,110 @@ impl<R: Runtime> BrowserManager<R> {
             let _ = self.emit_state(&affected_session_id);
         }
 
-        Ok(())
+        Ok(reopen)
+    }
+
+    /// Sites (WebKit's display names, usually the registrable domain) with
+    /// data in the profile's store. Call off the main thread.
+    pub fn profile_sites(&self, profile_id: &str) -> Result<Vec<String>, String> {
+        fetch_profile_sites(&self.app, profile_id)
+    }
+
+    /// Deletes one site's data from the profile's store. Call off the main
+    /// thread.
+    pub fn remove_profile_site(&self, profile_id: &str, site: &str) -> Result<(), String> {
+        remove_profile_site_data(&self.app, profile_id, site)
+    }
+
+    /// Hides a visible pane, returning a JPEG of what it showed first, so the
+    /// UI can put a dimmed picture in its place while a palette is open.
+    /// Call off the main thread.
+    pub fn suspend_with_snapshot(&self, session_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let (visible, width) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "Browser sessions lock poisoned".to_string())?;
+            match sessions.get(session_id) {
+                Some(entry) => (
+                    entry.visible && entry.webview_label.is_some(),
+                    entry.bounds.as_ref().map(|b| b.width).unwrap_or(0.0),
+                ),
+                None => (false, 0.0),
+            }
+        };
+        let snapshot = if visible {
+            let webview = self.require_webview(session_id)?;
+            // Half width: on a Retina screen that's one pixel per point, plenty
+            // for a dimmed backdrop, and quick to encode.
+            let snapshot_width = (width / 2.0).round();
+            capture_snapshot_sized(
+                &webview,
+                BrowserImageFormat::Jpeg,
+                (snapshot_width >= 64.0).then_some(snapshot_width),
+                Duration::from_millis(400),
+            )
+            .ok()
+        } else {
+            None
+        };
+        self.set_visible(session_id, false)?;
+        Ok(snapshot)
+    }
+
+    /// Gives the pane's webview keyboard focus.
+    pub fn focus(&self, session_id: &str) -> Result<(), String> {
+        let webview = self.require_webview(session_id)?;
+        webview.set_focus().map_err(|e| e.to_string())
+    }
+
+    /// A page asked for one of Butter's shortcuts (Cmd+K, Cmd+Shift+K,
+    /// Cmd+Shift+F). Hands focus to Butter's own webview so typing goes to
+    /// the palette, and tells the UI.
+    pub fn handle_page_shortcut(&self, payload: BrowserShortcutEvent) -> Result<(), String> {
+        self.validate_token(&payload.session_id, &payload.token)?;
+        let action = match payload.action.as_str() {
+            "commands" | "switcher" | "fullscreen" => payload.action.clone(),
+            other => return Err(format!("Unknown browser shortcut {other:?}")),
+        };
+        // Palettes take typing; full screen leaves focus in the page.
+        if action != "fullscreen" {
+            if let Some(main) = self.app.get_webview("main") {
+                let _ = main.set_focus();
+            }
+        }
+        self.app
+            .emit(
+                "browser-shortcut",
+                serde_json::json!({ "sessionId": payload.session_id, "action": action }),
+            )
+            .map_err(|e| format!("Failed to emit browser shortcut: {e}"))
+    }
+
+    /// Inbox Keys' commands on the pane's page (Gmail), or `null` when Inbox
+    /// Keys isn't running there. Asks the userscript's Butter shim, which
+    /// lives in an isolated world, through DOM events. Call off the main
+    /// thread.
+    pub fn inbox_keys_commands(&self, session_id: &str) -> Result<serde_json::Value, String> {
+        self.eval_with_result(
+            session_id,
+            &inbox_keys_request_script(r#"{ "type": "list" }"#),
+            Duration::from_millis(2_500),
+        )
+    }
+
+    /// Runs one Inbox Keys command by id. Call off the main thread.
+    pub fn inbox_keys_run(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let request = serde_json::json!({ "type": "run", "command": command_id }).to_string();
+        self.eval_with_result(
+            session_id,
+            &inbox_keys_request_script(&request),
+            Duration::from_millis(2_500),
+        )
     }
 
     pub fn snapshot_dom(&self, session_id: &str) -> Result<BrowserDomSnapshot, String> {
@@ -1174,7 +1342,14 @@ return {{
     }
 
     fn ensure_webview(&self, session_id: &str, initial_url: Option<&str>) -> Result<(), String> {
-        let (needs_create, label, visible, bounds, token, session_id_owned, data_store_identifier) = {
+        // Tauri panics on a label with other characters.
+        if !session_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '/' | ':' | '_'))
+        {
+            return Err(format!("Invalid browser session id {session_id:?}"));
+        }
+        let (needs_create, label, visible, bounds, token, session_id_owned, profile_id) = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -1183,6 +1358,7 @@ return {{
                 .entry(session_id.to_string())
                 .or_insert_with(|| BrowserSession::new(session_id));
             let label = entry.label();
+            entry.profile_locked = true;
             if entry.webview_label.is_none() {
                 entry.webview_label = Some(label.clone());
                 entry.open = true;
@@ -1198,7 +1374,7 @@ return {{
                 entry.bounds.clone(),
                 entry.token.clone(),
                 entry.session_id.clone(),
-                entry.data_store_identifier,
+                entry.profile_id.clone(),
             )
         };
 
@@ -1273,9 +1449,10 @@ return {{
             tauri::webview::NewWindowResponse::Deny
         });
 
-        if let Some(data_store_identifier) = data_store_identifier {
-            builder = builder.data_store_identifier(data_store_identifier);
-        }
+        // Every profile, "default" included, has a store of its own. WebKit's
+        // default store belongs to Butter's UI.
+        builder = builder
+            .data_store_identifier(crate::browser_config::data_store_identifier(&profile_id));
 
         let size = bounds
             .clone()
@@ -1409,63 +1586,6 @@ return {{
     }
 }
 
-fn resolve_browser_profile_key(directory: Option<&str>) -> Option<String> {
-    let directory = directory?.trim();
-    if directory.is_empty() {
-        return None;
-    }
-
-    let expanded = expand_home_path(directory);
-    let canonical = canonicalize_profile_directory(&expanded);
-    let resolved = resolve_git_worktree_root(&canonical).unwrap_or(canonical);
-    Some(resolved.to_string_lossy().to_string())
-}
-
-fn expand_home_path(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
-}
-
-fn canonicalize_profile_directory(path: &Path) -> PathBuf {
-    let candidate = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-    fs::canonicalize(&candidate).unwrap_or(candidate)
-}
-
-fn resolve_git_worktree_root(path: &Path) -> Option<PathBuf> {
-    let path_str = path.to_str()?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        return None;
-    }
-    Some(canonicalize_profile_directory(Path::new(&root)))
-}
-
-fn stable_profile_identifier_from_key(key: &str) -> [u8; 16] {
-    let first = fnv1a64(key.as_bytes(), 0xcbf29ce484222325);
-    let second = fnv1a64(key.as_bytes(), 0x84222325cbf29ce4);
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&first.to_be_bytes());
-    bytes[8..].copy_from_slice(&second.to_be_bytes());
-    bytes
-}
-
 fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
     let mut hash = seed;
     for byte in bytes {
@@ -1473,6 +1593,52 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// `to` is the page `from` is on, with a #fragment.
+fn is_fragment_navigation(from: &str, to: &str) -> bool {
+    let Some((to_page, _)) = to.split_once('#') else {
+        return false;
+    };
+    let from_page = from.split_once('#').map_or(from, |(page, _)| page);
+    is_reloadable_url(from_page) && from_page == to_page
+}
+
+/// A page worth loading again after a profile switch.
+fn is_reloadable_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
+}
+
+/// Page-world script for `eval_with_result` that sends `request` (JSON) to
+/// the Inbox Keys shim (`vendor/inbox-keys/butter-chrome-shim.js`), which
+/// runs in the userscript's isolated world. DOM events cross worlds; their
+/// string `detail` does too. Resolves `null` when nothing answers.
+fn inbox_keys_request_script(request: &str) -> String {
+    format!(
+        r#"
+const request = {request};
+request.id = "butter-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+return await new Promise((resolve) => {{
+  let done = false;
+  const finish = (value) => {{
+    if (done) return;
+    done = true;
+    document.removeEventListener("butter:inboxkeys-response", onResponse);
+    resolve(value);
+  }};
+  const onResponse = (event) => {{
+    let message = null;
+    try {{ message = JSON.parse(event.detail); }} catch (_err) {{ return; }}
+    if (!message || message.id !== request.id) return;
+    finish(message.payload === undefined ? null : message.payload);
+  }};
+  document.addEventListener("butter:inboxkeys-response", onResponse);
+  window.setTimeout(() => finish(null), 1500);
+  document.dispatchEvent(new CustomEvent("butter:inboxkeys-request", {{ detail: JSON.stringify(request) }}));
+}});
+"#
+    )
 }
 
 /// `~/.butter/bin` (`~/.butter-dev/bin` in the dev flavor). Only put on PATH
@@ -1506,7 +1672,7 @@ usage() {
   if [ "$code" -eq 0 ]; then
     cat <<'EOF'
 Usage:
-  butter-browser open [url]
+  butter-browser open [--profile <id>] [url]
   butter-browser goto <url>
   butter-browser close
   butter-browser show
@@ -1530,7 +1696,7 @@ EOF
   else
     cat >&2 <<'EOF'
 Usage:
-  butter-browser open [url]
+  butter-browser open [--profile <id>] [url]
   butter-browser goto <url>
   butter-browser close
   butter-browser show
@@ -1581,7 +1747,6 @@ need_env BUTTER_BROWSER_TOKEN
 sid="$BUTTER_SESSION_ID"
 endpoint="$BUTTER_BROWSER_ENDPOINT"
 token="$BUTTER_BROWSER_TOKEN"
-current_cwd="${PWD:-}"
 
 post_form() {
   route="$1"
@@ -1597,27 +1762,32 @@ get_query() {
 
 case "$command" in
   open)
-    if [ "${1:-}" ]; then
-      if [ -n "$current_cwd" ]; then
-        post_form open --data-urlencode "cwd=$current_cwd" --data-urlencode "url=$1"
-      else
-        post_form open --data-urlencode "url=$1"
-      fi
+    profile=""
+    case "${1:-}" in
+      --profile)
+        [ "${2:-}" ] || usage 1
+        profile="$2"
+        shift 2
+        ;;
+      --profile=*)
+        profile="${1#--profile=}"
+        shift
+        ;;
+    esac
+    set -- "${1:-}" "$profile"
+    if [ -n "$1" ] && [ -n "$2" ]; then
+      post_form open --data-urlencode "url=$1" --data-urlencode "profile=$2"
+    elif [ -n "$1" ]; then
+      post_form open --data-urlencode "url=$1"
+    elif [ -n "$2" ]; then
+      post_form open --data-urlencode "profile=$2"
     else
-      if [ -n "$current_cwd" ]; then
-        post_form open --data-urlencode "cwd=$current_cwd"
-      else
-        post_form open
-      fi
+      post_form open
     fi
     ;;
   goto|navigate)
     [ "${1:-}" ] || usage 1
-    if [ -n "$current_cwd" ]; then
-      post_form navigate --data-urlencode "cwd=$current_cwd" --data-urlencode "url=$1"
-    else
-      post_form navigate --data-urlencode "url=$1"
-    fi
+    post_form navigate --data-urlencode "url=$1"
     ;;
   close)
     post_form close
@@ -2228,6 +2398,8 @@ fn initialization_script(session_id: &str, token: &str, endpoint_base: &str) -> 
         .unwrap_or_else(|_| "\"\"".to_string());
     let network_endpoint = serde_json::to_string(&format!("{}/browser/network", endpoint_base))
         .unwrap_or_else(|_| "\"\"".to_string());
+    let shortcut_endpoint = serde_json::to_string(&format!("{}/browser/shortcut", endpoint_base))
+        .unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"
 (() => {{
@@ -2237,6 +2409,7 @@ fn initialization_script(session_id: &str, token: &str, endpoint_base: &str) -> 
   const callbackEndpoint = {callback_endpoint};
   const consoleEndpoint = {console_endpoint};
   const networkEndpoint = {network_endpoint};
+  const shortcutEndpoint = {shortcut_endpoint};
   const invokeOrFetch = async (command, endpoint, payload) => {{
     const body = {{
       session_id: sessionId,
@@ -2347,6 +2520,9 @@ fn initialization_script(session_id: &str, token: &str, endpoint_base: &str) -> 
     async postNetwork(payload) {{
       await invokeOrFetch("browser_network_event", networkEndpoint, payload);
     }},
+    async postShortcut(payload) {{
+      await invokeOrFetch("browser_page_shortcut", shortcutEndpoint, payload);
+    }},
   }};
   const emitNetwork = (payload) => {{
     const url = resolveRequestUrl(payload && payload.url ? payload.url : "");
@@ -2388,6 +2564,36 @@ fn initialization_script(session_id: &str, token: &str, endpoint_base: &str) -> 
     enumerable: false,
     writable: false
   }});
+  // Butter's own shortcuts win over the page's (Gmail binds Cmd+K too): the
+  // window capture phase runs before any listener on the document. Every
+  // frame gets this listener, since keys go to the focused frame's window.
+  if (!globalThis.__butterShortcutsHooked) {{
+    Object.defineProperty(globalThis, "__butterShortcutsHooked", {{
+      value: true,
+      configurable: false,
+      enumerable: false,
+      writable: false
+    }});
+    const shortcutFor = (event) => {{
+      if (!event.metaKey || event.ctrlKey || event.altKey) return null;
+      const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
+      if (key === "k") return event.shiftKey ? "switcher" : "commands";
+      if (key === "f" && event.shiftKey) return "fullscreen";
+      return null;
+    }};
+    globalThis.addEventListener(
+      "keydown",
+      (event) => {{
+        const action = shortcutFor(event);
+        if (!action) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (event.repeat) return;
+        void bridge.postShortcut({{ action }});
+      }},
+      true,
+    );
+  }}
   if (!globalThis.__butterContextMenuBlocked) {{
     Object.defineProperty(globalThis, "__butterContextMenuBlocked", {{
       value: true,
@@ -2638,35 +2844,144 @@ fn format_browser_eval_script(callback_id: &str, inner_script: &str) -> String {
     )
 }
 
+/// Runs `f` on the main thread with the WebKit data store of `profile_id`
+/// (the same store its panes get from `data_store_identifier`) and waits for
+/// it to send a result. `f` gets the store and a sender to finish with; keep
+/// the store alive in any completion block. Never call on the main thread.
 #[cfg(target_os = "macos")]
-fn clear_webview_data_store<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {
+fn with_profile_store<R, T, F>(app: &AppHandle<R>, profile_id: &str, f: F) -> Result<T, String>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(objc2::rc::Retained<WKWebsiteDataStore>, mpsc::Sender<Result<T, String>>)
+        + Send
+        + 'static,
+{
+    let identifier = crate::browser_config::data_store_identifier(profile_id);
     let (tx, rx) = mpsc::channel();
-    webview
-        .with_webview(move |platform| unsafe {
-            let view: &WKWebView = &*platform.inner().cast();
-            let config = view.configuration();
-            let store = config.websiteDataStore();
-            let mtm = MainThreadMarker::new_unchecked();
-            let all_data_types = WKWebsiteDataStore::allWebsiteDataTypes(mtm);
-            let date = NSDate::dateWithTimeIntervalSince1970(0.0);
-            let callback = RcBlock::new(move || {
-                let _ = tx.send(Ok(()));
-            });
-            store.removeDataOfTypes_modifiedSince_completionHandler(
-                &all_data_types,
-                &date,
-                &callback,
-            );
-        })
-        .map_err(|e| e.to_string())?;
-
+    app.run_on_main_thread(move || unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let uuid = objc2_foundation::NSUUID::from_bytes(identifier);
+        let store = WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm);
+        f(store, tx);
+    })
+    .map_err(|e| e.to_string())?;
     rx.recv_timeout(CALLBACK_TIMEOUT)
-        .map_err(|_| "Timed out waiting for browser data clear".to_string())?
+        .map_err(|_| "Timed out waiting for the browser data store".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn clear_profile_data_store<R: Runtime>(
+    app: &AppHandle<R>,
+    profile_id: &str,
+) -> Result<(), String> {
+    with_profile_store(app, profile_id, |store, tx| unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let all_data_types = WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+        let date = NSDate::dateWithTimeIntervalSince1970(0.0);
+        let keep = store.clone();
+        let callback = RcBlock::new(move || {
+            let _ = &keep;
+            let _ = tx.send(Ok(()));
+        });
+        store.removeDataOfTypes_modifiedSince_completionHandler(&all_data_types, &date, &callback);
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_profile_sites<R: Runtime>(
+    app: &AppHandle<R>,
+    profile_id: &str,
+) -> Result<Vec<String>, String> {
+    with_profile_store(app, profile_id, |store, tx| unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let all_data_types = WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+        let keep = store.clone();
+        let callback = RcBlock::new(
+            move |records: std::ptr::NonNull<
+                objc2_foundation::NSArray<objc2_web_kit::WKWebsiteDataRecord>,
+            >| {
+                let _ = &keep;
+                let mut sites: Vec<String> = records
+                    .as_ref()
+                    .to_vec()
+                    .iter()
+                    .map(|record| record.displayName().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                sites.sort();
+                sites.dedup();
+                let _ = tx.send(Ok(sites));
+            },
+        );
+        store.fetchDataRecordsOfTypes_completionHandler(&all_data_types, &callback);
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn remove_profile_site_data<R: Runtime>(
+    app: &AppHandle<R>,
+    profile_id: &str,
+    site: &str,
+) -> Result<(), String> {
+    let site = site.to_string();
+    with_profile_store(app, profile_id, move |store, tx| unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let all_data_types = WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+        let keep = store.clone();
+        let fetched = RcBlock::new(
+            move |records: std::ptr::NonNull<
+                objc2_foundation::NSArray<objc2_web_kit::WKWebsiteDataRecord>,
+            >| {
+                let matching: Vec<_> = records
+                    .as_ref()
+                    .to_vec()
+                    .into_iter()
+                    .filter(|record| record.displayName().to_string() == site)
+                    .collect();
+                if matching.is_empty() {
+                    let _ = tx.send(Ok(()));
+                    return;
+                }
+                let mtm = MainThreadMarker::new_unchecked();
+                let types = WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+                let array = objc2_foundation::NSArray::from_retained_slice(&matching);
+                let tx = tx.clone();
+                let keep_inner = keep.clone();
+                let removed = RcBlock::new(move || {
+                    let _ = &keep_inner;
+                    let _ = tx.send(Ok(()));
+                });
+                keep.removeDataOfTypes_forDataRecords_completionHandler(&types, &array, &removed);
+            },
+        );
+        store.fetchDataRecordsOfTypes_completionHandler(&all_data_types, &fetched);
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clear_webview_data_store<R: Runtime>(_webview: &Webview<R>) -> Result<(), String> {
+fn clear_profile_data_store<R: Runtime>(
+    _app: &AppHandle<R>,
+    _profile_id: &str,
+) -> Result<(), String> {
     Err("Browser profile clearing is only supported on macOS".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fetch_profile_sites<R: Runtime>(
+    _app: &AppHandle<R>,
+    _profile_id: &str,
+) -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_profile_site_data<R: Runtime>(
+    _app: &AppHandle<R>,
+    _profile_id: &str,
+    _site: &str,
+) -> Result<(), String> {
+    Err("Browser site data is only supported on macOS".to_string())
 }
 
 /// One userscript, ready to hand to WebKit. Plain data so it can cross to the
@@ -2793,10 +3108,20 @@ where
         .map_err(|_| "Failed to receive WKWebView callback result".to_string())?
 }
 
-#[cfg(target_os = "macos")]
 fn capture_snapshot<R: Runtime>(
     webview: &Webview<R>,
     format: BrowserImageFormat,
+) -> Result<Vec<u8>, String> {
+    capture_snapshot_sized(webview, format, None, CALLBACK_TIMEOUT)
+}
+
+/// `width` is in points; `None` keeps the view's own width.
+#[cfg(target_os = "macos")]
+fn capture_snapshot_sized<R: Runtime>(
+    webview: &Webview<R>,
+    format: BrowserImageFormat,
+    width: Option<f64>,
+    timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let (tx, rx) = mpsc::channel();
     webview
@@ -2816,10 +3141,13 @@ fn capture_snapshot<R: Runtime>(
             );
             let mtm = MainThreadMarker::new_unchecked();
             let config = WKSnapshotConfiguration::new(mtm);
+            if let Some(width) = width {
+                config.setSnapshotWidth(Some(&objc2_foundation::NSNumber::new_f64(width)));
+            }
             view.takeSnapshotWithConfiguration_completionHandler(Some(&config), &callback);
         })
         .map_err(|e| e.to_string())?;
-    rx.recv_timeout(CALLBACK_TIMEOUT)
+    rx.recv_timeout(timeout)
         .map_err(|_| "Timed out waiting for snapshot image".to_string())?
 }
 
@@ -2843,9 +3171,11 @@ fn encode_snapshot_image(image: &NSImage, format: BrowserImageFormat) -> Result<
 }
 
 #[cfg(not(target_os = "macos"))]
-fn capture_snapshot<R: Runtime>(
+fn capture_snapshot_sized<R: Runtime>(
     _webview: &Webview<R>,
     _format: BrowserImageFormat,
+    _width: Option<f64>,
+    _timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     Err("Browser image snapshots are only supported on macOS".to_string())
 }
@@ -2853,6 +3183,30 @@ fn capture_snapshot<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigations() {
+        let inbox = "https://mail.google.com/mail/u/0/#inbox";
+        assert!(is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/0/#search/is%3Aunread"
+        ));
+        assert!(is_fragment_navigation(
+            "https://a.com/x",
+            "https://a.com/x#top"
+        ));
+        // The pane may not know about in-page hash changes, so same is fine too.
+        assert!(is_fragment_navigation(inbox, inbox));
+        assert!(!is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/1/#inbox"
+        ));
+        assert!(!is_fragment_navigation(
+            inbox,
+            "https://mail.google.com/mail/u/0/"
+        ));
+        assert!(!is_fragment_navigation("about:blank", "about:blank#x"));
+    }
 
     #[test]
     fn user_agent_looks_like_safari() {
