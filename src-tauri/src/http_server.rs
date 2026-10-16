@@ -1,7 +1,7 @@
 use crate::agent_types::*;
 use crate::browser::{
     BrowserActionCallback, BrowserConsoleEvent, BrowserConsoleFilter, BrowserImageFormat,
-    BrowserManager, BrowserNetworkEvent, BrowserNetworkFilter,
+    BrowserManager, BrowserNetworkEvent, BrowserNetworkFilter, BrowserShortcutEvent,
 };
 use crate::database::{AgentDatabase, TeamChannelInput, TeamMessageInput, TeamUserInput};
 use axum::{
@@ -13,8 +13,8 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::TcpListener;
-use tauri::Emitter;
 use std::sync::Arc;
+use tauri::Emitter;
 
 /// Shared state for the HTTP server
 pub struct AppState {
@@ -54,6 +54,7 @@ pub async fn start_server(
         .route("/browser/callback", post(browser_callback))
         .route("/browser/console", post(browser_console))
         .route("/browser/network", post(browser_network))
+        .route("/browser/shortcut", post(browser_shortcut))
         // Team Mode CLI routes
         .route("/team/:id/send", post(team_send))
         .route("/team/:id/reply", post(team_reply))
@@ -135,16 +136,15 @@ struct BrowserOpenForm {
     token: String,
     #[serde(default)]
     url: Option<String>,
+    /// `butter-browser open --profile <id>`: switch the pane to that profile.
     #[serde(default)]
-    cwd: Option<String>,
+    profile: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct BrowserNavigateForm {
     token: String,
     url: String,
-    #[serde(default)]
-    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -209,11 +209,15 @@ async fn browser_open(
     if let Err(err) = state.browser.validate_token(&id, &form.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
     }
-    if let Err(err) = state
-        .browser
-        .register_session_directory(&id, form.cwd.as_deref())
+    if let Some(profile) = form
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
     {
-        return error_json(StatusCode::INTERNAL_SERVER_ERROR, err);
+        if let Err(err) = state.browser.switch_profile(&id, profile) {
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, err);
+        }
     }
     match state.browser.open(&id, form.url) {
         Ok(browser_state) => ok_json(browser_state),
@@ -270,12 +274,6 @@ async fn browser_navigate(
 ) -> impl IntoResponse {
     if let Err(err) = state.browser.validate_token(&id, &form.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
-    }
-    if let Err(err) = state
-        .browser
-        .register_session_directory(&id, form.cwd.as_deref())
-    {
-        return error_json(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
     match state.browser.navigate(&id, &form.url) {
         Ok(browser_state) => ok_json(browser_state),
@@ -561,6 +559,20 @@ async fn browser_network(State(state): State<Arc<AppState>>, body: String) -> im
     }
 }
 
+async fn browser_shortcut(State(state): State<Arc<AppState>>, body: String) -> impl IntoResponse {
+    match serde_json::from_str::<BrowserShortcutEvent>(&body) {
+        Ok(payload) => match state.browser.handle_page_shortcut(payload) {
+            Ok(()) => (StatusCode::OK, "ok").into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid browser shortcut payload: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 // ============================================================================
 // Team Mode CLI Handlers
 // ============================================================================
@@ -775,7 +787,12 @@ async fn thread_reply(
     }
     match crate::thread::get_thread(&state.db, &id) {
         Ok(Some(_)) => {}
-        Ok(None) => return error_json(StatusCode::NOT_FOUND, "This terminal is not a 1thread session"),
+        Ok(None) => {
+            return error_json(
+                StatusCode::NOT_FOUND,
+                "This terminal is not a 1thread session",
+            )
+        }
         Err(err) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
     let paths: Vec<String> = form
@@ -789,7 +806,15 @@ async fn thread_reply(
         Ok(images) => images,
         Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
     };
-    match crate::thread::add_message(&state.db, &id, "agent", &form.body, Some("cli"), None, &images) {
+    match crate::thread::add_message(
+        &state.db,
+        &id,
+        "agent",
+        &form.body,
+        Some("cli"),
+        None,
+        &images,
+    ) {
         Ok(message) => {
             let _ = state
                 .browser
@@ -859,11 +884,19 @@ async fn routine_create(
     if let Err(err) = state.browser.validate_token(&id, &form.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
     }
-    let due_at = match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
-        Ok(due_at) => due_at,
-        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
-    };
-    match crate::routine::create_routine(&state.db, &id, &form.prompt, Some(&form.title), due_at, Some(&form.cwd)) {
+    let due_at =
+        match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
+            Ok(due_at) => due_at,
+            Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+        };
+    match crate::routine::create_routine(
+        &state.db,
+        &id,
+        &form.prompt,
+        Some(&form.title),
+        due_at,
+        Some(&form.cwd),
+    ) {
         Ok(routine) => {
             routines_changed(&state);
             ok_json(routine)
@@ -880,7 +913,10 @@ async fn routine_list(
     if let Err(err) = state.browser.validate_token(&id, &query.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
     }
-    let all = query.all.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    let all = query
+        .all
+        .as_deref()
+        .is_some_and(|v| !v.is_empty() && v != "0");
     match crate::routine::list_for_session(&state.db, &id, all) {
         Ok(routines) => ok_json(routines),
         Err(err) => error_json(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -895,11 +931,18 @@ async fn routine_snooze(
     if let Err(err) = state.browser.validate_token(&id, &form.token) {
         return error_json(StatusCode::UNAUTHORIZED, err);
     }
-    let due_at = match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
-        Ok(due_at) => due_at,
-        Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
-    };
-    match crate::routine::snooze_routine(&state.db, &id, Some(&form.routine), due_at, Some(&form.prompt)) {
+    let due_at =
+        match crate::routine::parse_due(Some(&form.at), Some(&form.after), chrono::Local::now()) {
+            Ok(due_at) => due_at,
+            Err(err) => return error_json(StatusCode::BAD_REQUEST, err),
+        };
+    match crate::routine::snooze_routine(
+        &state.db,
+        &id,
+        Some(&form.routine),
+        due_at,
+        Some(&form.prompt),
+    ) {
         Ok(routine) => {
             routines_changed(&state);
             ok_json(routine)
@@ -954,7 +997,9 @@ async fn team_search(
         return error_json(StatusCode::BAD_REQUEST, "Expected search query");
     }
     let result = if query.advanced.unwrap_or(false) {
-        state.db.search_team_messages_advanced(&query.q, query.limit)
+        state
+            .db
+            .search_team_messages_advanced(&query.q, query.limit)
     } else {
         state.db.search_team_messages(&query.q, query.limit)
     };

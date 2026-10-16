@@ -1,6 +1,7 @@
 mod agent_skill;
 mod agent_types;
 mod browser;
+mod browser_config;
 mod cc_search;
 mod clipboard_history;
 mod codex_session;
@@ -19,7 +20,7 @@ mod userscripts;
 use agent_types::*;
 use browser::{
     BrowserActionCallback, BrowserBounds, BrowserConsoleEvent, BrowserManager, BrowserNetworkEvent,
-    BrowserSessionState,
+    BrowserSessionState, BrowserShortcutEvent,
 };
 use database::{
     AgentDatabase, ClipboardEntry, CreateSessionRequest, RestoreCandidate, Session,
@@ -149,11 +150,16 @@ fn pty_create(
     cols: u16,
     cwd: Option<String>,
     command: Option<String>,
+    browser_profile: Option<String>,
     manager: State<PtyManager>,
     browser_manager: State<Arc<BrowserManager>>,
 ) -> Result<String, String> {
     let session_id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    browser_manager.register_session_directory(&session_id, cwd.as_deref())?;
+    if browser::is_app_session(&session_id) {
+        return Err("Session ids starting with \"app:\" belong to web apps".to_string());
+    }
+    // The preset's browser profile, for a pane `butter-browser open` starts.
+    browser_manager.assign_initial_profile(&session_id, browser_profile.as_deref())?;
     let extra_env = browser_manager.shell_env(&session_id)?;
     manager.create(Some(session_id), rows, cols, cwd, command, Some(extra_env))
 }
@@ -173,16 +179,16 @@ fn pty_close(id: String, manager: State<PtyManager>) -> Result<(), String> {
     manager.close(&id)
 }
 
+/// `profile` is the pane's starting profile (a preset's or an app's); it's
+/// ignored once the pane has one.
 #[tauri::command]
 fn browser_open(
     session_id: String,
     url: Option<String>,
+    profile: Option<String>,
     manager: State<Arc<BrowserManager>>,
-    pty_manager: State<PtyManager>,
 ) -> Result<BrowserSessionState, String> {
-    if let Ok(cwd) = pty_cwd_by_id(&pty_manager, &session_id) {
-        let _ = manager.register_session_directory(&session_id, Some(&cwd));
-    }
+    manager.assign_initial_profile(&session_id, profile.as_deref())?;
     manager.open(&session_id, url)
 }
 
@@ -196,11 +202,7 @@ fn browser_navigate(
     session_id: String,
     url: String,
     manager: State<Arc<BrowserManager>>,
-    pty_manager: State<PtyManager>,
 ) -> Result<BrowserSessionState, String> {
-    if let Ok(cwd) = pty_cwd_by_id(&pty_manager, &session_id) {
-        let _ = manager.register_session_directory(&session_id, Some(&cwd));
-    }
     manager.navigate(&session_id, &url)
 }
 
@@ -271,11 +273,110 @@ fn browser_close_devtools(
 }
 
 #[tauri::command]
-fn browser_clear_profile(
+fn browser_set_profile(
     session_id: String,
+    profile: String,
+    manager: State<Arc<BrowserManager>>,
+) -> Result<BrowserSessionState, String> {
+    manager.switch_profile(&session_id, &profile)
+}
+
+#[tauri::command]
+fn browser_focus(session_id: String, manager: State<Arc<BrowserManager>>) -> Result<(), String> {
+    manager.focus(&session_id)
+}
+
+/// browser.toml, re-read if it changed.
+#[tauri::command]
+fn browser_config_get() -> browser_config::BrowserConfig {
+    browser_config::current()
+}
+
+#[tauri::command]
+fn browser_config_path() -> Result<String, String> {
+    browser_config::ensure_default_file();
+    browser_config::browser_toml_path().map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn browser_profile_create(
+    name: String,
+    color: Option<String>,
+) -> Result<browser_config::BrowserProfile, String> {
+    browser_config::create_profile(&name, color.as_deref())
+}
+
+#[tauri::command]
+fn browser_profile_update(
+    id: String,
+    name: Option<String>,
+    color: Option<String>,
+) -> Result<(), String> {
+    browser_config::update_profile(&id, name.as_deref(), color.as_deref())
+}
+
+// The commands below wait for WebKit callbacks that arrive on the main thread,
+// so they are async: Tauri runs sync commands on the main thread.
+
+/// Clears the profile's data store. Returns the panes that were open.
+#[tauri::command]
+async fn browser_profile_clear(
+    profile: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<Vec<String>, String> {
+    manager.clear_profile(&profile)
+}
+
+#[tauri::command]
+async fn browser_profile_sites(
+    profile: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<Vec<String>, String> {
+    manager.profile_sites(&profile)
+}
+
+#[tauri::command]
+async fn browser_profile_remove_site(
+    profile: String,
+    site: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<(), String> {
+    manager.remove_profile_site(&profile, &site)
+}
+
+/// Hides the pane; returns a JPEG of it (empty when it wasn't showing).
+#[tauri::command]
+async fn browser_suspend(
+    session_id: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<tauri::ipc::Response, String> {
+    let snapshot = manager.suspend_with_snapshot(&session_id)?;
+    Ok(tauri::ipc::Response::new(snapshot.unwrap_or_default()))
+}
+
+#[tauri::command]
+async fn browser_inbox_keys_commands(
+    session_id: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.inbox_keys_commands(&session_id)
+}
+
+#[tauri::command]
+async fn browser_inbox_keys_run(
+    session_id: String,
+    command: String,
+    manager: State<'_, Arc<BrowserManager>>,
+) -> Result<serde_json::Value, String> {
+    manager.inbox_keys_run(&session_id, &command)
+}
+
+#[tauri::command]
+fn browser_page_shortcut(
+    payload: BrowserShortcutEvent,
     manager: State<Arc<BrowserManager>>,
 ) -> Result<(), String> {
-    manager.clear_profile_state(&session_id)
+    manager.handle_page_shortcut(payload)
 }
 
 #[tauri::command]
@@ -1968,7 +2069,19 @@ pub fn run() {
             browser_get_state,
             browser_open_devtools,
             browser_close_devtools,
-            browser_clear_profile,
+            browser_set_profile,
+            browser_focus,
+            browser_config_get,
+            browser_config_path,
+            browser_profile_create,
+            browser_profile_update,
+            browser_profile_clear,
+            browser_profile_sites,
+            browser_profile_remove_site,
+            browser_suspend,
+            browser_inbox_keys_commands,
+            browser_inbox_keys_run,
+            browser_page_shortcut,
             browser_ipc_callback,
             browser_console_event,
             browser_network_event,
@@ -2113,6 +2226,8 @@ pub fn run() {
             // Bundled browser userscripts (Inbox Keys for Gmail). Quick, and done
             // before any browser pane can open so the first one gets them.
             userscripts::install_bundled();
+            // browser.toml with commented examples, only when there's none.
+            browser_config::ensure_default_file();
             app.manage(browser_manager);
 
             // Start the HTTP server for agent API in background
