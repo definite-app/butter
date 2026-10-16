@@ -168,6 +168,8 @@ struct Config {
     var pasteLastHotkey: String { string("dictation", "paste_last_hotkey", "ctrl+alt+v") }
     var livePreview: Bool { bool("dictation", "live_preview", true) }
     var previewIntervalMs: Int { int("dictation", "preview_interval_ms", 700) }
+    var paragraphPause: Double { double("dictation", "paragraph_pause_seconds", 2.0) }
+    var paragraphMaxWords: Int { int("dictation", "paragraph_max_words", 120) }
 
     // [ui]
     var hud: Bool { bool("ui", "hud", true) }
@@ -246,7 +248,9 @@ struct Config {
     paste_last_hotkey = "ctrl+alt+v"            # paste the last dictation again (e.g. it landed in the wrong window)
     live_preview = true          # show words as you speak (re-transcribes the last ~20s every interval)
     preview_interval_ms = 700
-    output = "paste"             # paste | clipboard | none
+    paragraph_pause_seconds = 2.0 # start a new paragraph after a pause this long (0 = one block of text)
+    paragraph_max_words = 120    # ...or at the next sentence once a paragraph gets this long (0 = no limit)
+    output = "paste"          # paste | clipboard | none
     restore_clipboard = true     # put the previous clipboard back after pasting
     sounds = true                # start/stop sounds (also used for meetings)
     start_sound = "butter-start" # butter-start | butter-stop | butter-error, a macOS sound

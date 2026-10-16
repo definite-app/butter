@@ -286,8 +286,9 @@ final class Daemon {
         sound(config.stopSound)
         if config.hud { hud.show(.transcribing) }
         let config = self.config
+        // Segments carry the timestamps that turn pauses into paragraph breaks.
         worker.transcribe(audio: sink.url, engine: config.engine, model: config.model, language: config.language,
-                          prompt: config.prompt, segments: false, vad: false) { [weak self] result in
+                          prompt: config.prompt, segments: true, vad: false) { [weak self] result in
             DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup) }
         }
         return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds, "cleanup": cleanup]
@@ -337,7 +338,7 @@ final class Daemon {
             if dictationMic == nil { showError() }
             log("dictation failed: \(error)")
         case let .success(transcription):
-            let text = transcription.text
+            let text = transcription.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)
             log("dictation: \(String(format: "%.1f", audioSeconds))s audio -> \(text.count) chars in \(String(format: "%.2f", transcription.elapsed))s")
             guard cleanup, !text.isEmpty else {
                 deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil)
@@ -537,8 +538,9 @@ final class Daemon {
             do {
                 let t = try worker.transcribeSync(audio: URL(fileURLWithPath: audio), engine: request["engine"] as? String ?? config.engine,
                                                   model: request["model"] as? String ?? config.model, language: config.language,
-                                                  prompt: config.prompt, segments: false, vad: request["vad"] as? Bool ?? true)
-                return ["ok": true, "text": t.text, "engine": t.engine, "model": t.model, "elapsed": t.elapsed]
+                                                  prompt: config.prompt, segments: true, vad: request["vad"] as? Bool ?? true)
+                return ["ok": true, "text": t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords),
+                        "engine": t.engine, "model": t.model, "elapsed": t.elapsed]
             } catch {
                 return ["ok": false, "error": "\(error)"]
             }
