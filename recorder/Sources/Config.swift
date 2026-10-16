@@ -1,12 +1,18 @@
 import Foundation
 
 /// Just enough TOML for a flat config: `[section]` headers and `key = value`
-/// with strings, numbers and booleans. Arrays and inline tables aren't needed.
+/// with strings (including `"""` multi-line strings), numbers, booleans and
+/// one-line arrays of strings. Inline tables aren't needed.
 enum MiniTOML {
     static func parse(_ text: String) -> [String: [String: Any]] {
         var result: [String: [String: Any]] = [:]
         var section = ""
-        for rawLine in text.components(separatedBy: .newlines) {
+        var lines = text.components(separatedBy: .newlines)[...]
+        while let rawLine = lines.popFirst() {
+            if let (key, value) = multiLineString(rawLine, rest: &lines) {
+                result[section, default: [:]][key] = value
+                continue
+            }
             let line = stripComment(rawLine).trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }
             if line.hasPrefix("[") && line.hasSuffix("]") {
@@ -19,6 +25,27 @@ enum MiniTOML {
             result[section, default: [:]][key] = parseValue(value)
         }
         return result
+    }
+
+    /// `key = """` ... `"""`: the text in between, verbatim, minus the newline
+    /// right after the opening quotes.
+    private static func multiLineString(_ line: String, rest: inout ArraySlice<String>) -> (String, String)? {
+        guard !line.trimmingCharacters(in: .whitespaces).hasPrefix("#"), let eq = line.firstIndex(of: "=") else { return nil }
+        let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        guard value.hasPrefix("\"\"\"") else { return nil }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+        var body = String(value.dropFirst(3))
+        if let end = body.range(of: "\"\"\"") { return (key, String(body[..<end.lowerBound])) }
+        var parts: [String] = body.isEmpty ? [] : [body]
+        while let next = rest.popFirst() {
+            if let end = next.range(of: "\"\"\"") {
+                parts.append(String(next[..<end.lowerBound]))
+                break
+            }
+            parts.append(next)
+        }
+        body = parts.joined(separator: "\n")
+        return (key, body)
     }
 
     private static func stripComment(_ line: String) -> String {
@@ -61,11 +88,40 @@ enum MiniTOML {
         if value.count >= 2, value.hasPrefix("'"), value.hasSuffix("'") {
             return String(value.dropFirst().dropLast())
         }
+        if value.hasPrefix("[") && value.hasSuffix("]") {
+            return splitArray(String(value.dropFirst().dropLast())).compactMap { item -> String? in
+                let parsed = parseValue(item.trimmingCharacters(in: .whitespaces))
+                return (parsed as? String).flatMap { $0.isEmpty ? nil : $0 }
+            }
+        }
         if value == "true" { return true }
         if value == "false" { return false }
         if let i = Int(value) { return i }
         if let d = Double(value) { return d }
         return value
+    }
+
+    /// Splits array items on commas outside quotes.
+    private static func splitArray(_ body: String) -> [String] {
+        var items: [String] = [], current = ""
+        var quote: Character?
+        var escaped = false
+        for ch in body {
+            if escaped { escaped = false; current.append(ch); continue }
+            if ch == "\\" && quote == "\"" { escaped = true; current.append(ch); continue }
+            if let q = quote {
+                if ch == q { quote = nil }
+            } else if ch == "\"" || ch == "'" {
+                quote = ch
+            } else if ch == "," {
+                items.append(current)
+                current = ""
+                continue
+            }
+            current.append(ch)
+        }
+        items.append(current)
+        return items.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     }
 }
 
@@ -83,6 +139,13 @@ struct Config {
 
     func double(_ section: String, _ key: String, _ fallback: Double) -> Double {
         (raw[section]?[key] as? NSNumber)?.doubleValue ?? fallback
+    }
+
+    /// An array of strings; a single string counts as a comma-separated list.
+    func strings(_ section: String, _ key: String) -> [String] {
+        if let list = raw[section]?[key] as? [String] { return list }
+        guard let text = raw[section]?[key] as? String else { return [] }
+        return text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     func int(_ section: String, _ key: String, _ fallback: Int) -> Int {
@@ -137,6 +200,17 @@ struct Config {
     var summarizeCommand: String { string("meeting", "summarize_command", "") }
     var meLabel: String { string("meeting", "me_label", "Me") }
     var themLabel: String { string("meeting", "them_label", "Them") }
+
+    // [cleanup]
+    var cleanupButton: Bool { bool("cleanup", "button", true) }
+    var cleanupHarness: String { string("cleanup", "harness", "claude") }
+    var cleanupModel: String { string("cleanup", "model", "haiku") }
+    var cleanupEffort: String { string("cleanup", "effort", "") }
+    var cleanupCommand: String { string("cleanup", "command", "") }
+    var cleanupPrompt: String { string("cleanup", "prompt", "") }
+    var cleanupInstructions: String { string("cleanup", "instructions", "") }
+    var cleanupVocabulary: [String] { strings("cleanup", "vocabulary") }
+    var cleanupTimeout: Double { double("cleanup", "timeout_seconds", 20) }
 
     static func load() -> Config {
         ensureDefaultFile()
@@ -204,6 +278,25 @@ struct Config {
     # becomes summary.md. Runs in a login shell. For example:
     # summarize_command = "ollama run llama3.2 'Summarize this meeting transcript as notes with decisions and action items:'"
     summarize_command = ""
+
+    [cleanup]
+    # Hands-free dictation shows a ✦ button next to stop: it stops, transcribes,
+    # then rewrites the text with a model before pasting (filler words, false
+    # starts, "X, I mean Y", misheard names, punctuation). Stop (■) stays raw.
+    # If the cleanup fails, times out, or looks like an answer instead of a
+    # cleanup, the raw text is pasted. History keeps both.
+    button = true
+    harness = "claude"           # claude: headless `claude -p` (no tools, MCP, hooks or session saved)
+                                 # command: run `command` below, prompt on stdin, cleaned text on stdout
+    model = "haiku"              # claude --model (haiku | sonnet | opus | a full model id)
+    effort = ""                  # claude --effort, e.g. "low"; empty = the model's default
+    command = ""                 # e.g. "ollama run qwen3:4b" to stay fully local
+    timeout_seconds = 20
+    vocabulary = []              # preferred spellings, e.g. ["Salesforce", "ClickHouse", "Postgres"]
+    instructions = ""            # extra rules appended to the prompt, e.g. "Use British spelling."
+    # The whole prompt, if you want to replace it. {{text}} is the transcript,
+    # {{vocabulary}} and {{instructions}} the settings above. Empty = built in.
+    prompt = ""
 
     """
 }

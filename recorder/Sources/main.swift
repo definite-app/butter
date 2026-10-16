@@ -14,9 +14,11 @@ Usage:
   butter-rec meeting stop [--wait]   stop recording; transcription runs in the background
   butter-rec meeting toggle [--title <name>]
   butter-rec dictate [start|stop|toggle|cancel]
+  butter-rec dictate stop --clean    stop, and clean up the text before pasting ([cleanup] in the config)
+  butter-rec cleanup [<text>]        clean up text (or stdin) with the [cleanup] harness and print it
   butter-rec list [-n <n>]           recorded meetings, newest first
-  butter-rec history [-n <n>] [--search <text>] [--json]
-                                     recent dictations, newest first
+  butter-rec history [-n <n>] [--search <text>] [--json] [--raw]
+                                     recent dictations, newest first (--raw: before cleanup)
   butter-rec last [--copy]           print (or copy) the last dictation
   butter-rec transcript [<id>]       print a meeting transcript (default: latest)
   butter-rec summary [<id>]          print a meeting summary (needs summarize_command)
@@ -200,7 +202,25 @@ func run() throws {
     case "dictate":
         let action = args.positional.first ?? "toggle"
         guard ["start", "stop", "toggle", "cancel"].contains(action) else { throw CLIError("dictate start|stop|toggle|cancel") }
-        print(json: try daemonRequest(["cmd": "dictate.\(action)"]))
+        var request: [String: Any] = ["cmd": "dictate.\(action)"]
+        if args.flags.contains("clean") {
+            guard action == "stop" else { throw CLIError("--clean only goes with `dictate stop`") }
+            request["cleanup"] = true
+        }
+        print(json: try daemonRequest(request))
+
+    case "cleanup":
+        var text = args.positional.joined(separator: " ")
+        if text.isEmpty {
+            text = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CLIError("cleanup <text> (or text on stdin)") }
+        let outcome = Cleanup.run(text, config: Config.load())
+        print(outcome.text)
+        if let reason = outcome.fallbackReason {
+            throw CLIError("cleanup failed, printed the raw text: \(reason)")
+        }
+        FileHandle.standardError.write(String(format: "(cleaned in %.1fs)\n", outcome.elapsed).data(using: .utf8)!)
 
     case "list":
         let limit = Int(args.options["limit"] ?? "") ?? 20
@@ -222,7 +242,8 @@ func run() throws {
             df.dateFormat = "yyyy-MM-dd HH:mm"
             for entry in entries {
                 let when = parseISO(entry["at"] as? String).map { df.string(from: $0) } ?? "?"
-                print("\(when)\t\(entry["text"] as? String ?? "")")
+                let text = args.flags.contains("raw") ? entry["raw"] as? String ?? entry["text"] as? String : entry["text"] as? String
+                print("\(when)\t\(text ?? "")")
             }
         }
 

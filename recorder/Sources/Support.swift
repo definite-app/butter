@@ -95,13 +95,25 @@ func formatDuration(_ seconds: Double) -> String {
 
 /// Runs a shell command through a login shell so the user's PATH applies.
 @discardableResult
-func runShell(_ command: String, stdin: Data? = nil) throws -> (status: Int32, stdout: Data, stderr: Data) {
+func runShell(_ command: String, stdin: Data? = nil, timeout: TimeInterval? = nil) throws -> (status: Int32, stdout: Data, stderr: Data) {
+    let result = try runProcess("/bin/zsh", ["-lc", command], stdin: stdin, timeout: timeout)
+    if result.timedOut { throw CLIError("timed out after \(Int(timeout ?? 0))s: \(command)") }
+    return (result.status, result.stdout, result.stderr)
+}
+
+/// Runs a program with the extended PATH. With a timeout, the child is
+/// terminated (then killed) once it runs over, and `timedOut` is set.
+func runProcess(_ executable: String, _ arguments: [String], stdin: Data? = nil, timeout: TimeInterval? = nil,
+                environment: [String: String?] = [:], directory: URL? = nil)
+    throws -> (status: Int32, stdout: Data, stderr: Data, timedOut: Bool) {
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    process.arguments = ["-lc", command]
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = Paths.searchPath
+    for (key, value) in environment { env[key] = value }
     process.environment = env
+    if let directory { process.currentDirectoryURL = directory }
     let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
     process.standardInput = inPipe
     process.standardOutput = outPipe
@@ -114,9 +126,19 @@ func runShell(_ command: String, stdin: Data? = nil) throws -> (status: Int32, s
     DispatchQueue.global().async { out = outPipe.fileHandleForReading.readDataToEndOfFile(); group.leave() }
     group.enter()
     DispatchQueue.global().async { err = errPipe.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+    var timedOut = false
+    if let timeout {
+        let pid = process.processIdentifier
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+            guard process.isRunning else { return }
+            timedOut = true
+            process.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if process.isRunning { kill(pid, SIGKILL) } }
+        }
+    }
     if let stdin { inPipe.fileHandleForWriting.write(stdin) }
     try? inPipe.fileHandleForWriting.close()
     process.waitUntilExit()
     group.wait()
-    return (process.terminationStatus, out, err)
+    return (process.terminationStatus, out, err, timedOut)
 }
