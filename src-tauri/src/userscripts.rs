@@ -392,13 +392,13 @@ struct Bundled {
 const BUNDLED: &[Bundled] = &[
     Bundled {
         file_name: "inbox-keys.user.js",
-        header: "// @name         Inbox Keys\n// @description  Gmail command palette (Cmd+K), hotkeys, split inbox and account switching.\n// @match        https://mail.google.com/*\n// @run-at       document-idle\n// @noframes",
+        header: "// @name         Inbox Keys\n// @description  Gmail command palette (Cmd+J), hotkeys, split inbox and account switching.\n// @match        https://mail.google.com/*\n// @run-at       document-idle\n// @noframes",
         content_world: true,
         files: GMAIL_FILES,
     },
     Bundled {
         file_name: "inbox-keys-calendar.user.js",
-        header: "// @name         Inbox Keys (Calendar)\n// @description  Cmd+K calendar layers, account switching and single-key navigation for Google Calendar.\n// @match        https://calendar.google.com/*\n// @run-at       document-idle\n// @noframes",
+        header: "// @name         Inbox Keys (Calendar)\n// @description  Cmd+J calendar layers, account switching and single-key navigation for Google Calendar.\n// @match        https://calendar.google.com/*\n// @run-at       document-idle\n// @noframes",
         content_world: true,
         files: CALENDAR_FILES,
     },
@@ -434,7 +434,48 @@ fn bundle_source(bundle: &Bundled) -> String {
         push_file("src/content/palette.css", &format!("GM_addStyle({css});"));
     }
     for (path, source) in bundle.files {
-        push_file(path, source);
+        push_file(path, &patch_vendored(path, source));
+    }
+    out
+}
+
+/// Butter's palette owns Cmd+K in every page, so Inbox Keys' own palette
+/// (Gmail) and overlay (Calendar) move to Cmd+J. Gmail's hotkey is a setting,
+/// so only its default and labels change; Calendar hard-codes it. Each entry:
+/// file, text, replacement, expected count. See vendor/inbox-keys/SOURCE.md.
+const HOTKEY_PATCHES: &[(&str, &str, &str, usize)] = &[
+    (
+        "src/content/storage.js",
+        "paletteHotkey: \"mod+k\",",
+        "paletteHotkey: \"mod+j\", // Butter: Cmd+K is Butter's palette.",
+        1,
+    ),
+    (
+        "src/content/hotkeys.js",
+        "storage.get(\"paletteHotkey\") || \"mod+k\"",
+        "storage.get(\"paletteHotkey\") || \"mod+j\"",
+        1,
+    ),
+    (
+        "src/content/palette.js",
+        "keyLabel(\"Mod+K\")",
+        "keyLabel(\"Mod+J\")",
+        2,
+    ),
+    (
+        "src/content/gcal-ui.js",
+        "if (mod && key === \"k\") {",
+        "if (mod && key === \"j\") { // Butter: Cmd+K is Butter's palette.",
+        1,
+    ),
+];
+
+fn patch_vendored(path: &str, source: &str) -> String {
+    let mut out = source.to_string();
+    for (file, from, to, _) in HOTKEY_PATCHES {
+        if *file == path {
+            out = out.replace(from, to);
+        }
     }
     out
 }
@@ -649,6 +690,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_keys_hotkeys_move_to_cmd_j() {
+        for (file, from, to, count) in HOTKEY_PATCHES {
+            let (_, original) = GMAIL_FILES
+                .iter()
+                .chain(CALENDAR_FILES)
+                .find(|(path, _)| path == file)
+                .unwrap();
+            assert_eq!(
+                original.matches(from).count(),
+                *count,
+                "{file}: the Cmd+J patch no longer applies; update HOTKEY_PATCHES"
+            );
+            let patched = patch_vendored(file, original);
+            assert_eq!(patched.matches(to).count(), *count);
+            assert!(!patched.contains(from));
+        }
+    }
+
+    #[test]
     fn bundled_scripts_parse_and_install_like_the_skill() {
         for bundle in BUNDLED {
             let source = bundle_source(bundle);
@@ -662,6 +722,8 @@ mod tests {
             );
             if bundle.content_world {
                 assert!(source.contains("var chrome = (function"));
+                assert!(source.contains("butter:inboxkeys-request"));
+                assert!(!source.contains("mod+k") && !source.contains("Mod+K"));
                 assert!(source.contains("GM_addStyle(\""));
                 assert!(source.contains("InboxKeys.storage = storage"));
             } else {

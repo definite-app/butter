@@ -11,7 +11,25 @@ Content scripts and CSS from the open-source Gmail extension "Inbox Keys"
   icons, marketing assets and tests.
 
 `butter-chrome-shim.js` is Butter's own code, not upstream. It stands in for
-the `chrome.storage` and `chrome.runtime` APIs the content scripts use.
+the `chrome.storage` and `chrome.runtime` APIs the content scripts use. It also
+answers Butter's palette: Butter dispatches `butter:inboxkeys-request` DOM
+events from the page world, and the shim lists or runs commands from
+`InboxKeys.commands` and replies with `butter:inboxkeys-response`.
+
+## Changes Butter makes when it bundles the files
+
+The files above stay unchanged on disk. `HOTKEY_PATCHES` in
+`src-tauri/src/userscripts.rs` edits them while building the userscripts,
+because Butter's palette owns Cmd+K in every page:
+
+- `storage.js`: the `paletteHotkey` default is `mod+j` (was `mod+k`), so Inbox
+  Keys' Gmail palette opens with Cmd+J. A value saved in its settings still
+  wins.
+- `hotkeys.js`: the fallback for a missing setting is `mod+j` too.
+- `palette.js`: the palette's key label reads Cmd+J.
+- `gcal-ui.js`: the Calendar overlay opens with Cmd+J (it hard-codes the key).
+
+A unit test fails if an upstream update moves any of these lines.
 
 `src-tauri/src/userscripts.rs` assembles these files, in the manifest's
 order, into userscripts and installs them into the userscripts folder on
