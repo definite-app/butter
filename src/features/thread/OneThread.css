@@ -418,6 +418,34 @@
   background: var(--border-default);
 }
 
+.ot-menu-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px 6px;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.ot-menu-meta span {
+  cursor: default;
+}
+
+.ot-menu .ot-menu-meta-id {
+  width: auto;
+  padding: 0;
+  border-radius: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.ot-menu .ot-menu-meta-id:hover {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
 .ot-receipt {
   font-size: var(--text-xs);
   color: var(--text-muted);

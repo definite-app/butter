@@ -12,6 +12,7 @@ import {
 } from "../src/features/thread/mentions.ts";
 import { filterSkills, insertSkill, leadingSkill, skillAtCaret, withLeadingSkill } from "../src/features/thread/skills.ts";
 import type { SkillAction } from "../src/features/thread/skills.ts";
+import { timeAgo } from "../src/features/thread/time.ts";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "../src/features/thread/search.ts";
 import { routinePreamble, routineWhen } from "../src/features/thread/routines.ts";
 import type { RoutineRecord } from "../src/features/thread/routines.ts";
@@ -194,4 +195,15 @@ test("withLeadingSkill puts the skill in front of the wrapped message", () => {
   assert.equal(withLeadingSkill("/butter-cli", known, wrap), "/butter-cli");
   assert.equal(withLeadingSkill("hello", known, wrap), "<m>hello</m>");
   assert.equal(withLeadingSkill("/tmp is full", known, wrap), "<m>/tmp is full</m>");
+});
+
+test("timeAgo counts up to days, then shows the date", () => {
+  const now = new Date(2026, 9, 16, 15, 0, 0).getTime();
+  assert.equal(timeAgo(now - 2_000, now), "just now");
+  assert.equal(timeAgo(now - 42_000, now), "42 seconds ago");
+  assert.equal(timeAgo(now - 60_000, now), "1 minute ago");
+  assert.equal(timeAgo(now - 3 * 3_600_000, now), "3 hours ago");
+  assert.equal(timeAgo(now - 86_400_000, now), "1 day ago");
+  assert.equal(timeAgo(new Date(2026, 8, 1).getTime(), now), "Sep 1");
+  assert.equal(timeAgo(new Date(2025, 8, 1).getTime(), now), "Sep 1, 2025");
 });

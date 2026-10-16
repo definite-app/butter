@@ -12,6 +12,7 @@ import type { SkillAction, SkillToken } from "./skills";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "./search";
 import type { SearchFrom } from "./search";
 import { routineDay, routineWhen } from "./routines";
+import { fullTimestamp, timeAgo } from "./time";
 import "./OneThread.css";
 
 const TIME_GAP_MS = 10 * 60 * 1000;
@@ -46,6 +47,15 @@ const sameItem = (a: StreamItem, b: StreamItem): boolean => {
 };
 
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/** What else the ⋯ menu says about a message: delivery for yours, where an agent's came from. */
+function messageMetaDetail(m: ThreadMessage): string | null {
+  if (m.role === "user") {
+    if (m.source === "routine") return "Routine";
+    return m.status ? m.status[0].toUpperCase() + m.status.slice(1) : null;
+  }
+  return m.source === "transcript" ? "From transcript" : null;
+}
 
 function formatSeparator(at: number): string {
   const date = new Date(at);
@@ -289,7 +299,7 @@ export function OneThread() {
   const [menuFor, setMenuFor] = createSignal<string | null>(null);
   // Open the menu upward when there isn't room below it in the stream.
   const [menuUp, setMenuUp] = createSignal(false);
-  const MENU_HEIGHT = 220;
+  const MENU_HEIGHT = 290;
   const toggleMenu = (messageId: string, button: HTMLElement) => {
     if (menuFor() === messageId) {
       setMenuFor(null);
@@ -1528,6 +1538,20 @@ export function OneThread() {
                                   <Icon name="terminal" />
                                   Open terminal
                                 </button>
+                                <div class="ot-menu-sep" role="separator" />
+                                <div class="ot-menu-meta">
+                                  <span title={fullTimestamp(m().created_at)}>
+                                    {timeAgo(m().created_at, Date.now())}
+                                    <Show when={messageMetaDetail(m())}>{(detail) => ` · ${detail()}`}</Show>
+                                  </span>
+                                  <button
+                                    class="ot-menu-meta-id"
+                                    onClick={fromMenu(() => void copyMessage(m().id))}
+                                    title={`Copy message ID ${m().id}`}
+                                  >
+                                    ID {m().id.slice(0, 8)}
+                                  </button>
+                                </div>
                               </div>
                             </Show>
                           </div>
