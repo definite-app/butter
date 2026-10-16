@@ -14,6 +14,7 @@ mod recordings;
 mod routine;
 mod thread;
 mod session_cli;
+mod userscripts;
 
 use agent_types::*;
 use browser::{
@@ -2109,6 +2110,9 @@ pub fn run() {
             }
             // Teach agents in any folder about butter-cli (routines, 1thread, Team Mode).
             std::thread::spawn(agent_skill::install_agent_skill);
+            // Bundled browser userscripts (Inbox Keys for Gmail). Quick, and done
+            // before any browser pane can open so the first one gets them.
+            userscripts::install_bundled();
             app.manage(browser_manager);
 
             // Start the HTTP server for agent API in background

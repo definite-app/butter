@@ -400,6 +400,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-web-kit",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

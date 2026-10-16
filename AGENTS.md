@@ -68,3 +68,19 @@ npm run test:composer
 - While Butter runs, the 1thread model checks once a minute (first check 15s after launch, which also catches routines missed while Butter was closed). A due routine starts a new agent looped into the conversation it came from, with the same preset and folder, the conversation so far, a pointer to the earlier agent's transcript, and the routine's prompt. From a plain terminal it starts a new thread in that folder.
 - The woken agent can run `butter-cli routine snooze --in 1w` (no id needed) to check again later.
 - Agents learn the commands from the `butter-cli` skill (`.claude/skills/butter-cli/`). Butter copies it into `~/.claude/skills/` and `~/.codex/skills/` on every launch (`src-tauri/src/agent_skill.rs`), unless the user has their own copy there (a SKILL.md without Butter's marker line).
+
+## Userscripts (browser pane)
+- Tampermonkey-style scripts for the browser pane live in `~/.config/butter/userscripts/` (Butter Dev: `~/.config/butter-dev/userscripts/`). Every `*.js` file there with a header is loaded, in name order, when a browser pane is created, and again when Butter's reload button or a navigation from Butter runs. A reload from inside the page doesn't re-read the folder. Code: `src-tauri/src/userscripts.rs` (parsing, matching, installing) and `replace_userscripts` in `src-tauri/src/browser.rs` (injection).
+- Header:
+  ```js
+  // ==UserScript==
+  // @name         My script
+  // @match        https://mail.google.com/*
+  // @run-at       document-idle
+  // @noframes
+  // ==/UserScript==
+  ```
+  `@match` takes Chrome match patterns and can repeat. A script without `@match` is skipped, and `@include`/`@exclude` are ignored. `@run-at` is `document-start`, `document-end` or `document-idle` (the default). `@noframes` keeps the script out of iframes. `@inject-into page` runs it in the page's own JavaScript world instead of an isolated one.
+- By default each script runs in its own isolated `WKContentWorld`, like a Chrome content script. It shares the DOM with the page but not its globals, and the page's CSP doesn't block it. WebKit 26 enforces Trusted Types, so on Gmail `innerHTML` throws in the page world but works in an isolated world. Scripts get `GM_addStyle(css)` and `GM_info`. Their console output goes to Web Inspector, not to `butter-browser console`.
+- **Inbox Keys** (Gmail Cmd+K palette, hotkeys, split inbox, account switching; MIT, vendored in `src-tauri/vendor/inbox-keys/`, source commit in `SOURCE.md`) is installed on every launch as `inbox-keys.user.js` (Gmail), `inbox-keys-calendar.user.js` (Google Calendar) and `inbox-keys-account-bridge.user.js` (runs in the page world to read the account list). `butter-chrome-shim.js` stands in for `chrome.storage` (backed by the page's localStorage) and `chrome.runtime`. Settings are in the in-Gmail settings modal. The extension's popup and options page aren't included.
+- Butter rewrites those files on every launch while they contain the line `// Installed by Butter, which rewrites this file on every launch. Delete this line to keep your own version.` To keep your own copy, delete that line. To turn one off, replace the file with an empty file.

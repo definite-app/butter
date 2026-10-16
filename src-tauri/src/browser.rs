@@ -2,6 +2,8 @@ use block2::RcBlock;
 #[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2::MainThreadOnly;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -22,9 +24,12 @@ use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSImage,
 };
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSDate, NSDictionary};
+use objc2_foundation::{NSDate, NSDictionary, NSString};
 #[cfg(target_os = "macos")]
-use objc2_web_kit::{WKSnapshotConfiguration, WKWebView, WKWebsiteDataStore};
+use objc2_web_kit::{
+    WKContentWorld, WKSnapshotConfiguration, WKUserScript, WKUserScriptInjectionTime, WKWebView,
+    WKWebsiteDataStore,
+};
 
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(20);
 const CONSOLE_BUFFER_LIMIT: usize = 400;
@@ -306,6 +311,8 @@ struct BrowserSession {
     last_error: Option<String>,
     console_entries: VecDeque<BrowserConsoleEntry>,
     network_entries: VecDeque<BrowserNetworkEntry>,
+    /// Fingerprint of the userscripts injected into the current webview.
+    userscripts_fingerprint: Option<u64>,
 }
 
 impl BrowserSession {
@@ -327,6 +334,7 @@ impl BrowserSession {
             last_error: None,
             console_entries: VecDeque::new(),
             network_entries: VecDeque::new(),
+            userscripts_fingerprint: None,
         }
     }
 
@@ -562,6 +570,7 @@ impl<R: Runtime> BrowserManager<R> {
         self.ensure_webview(session_id, Some(url))?;
         let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
         let webview = self.require_webview(session_id)?;
+        self.sync_userscripts(session_id, &webview, Userscripts::load());
         {
             let mut sessions = self
                 .sessions
@@ -580,6 +589,7 @@ impl<R: Runtime> BrowserManager<R> {
 
     pub fn reload(&self, session_id: &str) -> Result<BrowserSessionState, String> {
         let webview = self.require_webview(session_id)?;
+        self.sync_userscripts(session_id, &webview, Userscripts::load());
         webview.reload().map_err(|e| e.to_string())?;
         self.get_state(session_id)
     }
@@ -1200,7 +1210,15 @@ return {{
             .app
             .get_window("main")
             .ok_or_else(|| "Main window not found".to_string())?;
-        let url = initial_url.unwrap_or("about:blank");
+        let userscripts = Userscripts::load();
+        // Userscripts are added once the webview exists, so start blank and let
+        // the caller's navigate() (open and navigate both follow up with one)
+        // load the page with them in place.
+        let url = if userscripts.is_empty() {
+            initial_url.unwrap_or("about:blank")
+        } else {
+            "about:blank"
+        };
         let app_handle_for_page = self.app.clone();
         let app_handle_for_title = self.app.clone();
         let app_handle_for_new_window = self.app.clone();
@@ -1273,8 +1291,37 @@ return {{
         if !visible {
             let _ = webview.hide();
         }
+        self.set_userscripts_fingerprint(session_id, None);
+        self.sync_userscripts(session_id, &webview, userscripts);
         self.refresh_navigation_flags(session_id)?;
         self.emit_state(session_id)
+    }
+
+    fn set_userscripts_fingerprint(&self, session_id: &str, fingerprint: Option<u64>) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if let Some(entry) = sessions.get_mut(session_id) {
+                entry.userscripts_fingerprint = fingerprint;
+            }
+        }
+    }
+
+    /// Puts `userscripts` into the webview in place of the ones injected
+    /// before. They apply from the next page load. No-op when unchanged.
+    fn sync_userscripts(&self, session_id: &str, webview: &Webview<R>, userscripts: Userscripts) {
+        let previous = self.sessions.lock().ok().and_then(|sessions| {
+            sessions
+                .get(session_id)
+                .and_then(|e| e.userscripts_fingerprint)
+        });
+        let fingerprint = userscripts.fingerprint();
+        if previous == Some(fingerprint) || (previous.is_none() && userscripts.is_empty()) {
+            self.set_userscripts_fingerprint(session_id, Some(fingerprint));
+            return;
+        }
+        match replace_userscripts(webview, userscripts.injections) {
+            Ok(()) => self.set_userscripts_fingerprint(session_id, Some(fingerprint)),
+            Err(err) => eprintln!("[userscripts] could not inject into {session_id}: {err}"),
+        }
     }
 
     fn require_webview(&self, session_id: &str) -> Result<Webview<R>, String> {
@@ -2620,6 +2667,113 @@ fn clear_webview_data_store<R: Runtime>(webview: &Webview<R>) -> Result<(), Stri
 #[cfg(not(target_os = "macos"))]
 fn clear_webview_data_store<R: Runtime>(_webview: &Webview<R>) -> Result<(), String> {
     Err("Browser profile clearing is only supported on macOS".to_string())
+}
+
+/// One userscript, ready to hand to WebKit. Plain data so it can cross to the
+/// main thread.
+struct UserscriptInjection {
+    source: String,
+    at_document_start: bool,
+    main_frame_only: bool,
+    /// Isolated content world name; `None` means the page world.
+    world: Option<String>,
+}
+
+struct Userscripts {
+    injections: Vec<UserscriptInjection>,
+}
+
+impl Userscripts {
+    fn load() -> Self {
+        use crate::userscripts::{injection_source, load, RunAt};
+        let injections = load()
+            .iter()
+            .map(|script| UserscriptInjection {
+                source: injection_source(script),
+                at_document_start: script.run_at == RunAt::DocumentStart,
+                main_frame_only: script.no_frames,
+                world: script.world_name(),
+            })
+            .collect();
+        Self { injections }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.injections.is_empty()
+    }
+
+    fn fingerprint(&self) -> u64 {
+        self.injections
+            .iter()
+            .fold(0xcbf29ce484222325, |hash, injection| {
+                let flags = [
+                    u8::from(injection.at_document_start),
+                    u8::from(injection.main_frame_only),
+                ];
+                let hash = fnv1a64(&flags, hash);
+                let hash = fnv1a64(
+                    injection.world.as_deref().unwrap_or("page").as_bytes(),
+                    hash,
+                );
+                fnv1a64(injection.source.as_bytes(), hash)
+            })
+    }
+}
+
+/// Swaps the webview's userscripts: keeps wry's own `WKUserScript`s (Tauri's
+/// initialization scripts), drops the ones Butter added before, adds the new
+/// ones. Content scripts get a named `WKContentWorld` each, an isolated world
+/// where the page's CSP and Trusted Types don't apply to their DOM writes.
+#[cfg(target_os = "macos")]
+fn replace_userscripts<R: Runtime>(
+    webview: &Webview<R>,
+    injections: Vec<UserscriptInjection>,
+) -> Result<(), String> {
+    with_wkwebview(webview, move |view| unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let controller = view.configuration().userContentController();
+        let is_ours = |script: &WKUserScript| {
+            script
+                .source()
+                .to_string()
+                .starts_with(crate::userscripts::SOURCE_PREFIX)
+        };
+        let existing = controller.userScripts().to_vec();
+        if existing.iter().any(|script| is_ours(script)) {
+            controller.removeAllUserScripts();
+            for script in existing.iter().filter(|script| !is_ours(script)) {
+                controller.addUserScript(script);
+            }
+        }
+        for injection in &injections {
+            let world = match &injection.world {
+                Some(name) => WKContentWorld::worldWithName(&NSString::from_str(name), mtm),
+                None => WKContentWorld::pageWorld(mtm),
+            };
+            let time = if injection.at_document_start {
+                WKUserScriptInjectionTime::AtDocumentStart
+            } else {
+                WKUserScriptInjectionTime::AtDocumentEnd
+            };
+            let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+                WKUserScript::alloc(mtm),
+                &NSString::from_str(&injection.source),
+                time,
+                injection.main_frame_only,
+                &world,
+            );
+            controller.addUserScript(&script);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn replace_userscripts<R: Runtime>(
+    _webview: &Webview<R>,
+    _injections: Vec<UserscriptInjection>,
+) -> Result<(), String> {
+    Err("Userscripts are only supported on macOS".to_string())
 }
 
 fn with_wkwebview<R: Runtime, T, F>(webview: &Webview<R>, f: F) -> Result<T, String>
