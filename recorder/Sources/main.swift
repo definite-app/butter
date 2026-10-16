@@ -75,7 +75,9 @@ func convertToWav(_ input: URL) throws -> URL {
     let out = FileManager.default.temporaryDirectory.appendingPathComponent("butter-rec-\(UUID().uuidString).wav")
     let sink = try WavSink(url: out)
     let format = source.processingFormat
-    while true {
+    // Stop at the length rather than reading until an empty buffer: reading
+    // at the end throws (nilError) instead of returning zero frames.
+    while source.framePosition < source.length {
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 65536) else { break }
         try source.read(into: buffer)
         if buffer.frameLength == 0 { break }
@@ -290,9 +292,9 @@ func run() throws {
             let worker = ASRWorker(idleMinutes: 0)
             let t = try worker.transcribeSync(audio: wav, engine: args.options["engine"] ?? config.engine,
                                               model: args.options["model"] ?? config.model, language: config.language,
-                                              prompt: config.prompt, segments: false, vad: true)
+                                              prompt: config.prompt, segments: true, vad: true)
             worker.stop(reason: "done")
-            print(t.text)
+            print(t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords))
         }
 
     case "devices":

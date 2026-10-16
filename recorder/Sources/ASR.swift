@@ -12,6 +12,31 @@ struct Transcription {
     var engine: String
     var model: String
     var elapsed: Double
+
+    /// The text with a paragraph break wherever the speaker paused for at least
+    /// `pause` seconds, and at the next sentence once a paragraph passes
+    /// `maxWords`. Without segments (or with pause <= 0) it's the plain text.
+    func paragraphs(pause: Double, maxWords: Int) -> String {
+        let segments = self.segments.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard pause > 0, segments.count > 1 else { return text }
+        var paragraphs: [String] = []
+        var current: [String] = []
+        var words = 0
+        var lastEnd: Double?
+        for segment in segments {
+            let text = segment.text.trimmingCharacters(in: .whitespaces)
+            if let lastEnd, !current.isEmpty, segment.start - lastEnd >= pause || (maxWords > 0 && words >= maxWords) {
+                paragraphs.append(current.joined(separator: " "))
+                current = []
+                words = 0
+            }
+            current.append(text)
+            words += text.split(separator: " ").count
+            lastEnd = segment.end
+        }
+        if !current.isEmpty { paragraphs.append(current.joined(separator: " ")) }
+        return paragraphs.joined(separator: "\n\n")
+    }
 }
 
 /// Long-lived `uv run --script asr_worker.py serve` process speaking JSON lines,
