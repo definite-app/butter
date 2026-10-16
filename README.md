@@ -2,6 +2,65 @@
 
 A premium, minimal macOS terminal manager for agentic CLI workflows (Claude Code, Codex, Copilot). Built with Tauri + Solid.js + xterm.js, inspired by Arc and Zen browsers.
 
+## Install and update
+
+GitHub Actions builds Butter for Apple Silicon Macs on every push to `main`. You install and update from those builds. Downloading them requires a GitHub account with access to this repo.
+
+### With a clone of the repo (recommended)
+
+```sh
+git clone https://github.com/definite-app/butter.git
+cd butter
+scripts/install-app.sh --ci
+```
+
+To update, run `git pull && scripts/install-app.sh --ci` in the same folder. The script needs the [`gh` CLI](https://cli.github.com), signed in with `gh auth login`. It downloads the latest green `main` build. Then it quits Butter, saves the old app to `~/Butter.app.bak-<timestamp>`, installs the new one and reopens it. Your terminals come back through the reopen picker.
+
+- `--wait`: wait until no Claude session in Butter is mid-turn before quitting
+- `--rollback`: put the previous version back
+- No flags (`scripts/install-app.sh`): build locally instead (needs Node and Rust)
+
+### Without a clone
+
+1. Open the [latest successful **Build macOS App** run on `main`](https://github.com/definite-app/butter/actions/workflows/build-macos.yml?query=branch%3Amain+is%3Asuccess). Download the **Butter-macos-arm64** artifact.
+2. Unzip it, then unzip the `Butter.app.zip` inside.
+3. Quit Butter. This closes its terminals.
+4. Move the new `Butter.app` into `/Applications`, replacing the old one.
+5. The app is ad-hoc signed, so clear the download quarantine before opening it:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Butter.app
+   ```
+
+The same steps from a terminal, with `gh` signed in:
+
+```sh
+run=$(gh run list -R definite-app/butter -b main -e push -s success -L 20 \
+  --json databaseId,workflowName -q '[.[] | select(.workflowName=="Build macOS App")][0].databaseId')
+tmp=$(mktemp -d)
+gh run download "$run" -R definite-app/butter -n Butter-macos-arm64 -D "$tmp"
+ditto -x -k "$tmp/Butter.app.zip" "$tmp"
+osascript -e 'quit app "Butter"'; sleep 3
+[ -d /Applications/Butter.app ] && mv /Applications/Butter.app ~/Butter.app.bak-$(date +%Y%m%d-%H%M%S)
+ditto "$tmp/Butter.app" /Applications/Butter.app
+xattr -dr com.apple.quarantine /Applications/Butter.app
+open /Applications/Butter.app
+```
+
+Notes:
+- Each build has a new ad-hoc signature, so macOS may ask again for permissions you granted before.
+- GitHub keeps build artifacts for 90 days. Always take the newest run.
+- `butter-cli` is installed to `~/.butter/bin` every time Butter launches. There's nothing separate to update.
+
+### Dictation and meeting recorder (optional)
+
+The CI build doesn't include `butter-rec`. To install it, run this from a clone:
+
+```sh
+recorder/build.sh && butter-cli rec install
+```
+
+It needs Xcode's command-line tools (`xcode-select --install`) and [`uv`](https://docs.astral.sh/uv/). Run `recorder/build.sh` again after pulling to update it. See [recorder/README.md](recorder/README.md).
+
 ## Features
 
 - **Multi-session terminal** — xterm.js panes driven by a native Rust PTY layer
