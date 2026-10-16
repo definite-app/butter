@@ -1214,6 +1214,7 @@ return {{
             WebviewUrl::External(Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?),
         )
         .devtools(true)
+        .user_agent(safari_user_agent())
         .initialization_script_for_all_frames(init_script)
         .accept_first_mouse(true)
         .on_page_load(move |_webview, payload| {
@@ -2137,6 +2138,39 @@ esac
 "#
 }
 
+/// WKWebView's default user agent leaves off Safari's `Version/… Safari/…`
+/// suffix, so sites like Gmail treat the browser pane as an unsupported,
+/// outdated browser. Send the same user agent as the Mac's Safari, which runs
+/// the same WebKit.
+fn safari_user_agent() -> &'static str {
+    static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UA.get_or_init(|| {
+        let version = Command::new("defaults")
+            .args([
+                "read",
+                "/Applications/Safari.app/Contents/Info",
+                "CFBundleShortVersionString",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            .unwrap_or_else(|| "26.0".to_string());
+        safari_user_agent_for(&version)
+    })
+}
+
+fn safari_user_agent_for(version: &str) -> String {
+    // Safari reports macOS 10_15_7 on every macOS version, and only major.minor.
+    let short: Vec<&str> = version.split('.').take(2).collect();
+    format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{} Safari/605.1.15",
+        short.join(".")
+    )
+}
+
 fn initialization_script(session_id: &str, token: &str, endpoint_base: &str) -> String {
     let session_id = serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".to_string());
     let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
@@ -2660,4 +2694,18 @@ fn capture_snapshot<R: Runtime>(
     _format: BrowserImageFormat,
 ) -> Result<Vec<u8>, String> {
     Err("Browser image snapshots are only supported on macOS".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_looks_like_safari() {
+        assert_eq!(
+            safari_user_agent_for("26.6.2"),
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15"
+        );
+        assert!(safari_user_agent().contains(" Safari/605.1.15"));
+    }
 }

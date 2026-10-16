@@ -55,6 +55,9 @@ export function PaletteDialog<T extends PaletteItem>(props: {
               e.preventDefault();
               moveActiveIndex(-1);
             } else if (e.key === "Enter") {
+              // The command may move focus to another input (1thread's composer);
+              // don't let this Enter type a newline there.
+              e.preventDefault();
               const item = props.items[props.activeIndex];
               if (item) {
                 props.onSelect(item);

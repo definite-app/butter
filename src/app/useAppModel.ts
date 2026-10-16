@@ -452,6 +452,8 @@ export function useAppModel() {
   const [sessionSeenAt, setSessionSeenAt] = createSignal<Record<string, number>>({});
   const [ptyBySession, setPtyBySession] = createSignal<Record<string, string>>({});
   const [browserSessions, setBrowserSessions] = createSignal<Record<string, BrowserSessionState>>({});
+  // The active terminal's browser pane fills the whole window.
+  const [browserFullscreen, setBrowserFullscreen] = createSignal(false);
   const [fileTabsBySession, setFileTabsBySession] = createSignal<Record<string, WorkspaceFileTab[]>>({});
   const [pinnedFileTabs, setPinnedFileTabs] = createSignal<WorkspaceFileTab[]>([]);
   const [activeWorkspaceTabBySession, setActiveWorkspaceTabBySession] = createSignal<Record<string, string>>({});
@@ -2062,6 +2064,12 @@ export function useAppModel() {
           ? "Browse files to add to canvas (Cmd+Shift+E)"
           : "Browse directory of current terminal (Cmd+Shift+E)",
         action: () => void openFileBrowser(),
+      },
+      {
+        id: "browser-fullscreen",
+        label: "Full-Screen Browser",
+        description: "Fill the window with this terminal's browser (again to exit)",
+        action: () => void toggleBrowserFullscreen(),
       },
       {
         id: "recordings",
@@ -6044,7 +6052,20 @@ export function useAppModel() {
     }
   };
 
+  const toggleBrowserFullscreen = async () => {
+    if (browserFullscreen() && activeBrowserOpen()) {
+      setBrowserFullscreen(false);
+      return;
+    }
+    const sessionId = activeSessionId();
+    if (!sessionId) return;
+    if (appView() !== "terminal") setAppView("terminal");
+    if (!browserSessions()[sessionId]?.open) await openBrowserForSession(sessionId);
+    setBrowserFullscreen(true);
+  };
+
   const closeBrowserForSession = async (sessionId: string) => {
+    if (sessionId === activeSessionId()) setBrowserFullscreen(false);
     try {
       await invoke("browser_close", { sessionId });
       setBrowserSessions((prev) => ({
@@ -6397,7 +6418,7 @@ export function useAppModel() {
     const handlePaletteShortcut = (event: KeyboardEvent) => {
       const isK = event.key === "k" || event.key === "K";
       if (!isK || !event.metaKey) return;
-      const requestedMode: "commands" | "switcher" = event.shiftKey ? "commands" : "switcher";
+      const requestedMode: "commands" | "switcher" = event.shiftKey ? "switcher" : "commands";
       event.preventDefault();
       event.stopPropagation();
       const isOpen = showCommandPalette();
@@ -6591,7 +6612,7 @@ export function useAppModel() {
     window.addEventListener("keydown", handleCmdBackspace, true); // capture phase
 
     // Note: Cmd+K previously cleared the terminal; it is now globally bound to
-    // open the switcher palette (see handlePaletteShortcut above). Use the
+    // open the command palette (see handlePaletteShortcut above). Use the
     // command palette ("Clear Terminal Output") or the terminal's own escape
     // sequence if you need clearing.
 
@@ -7523,6 +7544,9 @@ export function useAppModel() {
     activeWorkspaceTabKind,
     activeSessionFileTabs,
     activeBrowserOpen,
+    browserFullscreen,
+    setBrowserFullscreen,
+    toggleBrowserFullscreen,
     activeBrowserSessionId,
     sessionPreview,
     setSessionPreview,

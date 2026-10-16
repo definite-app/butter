@@ -55,7 +55,7 @@ export function AppShell() {
 
   return (
     <div class="butter-web-shell">
-      <div class={`butter-web-layout ${app.quickInputActive() ? "quick-input-active" : ""} ${app.sidebarHidden() && !app.quickInputActive() ? "sidebar-collapsed" : ""}`}>
+      <div class={`butter-web-layout ${app.quickInputActive() ? "quick-input-active" : ""} ${app.sidebarHidden() && !app.quickInputActive() ? "sidebar-collapsed" : ""} ${app.appView() === "thread" ? "no-footer" : ""}`}>
         <Show when={showAppSidebar()}>
           <>
             <Sidebar />

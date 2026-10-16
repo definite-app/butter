@@ -1691,6 +1691,11 @@
   position: relative;
 }
 
+/* 1thread hides the footer bar, so the layout takes its space. */
+.butter-web-layout.no-footer {
+  height: 100vh;
+}
+
 .butter-web-main {
   flex: 1;
   display: flex;
@@ -2855,6 +2860,15 @@ body.butter-printing-markdown .butter-print-content hr {
   display: flex;
   flex-direction: column;
   background: rgba(17, 18, 20, 0.98);
+}
+
+/* Full-screen browser: cover the window (sidebar, tabs and terminal) without
+   resizing the terminal underneath. Palettes and modals still sit on top. */
+.butter-browser-pane.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(17, 18, 20);
 }
 
 .butter-browser-toolbar {
@@ -8368,7 +8382,7 @@ body.butter-printing-markdown .butter-print-content hr {
 
 /* ============================================
    TERMINAL SWITCHER (session list)
-   Triggered by ⌘K
+   Triggered by ⌘⇧K
    ============================================ */
 
 .switcher-overlay {

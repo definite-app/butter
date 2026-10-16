@@ -69,7 +69,7 @@ It needs Xcode's command-line tools (`xcode-select --install`) and [`uv`](https:
 
 - **Multi-session terminal** — xterm.js panes driven by a native Rust PTY layer
 - **Arc-style sidebar** — organize sessions with tags, presets, and filters
-- **Command palette** — `Cmd+Shift+K` to jump anywhere
+- **Command palette** — `Cmd+K` for commands, `Cmd+Shift+K` to jump to a terminal
 - **Claude Code activity indicators** — live working/idle status in the sidebar via Claude hooks
 - **Codex activity support** — `agent-turn-complete` events from Codex CLI
 - **Session persistence** — SQLite-backed sessions with scrollback; restore on app restart
@@ -205,9 +205,9 @@ notify = ["bash", "~/.config/butter/hooks/codex-notify.sh"]
 
 ## Keyboard Shortcuts
 
-- `Cmd+Shift+K` — command palette
+- `Cmd+K` — command palette
+- `Cmd+Shift+K` — terminal switcher
 - `Cmd+O` — file browser
-- `Cmd+K` — clear terminal
 - `Cmd+click` — open links
 
 ## Storage
