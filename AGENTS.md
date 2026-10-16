@@ -57,6 +57,14 @@ npm run test:composer
 (cd src-tauri && cargo test --lib)
 ```
 
+## Permissions and signing
+- macOS keys permission grants (Screen Recording, Microphone, Full Disk Access, folders, Automation) to the app's designated requirement. An ad-hoc build's requirement is its code hash (`codesign -dr -` prints `cdhash H"…"`), so every build looked like a new app and lost its grants.
+- `scripts/install-app.sh` re-signs every bundle it installs (local build, `--ci`, `--skip-build`, `--rollback`, also on `--dry-run`) with `scripts/sign-app.sh`: `$BUTTER_SIGN_IDENTITY` (name or SHA-1; `-` forces ad-hoc), else the first "Developer ID Application", else the first "Apple Development" identity in the keychain. It signs nested code first, then the bundle with `src-tauri/entitlements.plist`, and fails unless `codesign --verify --strict` passes and the requirement no longer pins a cdhash. With no identity it signs ad-hoc and warns. No hardened runtime locally; Developer ID + notarization in CI will need `--options runtime` and `com.apple.security.device.audio-input`.
+- The first stable-signed install can leave old toggles on that no longer apply. Fix with "Reset stale grants…" in the Permissions view (`tccutil reset All <bundle id>`).
+- **Permissions view** (Cmd+K "Permissions"; `src/features/permissions/`, backend `src-tauri/src/permissions.rs`): Butter's own (Notifications, Screen Recording, Microphone), the ones charged to Butter for terminal commands (Full Disk Access, Desktop/Documents/Downloads, Automation), and ButterRec's (from its daemon's `status` over `~/.butter/rec.sock`). Grant shows the system prompt where macOS has one and it hasn't been answered, else opens the exact System Settings pane. Rows re-check when the window regains focus. Full Disk Access is detected by opening the user's `TCC.db` (no prompt); folder and Automation access can't be checked without prompting.
+- The view opens by itself once on first launch, and once when the designated requirement differs from the one in `<butter home>/signing.json` while one of Butter's own permissions isn't granted.
+- WebKit keeps a login-keychain item, "butter WebCrypto Master Key", for pages that store crypto keys. Its access list trusts the build that made it, so after a signature change macOS may ask once to let Butter use it; choose Always Allow. Butter itself stores nothing in the keychain.
+
 ## Composer Dock (Cmd+I)
 - `src/features/composer/` (UI + pure logic in `logic.ts`, tests in `scripts/composer-logic.test.ts`, run `npm run test:composer`); backend in `src-tauri/src/composer.rs`.
 - Drafts are files under the flavor data dir (`~/.butter/drafts`, `~/.butter-dev/drafts`); sent drafts move to `drafts/sent/` and `drafts/history.jsonl`.
