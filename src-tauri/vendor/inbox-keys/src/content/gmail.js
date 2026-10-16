@@ -1,0 +1,1311 @@
+// Helpers for driving the Gmail UI from the content script.
+//
+// Strategy, in order of robustness:
+//   1) Hash routing (#inbox, #sent, #search/...) — very stable, Gmail's own router.
+//   2) Stable Gmail attributes ([gh="cm"] = compose, [gh="tm"] = toolbar).
+//   3) Toolbar buttons matched by data-tooltip / aria-label (English; localizable later).
+//   4) Native Gmail keyboard shortcuts as a fallback (requires shortcuts ON in Gmail).
+window.InboxKeys = window.InboxKeys || {};
+
+(function () {
+  function accountIndex() {
+    const m = location.pathname.match(/\/mail\/u\/(\d+)\//);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function basePath() {
+    return `/mail/u/${accountIndex()}/`;
+  }
+
+  function setHash(hash) {
+    location.hash = hash.startsWith("#") ? hash : "#" + hash;
+  }
+
+  // True when a single conversation is open (hash ends in a long thread id),
+  // e.g. #inbox/FMfcgz... or #search/is:unread/FMfcgz... The id is the LAST hash
+  // segment regardless of how many list/query/label segments precede it — see
+  // InboxKeys.hashutil.hashIsThread. (Earlier this assumed the id was the 2nd segment,
+  // which broke threads opened from search: shortcuts died until you cleared the
+  // search box.)
+  function inThread() {
+    return InboxKeys.hashutil.hashIsThread(location.hash || "");
+  }
+
+  // Visible-only query helper.
+  function isVisible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  // Stricter "actually on screen" test for dialogs/menus. A [role=dialog] can
+  // LINGER in Gmail's DOM after it closes — the attachment projector keeps its
+  // full-window box (so the crude isVisible above is fooled) but is flagged
+  // visibility:hidden / opacity:0 / aria-hidden="true". If we trust isVisible for
+  // those, getContext() stays stuck on the closed preview and Escape (plus every
+  // other thread shortcut) is hijacked into a no-op closeAttachmentPreview — the
+  // reported "Escape stops working after opening an attachment" bug. An open
+  // projector has none of these flags, so they cleanly separate the two states.
+  // Tolerant of jsdom (sparse getComputedStyle); offsetParent is deliberately not
+  // tested because it is null even for a genuinely open, position:fixed projector.
+  function isShowing(el) {
+    if (!isVisible(el)) return false;
+    if (el.closest && el.closest('[aria-hidden="true"]')) return false;
+    const cs = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
+    if (cs && (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0")) return false;
+    return true;
+  }
+
+  // ---- Selector registry --------------------------------------------------
+  // Single source of truth for every load-bearing Gmail DOM hook. Code reads
+  // SEL.* instead of scattering literals; verifySelectors() below (surfaced in
+  // the palette as "Verify Gmail selectors") and smoke/gmail-readonly-smoke.js
+  // probe the same names, so "what we depend on" and "is it still there" can't
+  // drift apart. When a shortcut dies in the field, run the verify command:
+  // the failing probe names exactly what Gmail changed.
+  const SEL = {
+    // list surface
+    listRow: "tr.zA",
+    listRowFallback: '[gh="tl"] tr', // structural: any row in the thread-list area
+    threadList: '[role="main"] [gh="tl"]',
+    rowCheckbox: '[role="checkbox"]',
+    // open conversation
+    renderedMessage: '[role="main"] [data-message-id]',
+    card: '[role="listitem"]',
+    cardHeader: ".gE",
+    messageBody: ".a3s",
+    inlineActions: ".ams",
+    // boilerplate zones inside a message body: links in here are almost never
+    // what Cmd+O means, so they rank below body links and attachments
+    signature: '.gmail_signature, [data-smartmail="gmail_signature"]',
+    quotedText: ".gmail_quote, .adL",
+    // an attachment chip at the bottom of a message card; clicking it opens
+    // Gmail's own previewer. download_url ("mime:filename:url") is the
+    // structural fallback if the aZo class is renamed.
+    attachmentChip: "span.aZo, [download_url]",
+    attachmentName: ".aV3",
+    // per-message kebab ("More") in an expanded card header — the ONLY Gmail
+    // control that forwards a SPECIFIC message. Its label varies across Gmail
+    // builds ("More message options" vs "More email options"); both spellings
+    // are registered. It is hover-gated, so callers hover the header first.
+    messageMenuButton:
+      '[aria-label="More message options"], [data-tooltip="More message options"], [aria-label="More email options"], [data-tooltip="More email options"]',
+    menu: '[role="menu"]',
+    menuItem: '[role="menuitem"], .J-N',
+    // structural shape of an open conversation, for when [data-message-id]
+    // is renamed: a message card header or a message body inside main.
+    threadFallback: '[role="main"] [role="listitem"] .gE, [role="main"] .a3s',
+    // app chrome
+    main: '[role="main"]',
+    composeButton: '[gh="cm"], [role="button"][gh="cm"]',
+    toolbars: '[gh="tm"], [gh="mtb"], [role="toolbar"]',
+    searchInput: 'input[aria-label="Search mail"], input[name="q"]',
+    composeBody: 'div[aria-label="Message Body"], div[g_editable="true"], [contenteditable="true"][role="textbox"]',
+    // the editors Gmail itself marks as a message body. The bare
+    // [contenteditable][role=textbox] shape above is a structural fallback only:
+    // Gemini's "Describe your message" (Help me write) box shares it. See
+    // composeEditors().
+    composeBodyMarked: 'div[aria-label="Message Body"], div[g_editable="true"]',
+  };
+
+  // First visible match for a selector, or null.
+  function firstVisible(sel, scope = document) {
+    return Array.from(scope.querySelectorAll(sel)).filter(isVisible)[0] || null;
+  }
+
+  // Gmail's controls (row buttons, side-rail tabs, toolbar icons) frequently
+  // ignore a bare element.click(); they only react to a full pointer + mouse
+  // gesture at the element's center. realClick synthesizes the whole sequence.
+  // (Trusted-vs-untrusted doesn't matter here — these are DOM click handlers,
+  // not Gmail's native keyboard router, which DOES reject synthetic keys.)
+  function realClick(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+    };
+    for (const type of ["pointerover", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      const Ctor = type.startsWith("pointer") && typeof PointerEvent !== "undefined" ? PointerEvent : MouseEvent;
+      el.dispatchEvent(new Ctor(type, opts));
+    }
+    return true;
+  }
+
+  // Gmail lays out a row's per-row action buttons (Archive, Delete, …) at 0x0
+  // and reveals them only on mouseover. We navigate by keyboard and never move
+  // the real pointer, so synthesize the hover to make those buttons clickable.
+  // (Like realClick this drives DOM handlers, not the native keyboard router.)
+  // While hover() is dispatching, listeners that track the REAL mouse (listnav's
+  // hover-target listener) must ignore these synthetic events, or revealing a
+  // row's buttons would count as the user pointing at that row.
+  let synthesizingHover = false;
+  function isSynthesizingHover() {
+    return synthesizingHover;
+  }
+  function hover(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+    };
+    synthesizingHover = true;
+    try {
+      for (const type of ["pointerover", "mouseover", "pointermove", "mousemove"]) {
+        const Ctor = type.startsWith("pointer") && typeof PointerEvent !== "undefined" ? PointerEvent : MouseEvent;
+        el.dispatchEvent(new Ctor(type, opts));
+      }
+    } finally {
+      synthesizingHover = false;
+    }
+    return true;
+  }
+
+  function findByTooltip(prefix) {
+    const sel = [
+      `[data-tooltip^="${prefix}"]`,
+      `[aria-label^="${prefix}"]`,
+      `[data-tooltip*="${prefix}"]`,
+    ].join(",");
+    return Array.from(document.querySelectorAll(sel)).filter(isVisible);
+  }
+
+  function clickByTooltip(prefix) {
+    const el = findByTooltip(prefix)[0];
+    if (!el) return false;
+    return realClick(el);
+  }
+
+  // First visible element whose aria-label / data-tooltip equals `label` exactly.
+  function exactButton(label, scope = document) {
+    return (
+      Array.from(
+        scope.querySelectorAll(`[aria-label="${label}"], [data-tooltip="${label}"]`)
+      ).filter(isVisible)[0] || null
+    );
+  }
+
+  function buttonLabel(el) {
+    return (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("data-tooltip") ||
+      el.getAttribute("title") ||
+      (el.textContent || "")
+    ).trim();
+  }
+
+  function labeledButton(patterns, scope = document) {
+    const list = Array.from(
+      scope.querySelectorAll('[aria-label], [data-tooltip], [title], [role="button"], [role="menuitem"], .T-I, .ams')
+    ).filter(isVisible);
+    return (
+      list.find((el) => {
+        const label = buttonLabel(el);
+        return patterns.some((p) => p.test(label));
+      }) || null
+    );
+  }
+
+  function visibleControls(scope = document) {
+    return Array.from(
+      scope.querySelectorAll('a, button, [role="button"], [role="menuitem"], [role="link"], [aria-label], [data-tooltip], [title], .T-I, .ams')
+    ).filter(isVisible);
+  }
+
+  function controlLabel(el) {
+    return (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("data-tooltip") ||
+      el.getAttribute("title") ||
+      el.getAttribute("download") ||
+      el.textContent ||
+      ""
+    ).trim().replace(/\s+/g, " ");
+  }
+
+  function findControl(patterns, scope = document) {
+    // Prefer Gmail's own control surfaces (toolbars) before scanning the whole
+    // document: controlLabel falls back to textContent, so a document-wide scan
+    // can match a link INSIDE an email body whose text happens to be exactly
+    // "Mute" or "Move to inbox" and realClick mail content instead of a Gmail
+    // control. Toolbars first; the generic scan stays as the fallback because
+    // some controls legitimately live outside any toolbar (the Undo snackbar,
+    // the per-message Unsubscribe header button).
+    if (scope === document) {
+      for (const bar of Array.from(document.querySelectorAll(SEL.toolbars)).filter(isVisible)) {
+        const hit = visibleControls(bar).find((el) => patterns.some((p) => p.test(controlLabel(el))));
+        if (hit) return hit;
+      }
+    }
+    return (
+      visibleControls(scope).find((el) => {
+        const label = controlLabel(el);
+        return patterns.some((p) => p.test(label));
+      }) || null
+    );
+  }
+
+  // Click el, or tell the user which Gmail control went missing. Most actions
+  // drive a label-matched control; when Gmail renames one, the old behavior was
+  // an eaten keystroke and total silence — and a user report is the only way we
+  // ever find out. An action the user explicitly invoked must never fail
+  // silently.
+  function clickOr(el, what) {
+    if (realClick(el)) return true;
+    if (InboxKeys.toast) InboxKeys.toast(`Gmail control not found: ${what}`, { kind: "warn" });
+    return false;
+  }
+
+  function attachmentPreviewDialog() {
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="presentation"]')).filter(isShowing);
+    return (
+      dialogs.find((dialog) => {
+        const label = controlLabel(dialog).toLowerCase();
+        if (/\b(pdf|attachment|preview|open with|download|print|add to drive)\b/.test(label)) return true;
+        return !!findControl([/^Open with/i, /^Download$/i, /^Print$/i, /^Add to Drive$/i], dialog);
+      }) || null
+    );
+  }
+
+  function hasAttachmentPreview() {
+    return !!attachmentPreviewDialog();
+  }
+
+  function closeAttachmentPreview() {
+    const dialog = attachmentPreviewDialog();
+    if (!dialog) return false;
+    const close =
+      findControl([/^Close$/i, /^Back$/i, /^Done$/i], dialog) ||
+      findControl([/^Close$/i, /^Back$/i, /^Done$/i]);
+    if (close && realClick(close)) return true;
+    history.back();
+    return true;
+  }
+
+  function compose() {
+    const btn = document.querySelector(SEL.composeButton);
+    if (btn && isVisible(btn)) {
+      btn.click();
+      return true;
+    }
+    // Fallback: Gmail compose deep-link.
+    location.href = `${basePath()}#inbox?compose=new`;
+    return true;
+  }
+
+  // Click the first visible control matching one of the tooltip prefixes.
+  // There is deliberately NO synthetic-keyboard fallback here: Gmail ignores
+  // synthetic key events (isTrusted === false), so the old fallback "succeeded"
+  // while doing nothing and masked real selector breakage. A missing control
+  // now toasts so the failure is visible in the field.
+  function action(tooltipPrefixes, what) {
+    const prefixes = [].concat(tooltipPrefixes);
+    for (const p of prefixes) {
+      if (clickByTooltip(p)) return true;
+    }
+    if (InboxKeys.toast) {
+      InboxKeys.toast(`Gmail control not found: ${what || prefixes[0]}`, { kind: "warn" });
+    }
+    return false;
+  }
+
+  function undo() {
+    const btn = findControl([/^Undo$/i]);
+    if (btn) return realClick(btn);
+    if (InboxKeys.toast) InboxKeys.toast("Nothing to undo", { kind: "info" });
+    return false;
+  }
+
+  function toggleStar(scope = document) {
+    return clickOr(findControl([
+      /^Star$/i,
+      /^Not starred$/i,
+      /^Add star$/i,
+      /^Remove star$/i,
+      /^Starred$/i,
+    ], scope), "Star");
+  }
+
+  function attachFile() {
+    const input = Array.from(document.querySelectorAll('input[type="file"]')).filter(isVisible)[0];
+    if (input) return realClick(input);
+    return realClick(findControl([/^Attach files?$/i, /^Attach$/i, /\bAttach files?\b/i]));
+  }
+
+  function discardDraft() {
+    const body = composeBody();
+    const surfaces = [
+      body && body.closest('[role="dialog"], [role="listitem"], .M9, .AD, .nH'),
+      ...Array.from(document.querySelectorAll('[role="dialog"], [role="listitem"], .M9, .AD, .nH')).filter(isVisible),
+      document,
+    ].filter(Boolean);
+    let btn = null;
+    for (const surface of surfaces) {
+      btn =
+        labeledButton([/^Discard draft$/i, /^Discard$/i, /^Delete draft$/i], surface) ||
+        findControl([/^Discard draft$/i, /^Discard$/i, /^Delete draft$/i], surface) ||
+        Array.from(
+          surface.querySelectorAll('[aria-label*="Discard"], [data-tooltip*="Discard"], [title*="Discard"], [aria-label*="Delete draft"], [data-tooltip*="Delete draft"], [title*="Delete draft"]')
+        ).filter(isVisible)[0] ||
+        null;
+      if (btn) break;
+    }
+    if (btn) return realClick(btn);
+    if (InboxKeys.toast) InboxKeys.toast("No draft discard button found", { kind: "warn" });
+    return false;
+  }
+
+  function markReadUnread() {
+    return clickOr(findControl([/^Mark as read$/i, /^Mark as unread$/i, /^Mark read$/i, /^Mark unread$/i]), "Mark as read/unread");
+  }
+
+  function snooze() {
+    const btn = findControl([/^Snooze\b/i, /^Remind me\b/i]);
+    if (btn) return realClick(btn);
+    if (InboxKeys.toast) InboxKeys.toast("No snooze button found", { kind: "warn" });
+    return false;
+  }
+
+  function markNotDone() {
+    return clickOr(findControl([/^Move to inbox$/i, /^Mark not done$/i, /^Not done$/i]), "Move to inbox");
+  }
+
+  function mute() {
+    return clickOr(findControl([/^Mute$/i]), "Mute");
+  }
+
+  function unsubscribe() {
+    const btn = findControl([/^Unsubscribe\b/i, /\bUnsubscribe\b/i]);
+    if (!btn) {
+      if (InboxKeys.toast) InboxKeys.toast("No unsubscribe action found", { kind: "warn" });
+      return false;
+    }
+    realClick(btn);
+    waitFor(
+      () => {
+        const dialog = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(isVisible)[0];
+        return dialog ? findControl([/^Unsubscribe$/i, /^OK$/i, /^Confirm$/i], dialog) : null;
+      },
+      (confirm) => realClick(confirm),
+      null,
+      8,
+      80
+    );
+    return true;
+  }
+
+  // ---- Open link or attachment (Cmd+O) ------------------------------------
+  // The old behavior clicked the FIRST visible anchor in the message, which in
+  // a typical business email is a signature link (SharePoint, website, maps…)
+  // rather than the attachment or body link the user meant. Now candidates are
+  // extracted and ranked; one unambiguous target opens directly, anything else
+  // opens a picker (palette.choose) so the user says which.
+
+  // Unwrap known tracking/redirect wrappers for display and dedupe ONLY — the
+  // original anchor is always what gets clicked.
+  function destinationUrl(href) {
+    try {
+      const u = new URL(href, location.href);
+      // Only Google's actual redirect host — docs.google.com/url etc. are real
+      // destinations, not wrappers.
+      if ((u.hostname === "www.google.com" || u.hostname === "google.com") && u.pathname === "/url") {
+        const q = u.searchParams.get("q") || u.searchParams.get("url");
+        if (q) {
+          // Normalize through URL so a wrapped and a direct copy of the same
+          // destination dedupe (e.g. trailing-slash variants).
+          try {
+            return new URL(q).href;
+          } catch (e2) {
+            return q;
+          }
+        }
+      }
+      return u.href;
+    } catch (e) {
+      return href || "";
+    }
+  }
+
+  function displayUrl(href) {
+    try {
+      const u = new URL(destinationUrl(href));
+      const path = u.pathname !== "/" ? u.pathname : "";
+      const s = u.hostname.replace(/^www\./, "") + path;
+      return s.length > 42 ? s.slice(0, 41) + "…" : s;
+    } catch (e) {
+      return href || "";
+    }
+  }
+
+  function linkLabel(a) {
+    const text = (a.textContent || "").trim().replace(/\s+/g, " ");
+    if (text) return text.length > 60 ? text.slice(0, 59) + "…" : text;
+    const img = a.querySelector("img[alt]");
+    const alt = img && (img.getAttribute("alt") || "").trim();
+    if (alt) return alt;
+    return displayUrl(a.getAttribute("href"));
+  }
+
+  function attachmentLabel(chip) {
+    const name = chip.querySelector(SEL.attachmentName);
+    if (name && name.textContent.trim()) return name.textContent.trim();
+    // download_url is "mimetype:filename:url"
+    const parts = (chip.getAttribute("download_url") || "").split(":");
+    if (parts.length >= 3 && parts[1]) return parts[1];
+    return controlLabel(chip) || "Attachment";
+  }
+
+  // Rank order doubles as picker group order. Attachments and body links are
+  // "strong" (plausibly what the user meant); signature and quoted links are
+  // "weak" (boilerplate that should never win by DOM position).
+  const OPEN_RANK = { attachment: 0, link: 1, signature: 2, quoted: 3 };
+  const OPEN_GROUP = { attachment: "Attachments", link: "Links", signature: "Signature links", quoted: "Quoted links" };
+
+  function extractOpenCandidates(scope) {
+    const root = scope && scope !== document ? scope : firstVisible(SEL.main) || document;
+    const out = [];
+
+    // Attachment chips (each opens Gmail's previewer via realClick). The two
+    // chip selectors can match nested elements of the same chip — keep one.
+    // Click the chip's anchor when it has one: realClick dispatches ON its
+    // element with no hit-testing, and Gmail's open handler lives on the
+    // anchor that fills the chip, not on the aZo wrapper.
+    for (const chip of Array.from(root.querySelectorAll(SEL.attachmentChip)).filter(isVisible)) {
+      const target = chip.matches("a[href]") ? chip : chip.querySelector("a[href]") || chip;
+      if (out.some((c) => c.element.contains(target) || target.contains(c.element))) continue;
+      out.push({ element: target, kind: "attachment", label: attachmentLabel(chip), detail: "" });
+    }
+
+    // Structural fallback if Gmail renames the chip classes: per-attachment
+    // labeled controls ("Download attachment …", "Preview attachment …").
+    // Never toolbar controls — "Download all attachments" in a [gh] toolbar
+    // must not masquerade as a file when chips are simply absent.
+    if (!out.length) {
+      for (const el of Array.from(root.querySelectorAll('[role="button"], [role="link"]')).filter(isVisible)) {
+        if (el.closest(SEL.toolbars)) continue;
+        const label = controlLabel(el);
+        if (!/\battachment\b/i.test(label)) continue;
+        if (out.some((c) => c.element.contains(el) || el.contains(c.element))) continue;
+        out.push({ element: el, kind: "attachment", label, detail: "" });
+      }
+    }
+
+    // Links, scoped to message bodies when present so Gmail chrome never leaks in.
+    const bodies = Array.from(root.querySelectorAll(SEL.messageBody)).filter(isVisible);
+    const links = [];
+    for (const body of bodies.length ? bodies : [root]) {
+      for (const a of Array.from(body.querySelectorAll("a[href]")).filter(isVisible)) {
+        const href = a.getAttribute("href") || "";
+        if (!href || href === "#" || /^(mailto|tel|javascript):/i.test(href)) continue;
+        if (a.closest(SEL.attachmentChip)) continue; // already covered as an attachment
+        const kind = a.closest(SEL.signature) ? "signature" : a.closest(SEL.quotedText) ? "quoted" : "link";
+        links.push({ element: a, kind, label: linkLabel(a), detail: displayUrl(href), dest: destinationUrl(href), order: links.length });
+      }
+    }
+
+    // Same destination in body and signature/quote → keep the best-ranked one.
+    links.sort((x, y) => OPEN_RANK[x.kind] - OPEN_RANK[y.kind] || x.order - y.order);
+    const seen = new Set();
+    for (const l of links) {
+      if (seen.has(l.dest)) continue;
+      seen.add(l.dest);
+      out.push({ element: l.element, kind: l.kind, label: l.label, detail: l.detail });
+    }
+    return out;
+  }
+
+  function openLinkOrAttachment(scope = document) {
+    const candidates = extractOpenCandidates(scope);
+    if (!candidates.length) {
+      if (InboxKeys.toast) InboxKeys.toast("No link or attachment found", { kind: "warn" });
+      return false;
+    }
+    const strong = candidates.filter((c) => c.kind === "attachment" || c.kind === "link");
+    // One candidate, or one strong candidate above the boilerplate: just open it.
+    if (candidates.length === 1) return realClick(candidates[0].element);
+    if (strong.length === 1) return realClick(strong[0].element);
+    if (InboxKeys.palette && InboxKeys.palette.choose) {
+      InboxKeys.palette.choose({
+        placeholder: "Filter links and attachments…",
+        prompt: "Open",
+        items: candidates.map((c) => ({
+          id: "open-candidate",
+          title: c.label,
+          group: OPEN_GROUP[c.kind],
+          hint: c.detail,
+          searchText: c.detail + " " + c.kind,
+          run: () => realClick(c.element),
+        })),
+      });
+      return true;
+    }
+    return realClick((strong[0] || candidates[0]).element);
+  }
+
+  function openLabelMenu() {
+    return clickOr(findControl([/^Label$/i, /^Labels$/i, /^Label as$/i]), "Label menu");
+  }
+
+  function removeLabel() {
+    return clickOr(findControl([/^Remove label$/i, /^Remove$/i]), "Remove label");
+  }
+
+  function removeAllLabels() {
+    return clickOr(findControl([/^Remove all labels$/i]), "Remove all labels");
+  }
+
+  function openMoveMenu() {
+    return clickOr(findControl([/^Move$/i, /^Move to$/i]), "Move menu");
+  }
+
+  // Read the signed-in account email from the top-right account button.
+  function currentEmail() {
+    const a = document.querySelector('a[aria-label^="Google Account"], a[aria-label*="Google Account:"]');
+    if (a) {
+      const m = a.getAttribute("aria-label").match(/\(([^)]+@[^)]+)\)/);
+      if (m) return m[1];
+    }
+    const t = document.querySelector('[data-hovercard-id*="@"]');
+    if (t) return t.getAttribute("data-hovercard-id");
+    return null;
+  }
+
+  // The active compose editor body (contenteditable).
+  // Textboxes that LOOK like a compose editor but are Gemini/assistant prompts
+  // (the "Describe your message" box under an open reply, "Help me write", the
+  // "Ask Gmail" prompt). Never treat one as the message body.
+  const ASSISTANT_TEXTBOX = /describe your message|help me write|ask gmail/i;
+  function isAssistantTextbox(el) {
+    const label = [
+      el.getAttribute("aria-label"),
+      el.getAttribute("aria-placeholder"),
+      el.getAttribute("data-placeholder"),
+      el.getAttribute("placeholder"),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return ASSISTANT_TEXTBOX.test(label);
+  }
+
+  // Every visible compose editor in scope, real ones first. Gmail's own editors
+  // carry explicit markers (aria-label "Message Body" / g_editable); the bare
+  // [contenteditable][role=textbox] shape is only trusted when no marked editor
+  // exists, and assistant prompts are excluded outright.
+  function composeEditors(scope = document) {
+    const all = Array.from(scope.querySelectorAll(SEL.composeBody))
+      .filter(isVisible)
+      .filter((el) => !isAssistantTextbox(el));
+    const marked = all.filter((el) => el.matches(SEL.composeBodyMarked));
+    return marked.length ? marked : all;
+  }
+
+  // The compose editor that matters right now: the one that OWNS focus, else
+  // the last real editor in scope (the newest open reply / compose).
+  //
+  // This used to be "the last visible SEL.composeBody match". Gemini's
+  // "Describe your message" box renders UNDER an open reply, matches the
+  // structural [contenteditable][role=textbox] shape, and sits AFTER the real
+  // editor in the DOM — so it was returned as the compose body. Focus was in
+  // the real "Message Body", the returned body did not contain it, so
+  // hasOpenThreadReply() came back false, Escape fell through to nothing and
+  // the reply stayed open: the reported "Escape gets stuck in a thread" bug
+  // (verified live, Sep 2026). Preferring the focused editor and the marked
+  // selectors fixes it and keeps every other composeBody() caller (exitReply,
+  // discardDraft, the forward draft guard, Cmd+U attach) on the real editor.
+  function composeBody(scope = document) {
+    const editors = composeEditors(scope);
+    const active = document.activeElement;
+    const focused = active ? editors.find((el) => el === active || el.contains(active)) : null;
+    return focused || editors[editors.length - 1] || null;
+  }
+
+  function threadReplyBody() {
+    if (!inThread()) return null;
+    return composeBody();
+  }
+
+  function hasOpenThreadReply() {
+    const body = threadReplyBody();
+    const active = document.activeElement;
+    return !!(body && active && (active === body || body.contains(active)));
+  }
+
+  function composeText(body) {
+    return String((body && (body.innerText || body.textContent)) || "")
+      .replace(/\u200b/g, "")
+      .trim();
+  }
+
+  function isComposeEmpty(body) {
+    const text = composeText(body);
+    return !text || /^Press\s+\/\s+to write/i.test(text);
+  }
+
+  // The recipient field text for the active compose, best-effort.
+  function composeRecipients() {
+    const chips = Array.from(
+      document.querySelectorAll('[email], input[name="to"], textarea[name="to"]')
+    )
+      .filter(isVisible)
+      .map((el) => el.getAttribute("email") || el.value)
+      .filter(Boolean);
+    return Array.from(new Set(chips)).join(", ");
+  }
+
+  function composeSubject() {
+    const s = Array.from(document.querySelectorAll('input[name="subjectbox"]')).filter(isVisible)[0];
+    return s ? s.value : "";
+  }
+
+  // Go back from an open thread to the list. Click a visible Back button if
+  // Gmail renders one; otherwise drive Gmail's own hash router by stripping the
+  // thread id off the hash (#inbox/<id> -> #inbox, #search/<q>/<id> -> #search/<q>).
+  //
+  // We deliberately do NOT fall back to a synthetic "u" key: Gmail ignores synthetic
+  // keyboard events (isTrusted === false) for native navigation, so a fake "u"
+  // silently does nothing. Hash routing is trusted and always works.
+  function back() {
+    const parent = InboxKeys.hashutil.parentHash(location.hash || "");
+    const sels = [
+      '[aria-label^="Back to"]',
+      '[data-tooltip^="Back to"]',
+      'div[role="button"][aria-label^="Back"]',
+    ];
+    for (const sel of sels) {
+      const el = Array.from(document.querySelectorAll(sel)).filter(isVisible)[0];
+      if (el) {
+        realClick(el);
+        location.hash = parent;
+        return true;
+      }
+    }
+    location.hash = parent;
+    return true;
+  }
+
+  // ---- Open-thread actions (thread view) --------------------------------
+  // These click real Gmail controls (Gmail ignores synthetic keystrokes, so
+  // pressing a fake "r"/"j" does nothing — we drive the buttons instead).
+
+  function amsButton(re, scope = document) {
+    return (
+      Array.from(scope.querySelectorAll(".ams"))
+        .filter(isVisible)
+        .find((b) => re.test((b.textContent || "").trim())) || null
+    );
+  }
+
+  // Start a reply on the open thread: the inline "Reply" link, else the
+  // per-message reply arrow icon. Only the document-wide lookup toasts on
+  // failure: a card-scoped miss is normal (callers fall through to document).
+  function replyToThread(scope = document) {
+    const opened = realClick(
+      amsButton(/^reply$/i, scope) ||
+        labeledButton([/^Reply(?!\s+(all|to all))\b/i], scope) ||
+        exactButton("Reply", scope)
+    );
+    if (opened) focusReplyBodySoon();
+    else if (scope === document && InboxKeys.toast) {
+      InboxKeys.toast("Gmail control not found: Reply", { kind: "warn" });
+    }
+    return opened;
+  }
+  // The inline "Reply all" button Gmail renders at the BOTTOM of a multi-recipient
+  // conversation (the `.ams` links, or a labeled/exact-labeled button).
+  function inlineReplyAll(scope = document) {
+    return (
+      amsButton(/^reply all\b/i, scope) ||
+      labeledButton([/^Reply all\b/i, /^Reply to all\b/i], scope) ||
+      exactButton("Reply to all", scope)
+    );
+  }
+
+  function replyAllToThread(scope = document) {
+    // Reply-all clicks Gmail's inline "Reply all" button (verified live: it opens
+    // the composer addressed to everyone in ONE click). When the thread is just you
+    // and one other person Gmail offers no "Reply all" — a plain reply already goes
+    // to that person — so we open that instead.
+    //
+    // We deliberately NEVER open the response-type caret menu. That menu popped up
+    // over the compose box and fought with typing, and on a two-person thread there
+    // is nothing to switch to anyway. Look in the focused card first, then fall back
+    // to the whole thread: the inline controls live at the bottom of the
+    // conversation, outside the message card listitem, so a card-only lookup
+    // usually finds nothing (this was the silent-dead-Enter funkiness).
+    const replyAll = inlineReplyAll(scope) || (scope !== document && inlineReplyAll(document));
+    if (realClick(replyAll)) {
+      focusReplyBodySoon();
+      return true;
+    }
+
+    // No reply-all offered (two-person thread): the single reply IS the reply-all.
+    return replyToThread(scope) || (scope !== document && replyToThread(document));
+  }
+
+  function focusReplyBodySoon() {
+    waitFor(composeBody, (body) => {
+      if (typeof body.focus === "function") body.focus();
+      realClick(body);
+    }, null, 10, 60);
+  }
+
+  // Poll for an element Gmail renders lazily; run onFound when it appears, else
+  // onGiveUp after the budget. The FIRST probe is synchronous, so when the DOM is
+  // already in place the whole chain completes without timers (deterministic in
+  // tests; resilient to slow renders in the wild).
+  function waitFor(find, onFound, onGiveUp, tries = 16, interval = 80) {
+    const el = find();
+    if (el) return onFound(el);
+    if (tries <= 0) return onGiveUp && onGiveUp();
+    setTimeout(() => waitFor(find, onFound, onGiveUp, tries - 1, interval), interval);
+  }
+
+  // ---- Forward (f) ---------------------------------------------------------
+  // Gmail's bottom inline "Forward" link forwards ONLY the LAST message of the
+  // conversation, carrying only THAT message's attachments. The quoted text of
+  // the whole thread rides along, so the draft LOOKS complete while attachments
+  // on earlier messages are silently dropped — the reported "recipients didn't
+  // get the files". Forward is therefore message-aware:
+  //   • j/k cursor on an earlier card → forward THAT message via its own kebab
+  //     menu (the only Gmail control with per-message identity);
+  //   • attachments confined to the target, or absent from every inspectable
+  //     card → the bottom inline Forward, exactly as before;
+  //   • attachments known on OTHER messages, or collapsed cards whose chips we
+  //     cannot see → a picker (palette.choose) listing every message with its
+  //     attachment count, so the attachment-less one can never win silently.
+  // The old labeledButton(/^Forward\b/) fallback is gone: it prefix-matched
+  // "Forward all" and other strays document-wide. Never reintroduce it.
+
+  function inlineForward(scope = document) {
+    return amsButton(/^forward$/i, scope) || exactButton("Forward", scope);
+  }
+
+  function threadCards() {
+    const main = firstVisible(SEL.main);
+    if (!main) return [];
+    return Array.from(main.querySelectorAll(SEL.card)).filter(
+      (card) => isVisible(card) && card.querySelector(SEL.cardHeader)
+    );
+  }
+
+  function isExpandedCard(card) {
+    return Array.from(card.querySelectorAll(SEL.messageBody + ", [data-message-id]")).some(isVisible);
+  }
+
+  // Distinct visible attachment chips on one card. The two chip selectors can
+  // match nested elements of the same chip — count each chip once.
+  function cardAttachmentChips(card) {
+    const kept = [];
+    for (const chip of Array.from(card.querySelectorAll(SEL.attachmentChip)).filter(isVisible)) {
+      if (kept.some((c) => c.contains(chip) || chip.contains(c))) continue;
+      kept.push(chip);
+    }
+    return kept;
+  }
+
+  function cardTitle(card) {
+    const header = card.querySelector(SEL.cardHeader);
+    const text = ((header && header.textContent) || "").trim().replace(/\s+/g, " ");
+    if (!text) return "Message";
+    return text.length > 70 ? text.slice(0, 69) + "…" : text;
+  }
+
+  // The kebab in the card's own header. Scoped to the card, so the
+  // conversation-toolbar "More email options" (which has NO per-message
+  // Forward item) can never be confused with it.
+  function cardMenuButton(card) {
+    return (
+      Array.from(card.querySelectorAll(SEL.messageMenuButton))
+        .filter(isVisible)
+        .filter((el) => !el.closest(SEL.toolbars))[0] || null
+    );
+  }
+
+  // The EXACT "Forward" item of a showing menu. Exact, never a prefix match:
+  // "Forward all" and "Forward as attachment" are different actions with
+  // different attachment semantics. `excludeShowing` holds menus that were
+  // ALREADY showing before we clicked the kebab (a stale menu under the
+  // palette could belong to another card — its Forward would target the wrong
+  // message). Gmail recycles hidden menu containers, so only menus that were
+  // showing at snapshot time are excluded.
+  function showingMenus() {
+    return Array.from(document.querySelectorAll(SEL.menu)).filter(isShowing);
+  }
+
+  function menuForwardItem(excludeShowing) {
+    for (const menu of showingMenus()) {
+      if (excludeShowing && excludeShowing.has(menu)) continue;
+      const item = Array.from(menu.querySelectorAll(SEL.menuItem))
+        .filter(isVisible)
+        .find((el) => controlLabel(el).toLowerCase() === "forward");
+      if (item) return item;
+    }
+    return null;
+  }
+
+  function forwardFail(what) {
+    if (InboxKeys.toast) InboxKeys.toast(`Gmail control not found: ${what}`, { kind: "warn" });
+    return false;
+  }
+
+  // Forward one SPECIFIC message: expand it if collapsed, hover its header (the
+  // kebab is hover-gated), open its kebab menu, click the exact "Forward" item.
+  function forwardMessage(card) {
+    // A card can detach while the picker is open (Gmail re-renders threads in
+    // the background); clicking a detached node times out with misleading
+    // toasts, so say what actually happened.
+    if (!card || !card.isConnected) {
+      if (InboxKeys.toast) InboxKeys.toast("The thread changed — press f again", { kind: "warn" });
+      return false;
+    }
+    const openMenu = () => {
+      hover(card.querySelector(SEL.cardHeader) || card);
+      waitFor(
+        () => cardMenuButton(card),
+        (kebab) => {
+          // Snapshot menus already showing: a stale menu (possibly another
+          // card's) must never donate its Forward item to this message.
+          const stale = new Set(showingMenus());
+          hover(kebab);
+          realClick(kebab);
+          waitFor(
+            () => menuForwardItem(stale),
+            (item) => {
+              realClick(item);
+              focusReplyBodySoon();
+            },
+            () => {
+              // Close a menu we actually opened; if none is showing, a second
+              // kebab click would OPEN one over the thread — skip it then.
+              if (showingMenus().some((m) => !stale.has(m))) realClick(kebab);
+              forwardFail("Forward (message menu item)");
+            },
+            8,
+            80
+          );
+        },
+        () => forwardFail("Forward (message menu)"),
+        8,
+        80
+      );
+      return true;
+    };
+    if (isExpandedCard(card)) return openMenu();
+    const header = card.querySelector(SEL.cardHeader);
+    if (!header) return forwardFail("Forward (message)");
+    realClick(header); // expand the collapsed message first
+    waitFor(() => (isExpandedCard(card) ? card : null), openMenu, () => forwardFail("Forward (expand message)"), 12, 100);
+    return true;
+  }
+
+  // Forward the last message: the bottom inline "Forward" is Gmail's own
+  // control for exactly that; the card's kebab is the structural fallback.
+  function forwardLastMessage(last) {
+    const el = inlineForward(firstVisible(SEL.main) || document);
+    if (el) {
+      realClick(el);
+      focusReplyBodySoon();
+      return true;
+    }
+    return forwardMessage(last);
+  }
+
+  // A draft open INSIDE the conversation (blurred — a focused one classifies
+  // as compose, so f types normally and never reaches here). Scoped to main:
+  // a background standalone compose popup or a docked Chat box also matches
+  // SEL.composeBody document-wide but does not remove the thread's Forward
+  // controls, and must not block forwarding.
+  function threadInlineDraft() {
+    if (!inThread()) return null;
+    const main = firstVisible(SEL.main);
+    if (!main) return null;
+    return composeBody(main);
+  }
+
+  function forwardThread(scope = document) {
+    // With an inline draft open the bottom .ams links are gone from the DOM,
+    // and the old document-wide scan clicked arbitrary "Forward…"-labeled
+    // things. Refuse loudly instead of guessing.
+    if (threadInlineDraft()) {
+      if (InboxKeys.toast) InboxKeys.toast("Close the open draft first (Escape), then forward", { kind: "warn" });
+      return false;
+    }
+
+    const cards = threadCards();
+    if (!cards.length) return clickOr(inlineForward(), "Forward");
+
+    const last = cards[cards.length - 1];
+    const target = scope && scope !== document && cards.indexOf(scope) >= 0 ? scope : last;
+
+    // Cursor parked on an EARLIER message: explicit — forward that one.
+    if (target !== last) return forwardMessage(target);
+
+    // Default target (the last message): only forward directly when we can SEE
+    // that no other message carries attachments. A collapsed card hides its
+    // chips, and a collapsed "N older messages" stack hides whole messages —
+    // both count as "may have attachments".
+    const infos = cards.map((card) => ({
+      card,
+      expanded: isExpandedCard(card),
+      attachments: cardAttachmentChips(card).length,
+    }));
+    const hiddenStacks =
+      InboxKeys.threadnav && InboxKeys.threadnav.hiddenMessageControls
+        ? InboxKeys.threadnav.hiddenMessageControls()
+        : [];
+    const ambiguous =
+      hiddenStacks.length > 0 || infos.some((i) => i.card !== last && (i.attachments > 0 || !i.expanded));
+    if (!ambiguous) return forwardLastMessage(last);
+
+    if (InboxKeys.palette && InboxKeys.palette.choose) {
+      // Messages with known attachments first (newest first within each tier,
+      // sort is stable) — so f, Enter forwards the message that has the files.
+      const ranked = infos
+        .slice()
+        .reverse()
+        .sort((x, y) => (y.attachments > 0 ? 1 : 0) - (x.attachments > 0 ? 1 : 0));
+      const items = ranked.map(({ card, expanded, attachments }) => ({
+        id: "forward-message",
+        title: cardTitle(card),
+        group: attachments > 0 ? "Messages with attachments" : "Messages",
+        hint:
+          attachments > 0
+            ? `${attachments} attachment${attachments === 1 ? "" : "s"}`
+            : expanded
+              ? "no attachments"
+              : "collapsed — attachments unknown",
+        searchText: attachments > 0 ? "attachment" : "",
+        run: () => (card === last ? forwardLastMessage(last) : forwardMessage(card)),
+      }));
+      // The collapsed stack hides whole messages: offer to reveal them, then
+      // re-run forward so the picker reopens with every message listed. Each
+      // expansion strictly grows the card list, so this cannot loop.
+      for (const stack of hiddenStacks) {
+        items.push({
+          id: "forward-message",
+          title: (stack.textContent || "").trim().replace(/\s+/g, " ") || "Hidden messages",
+          group: "Messages",
+          hint: "expand to inspect attachments",
+          searchText: "hidden older messages expand",
+          run: () => {
+            const count = cards.length;
+            realClick(stack);
+            waitFor(
+              () => (threadCards().length > count ? true : null),
+              () => forwardThread(document),
+              () => forwardFail("Forward (show hidden messages)"),
+              12,
+              100
+            );
+          },
+        });
+      }
+      InboxKeys.palette.choose({
+        placeholder: "Forward which message?",
+        prompt: "Forward",
+        items,
+      });
+      return true;
+    }
+    return forwardLastMessage(last);
+  }
+
+  // Older = next (further down the list), Newer = previous.
+  function nextThread() {
+    return clickOr(exactButton("Older"), "Older (next conversation)");
+  }
+  function prevThread() {
+    return clickOr(exactButton("Newer"), "Newer (previous conversation)");
+  }
+
+  // List pager: in a list view Gmail's "Older"/"Newer" toolbar buttons step to the
+  // next/previous PAGE of results (the same controls page conversations in a thread).
+  // Newer = previous page, Older = next page. The button is aria-disabled at the
+  // first/last page, so realClick is a harmless no-op at the boundary.
+  //
+  // SEARCH RESULTS are the exception and caused the "doesn't work with a label or
+  // search" report: a search view still renders the "Older"/"Newer" toolbar but
+  // keeps it HIDDEN, and exposes its OWN visible pager labeled "Next results" /
+  // "Previous results" instead (verified live: #search/<q> → #search/<q>/p2).
+  // exactButton already filters by visibility, so it skips the hidden Older/Newer
+  // and we fall through to the search labels. Labels and All Mail keep "Older"/
+  // "Newer" visible, so they use the first match. Next = older/forward, Previous =
+  // newer/back, matching the Older/Newer direction.
+  function nextPage() {
+    return realClick(exactButton("Older") || exactButton("Next results"));
+  }
+  function prevPage() {
+    return realClick(exactButton("Newer") || exactButton("Previous results"));
+  }
+
+  // Archive the open thread via its toolbar icon (returns to the list).
+  function archiveThread() {
+    return clickOr(exactButton("Archive"), "Archive");
+  }
+
+  // Leave an open inline reply before Escape is allowed to navigate back from the
+  // thread. Empty replies are discarded; non-empty replies are only blurred/saved.
+  function exitReply() {
+    const body = threadReplyBody();
+    const surface = composeSurface(body);
+    if (body && isComposeEmpty(body)) {
+      const discard =
+        labeledButton([/^Discard draft/i, /^Discard$/i], surface || document) ||
+        labeledButton([/^Discard draft/i, /^Discard$/i]);
+      if (discard) return realClick(discard);
+    }
+    const close =
+      labeledButton([/^Save & close/i, /^Minimize/i], surface || document) ||
+      exactButton("Save & close");
+    if (close) return realClick(close); // already a pop-out window
+    const pop =
+      labeledButton([/^Pop out reply/i, /^Pop out/i], surface || document) ||
+      exactButton("Pop out reply");
+    if (pop) {
+      realClick(pop);
+      setTimeout(() => {
+        const c = exactButton("Save & close");
+        if (c) realClick(c);
+      }, 160);
+      return true;
+    }
+    const active = document.activeElement;
+    if (active && active.isContentEditable) {
+      active.blur();
+      return true;
+    }
+    return false;
+  }
+
+  function composeSurface(body) {
+    let el = body;
+    while (el && el !== document.body) {
+      if (
+        labeledButton([/^Send\b/i, /^Discard draft/i, /^Discard$/i], el) ||
+        el.getAttribute("role") === "dialog"
+      ) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return body ? body.parentElement : null;
+  }
+
+  // Find the scrollable ancestor of the first visible thread row and pin it to
+  // top or bottom. Falls back to scrolling [role="main"].
+  function listScrollContainer() {
+    const row = firstVisible(SEL.listRow) || firstVisible(SEL.threadList);
+    let el = row;
+    while (el && el !== document.body) {
+      const style = getComputedStyle(el);
+      const oy = style.overflowY;
+      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight) return el;
+      el = el.parentElement;
+    }
+    return firstVisible(SEL.main);
+  }
+
+  function listScrollTop() {
+    const el = listScrollContainer();
+    if (el) el.scrollTop = 0;
+  }
+
+  function listScrollBottom() {
+    const el = listScrollContainer();
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  // The scrollable region that holds the OPEN CONVERSATION (a long single message
+  // or the stack of message cards). Walk up from a rendered message to the nearest
+  // scrollable ancestor (Gmail's is a div.Tm.aeJ), falling back to the visible
+  // [role="main"]. Same pattern as listScrollContainer, kept separate because the
+  // reading pane and the list pane are different scroll containers.
+  function threadScrollContainer() {
+    const msg = firstVisible(SEL.renderedMessage) || firstVisible(SEL.threadFallback);
+    let el = msg;
+    while (el && el !== document.body) {
+      const style = getComputedStyle(el);
+      const oy = style.overflowY;
+      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 1) return el;
+      el = el.parentElement;
+    }
+    return firstVisible(SEL.main);
+  }
+
+  // Scroll the reading pane (dir: 1 down, -1 up) by a fraction of its height.
+  // Arrow keys use the default step; PageUp/PageDown pass a larger frac. We scroll
+  // the container ourselves rather than relying on native arrow-scroll, because the
+  // reading pane usually isn't the focused element, so the browser wouldn't scroll it.
+  function threadScrollBy(dir, frac = 0.15) {
+    const el = threadScrollContainer();
+    if (!el) return false;
+    const step = Math.max(80, Math.round(el.clientHeight * frac)) * dir;
+    if (typeof el.scrollBy === "function") el.scrollBy({ top: step, behavior: "auto" });
+    else el.scrollTop += step; // environments without scrollBy (e.g. jsdom)
+    return true;
+  }
+
+  // In-Gmail smoke probe over the selector registry: check every probe that
+  // should exist on the CURRENT surface (list vs thread) and report what is
+  // missing. Run from the palette ("Verify Gmail selectors") when a shortcut
+  // stops working — the failing probe names exactly what Gmail changed,
+  // without devtools archaeology. Conditional controls (the pager, hover-only
+  // row buttons) are deliberately not probed: their absence is often
+  // legitimate, and a smoke check that cries wolf gets ignored.
+  const PROBES = [
+    { name: "search input", sel: SEL.searchInput, requiredIn: "always" },
+    { name: "main region", sel: SEL.main, requiredIn: "always" },
+    { name: "compose button", sel: SEL.composeButton, requiredIn: "always" },
+    { name: "list rows (tr.zA)", sel: SEL.listRow, requiredIn: "list" },
+    { name: "thread list area", sel: SEL.threadList, requiredIn: "list" },
+    { name: "row checkboxes", sel: SEL.listRow + " " + SEL.rowCheckbox, requiredIn: "list" },
+    { name: "toolbar", sel: SEL.toolbars, requiredIn: "list" },
+    { name: "rendered message", sel: SEL.renderedMessage, requiredIn: "thread" },
+    { name: "message cards", sel: '[role="main"] ' + SEL.card, requiredIn: "thread" },
+    { name: "card headers", sel: '[role="main"] ' + SEL.card + " " + SEL.cardHeader, requiredIn: "thread" },
+    { name: "message bodies", sel: '[role="main"] ' + SEL.messageBody, requiredIn: "thread" },
+    { name: "inline reply links (.ams)", sel: SEL.inlineActions, requiredIn: "thread" },
+  ];
+
+  function verifySelectors() {
+    const surface = inThread() ? "thread" : "list";
+    const results = PROBES.map((p) => {
+      const applies = p.requiredIn === "always" || p.requiredIn === surface;
+      const count = Array.from(document.querySelectorAll(p.sel)).filter(isVisible).length;
+      return { probe: p.name, selector: p.sel, requiredIn: p.requiredIn, applies, count, ok: !applies || count > 0 };
+    });
+    const failed = results.filter((r) => !r.ok);
+    if (typeof console !== "undefined" && console.table) console.table(results);
+    if (InboxKeys.toast) {
+      if (failed.length) {
+        InboxKeys.toast(
+          `Selector check: ${failed.length} FAILED — ${failed.map((r) => r.probe).join(", ")} (details in console)`,
+          { kind: "warn", timeout: 6000 }
+        );
+      } else {
+        const checked = results.filter((r) => r.applies).length;
+        InboxKeys.toast(`Selector check: all ${checked} probes OK on this ${surface} view`, { kind: "info" });
+      }
+    }
+    return { surface, results, failed };
+  }
+
+  // Coarse "what am I looking at" classifier, in priority order. Drives the
+  // hotkey context gate so bindings only fire where they make sense.
+  function getContext() {
+    // 1) Palette open.
+    if (InboxKeys.palette && InboxKeys.palette.isOpen && InboxKeys.palette.isOpen()) return "paletteOpen";
+
+    const active = document.activeElement;
+
+    // 2) A modal dialog / menu is open (and not the compose surface itself).
+    // isShowing (not isVisible) so a closed-but-lingering dialog — notably the
+    // attachment projector, which stays sized but visibility:hidden/aria-hidden
+    // after Escape — doesn't keep us stuck in modalOpen/attachmentPreview.
+    const dialogs = Array.from(
+      document.querySelectorAll('[role="dialog"], [role="menu"]')
+    ).filter(isShowing);
+    const body = composeBody();
+    for (const d of dialogs) {
+      if (body && d.contains(body)) continue; // compose dialog handled below
+      if (inThread() && attachmentPreviewDialog() === d) return "attachmentPreview";
+      return "modalOpen";
+    }
+
+    // 3) Compose: focused contenteditable message body, or a visible standalone
+    // compose body. Inline replies inside a thread should stop capturing global
+    // hotkeys once Escape blurs the editor.
+    if (active && active.isContentEditable && active.closest('[aria-label="Message Body"], [g_editable="true"], [contenteditable="true"][role="textbox"]')) {
+      return "compose";
+    }
+    if (body && !inThread()) return "compose";
+
+    // 4) Thread view: in a thread AND a rendered message present. This must win
+    // over stale Gmail search focus after submitting a search query. The
+    // [data-message-id] probe is primary; if Gmail ever renames it, the
+    // structural shape of an open conversation (a card header or message body
+    // inside main) keeps thread detection alive. Both stay gated by inThread()
+    // so a list never classifies as a thread (the long-bare-word query guard).
+    if (inThread() && (firstVisible(SEL.renderedMessage) || firstVisible(SEL.threadFallback))) {
+      return "threadView";
+    }
+
+    // 5) Inbox list: a visible thread row / thread-list area. Search results
+    // render as a list while the search box can remain focused.
+    if (firstVisible(SEL.listRow) || firstVisible(SEL.threadList)) {
+      return "inboxList";
+    }
+
+    // 6) Search field focused and no active list/thread surface is available.
+    if (active && active.matches && active.matches(SEL.searchInput)) {
+      return "searchFocused";
+    }
+
+    return "unknown";
+  }
+
+  InboxKeys.gmail = {
+    SEL,
+    firstVisible,
+    verifySelectors,
+    accountIndex,
+    basePath,
+    setHash,
+    inThread,
+    findByTooltip,
+    clickByTooltip,
+    exactButton,
+    realClick,
+    hover,
+    isSynthesizingHover,
+    compose,
+    action,
+    undo,
+    toggleStar,
+    attachFile,
+    discardDraft,
+    markReadUnread,
+    snooze,
+    markNotDone,
+    mute,
+    unsubscribe,
+    openLinkOrAttachment,
+    extractOpenCandidates,
+    openLabelMenu,
+    removeLabel,
+    removeAllLabels,
+    openMoveMenu,
+    currentEmail,
+    composeBody,
+    composeRecipients,
+    composeSubject,
+    hasOpenThreadReply,
+    hasAttachmentPreview,
+    closeAttachmentPreview,
+    isVisible,
+    back,
+    replyToThread,
+    replyAllToThread,
+    forwardThread,
+    forwardMessage,
+    nextThread,
+    prevThread,
+    nextPage,
+    prevPage,
+    archiveThread,
+    exitReply,
+    listScrollContainer,
+    listScrollTop,
+    listScrollBottom,
+    threadScrollContainer,
+    threadScrollBy,
+    getContext,
+  };
+})();
