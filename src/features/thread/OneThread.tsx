@@ -4,9 +4,11 @@ import { useAppContext } from "../../app/context/AppContext";
 import { extractImageFromClipboard, inferImageMimeType } from "../../utils/clipboard";
 import type { TerminalPreset } from "../../app/types";
 import { threadAgentKind, threadAgentLabel, threadPresetLaunch } from "./threadModel";
-import type { ThreadMessage, ThreadPresetLaunch, ThreadRecord } from "./threadModel";
+import type { ThreadAgentKind, ThreadMessage, ThreadPresetLaunch, ThreadRecord } from "./threadModel";
 import { assignHandles, filterHandles, findMention, insertMention, mentionAtCaret, stripMention } from "./mentions";
 import type { MentionToken } from "./mentions";
+import { filterSkills, insertSkill, skillAtCaret } from "./skills";
+import type { SkillAction, SkillToken } from "./skills";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "./search";
 import type { SearchFrom } from "./search";
 import { routineDay, routineWhen } from "./routines";
@@ -327,6 +329,68 @@ export function OneThread() {
     const found = findMention(draft(), agents().map((a) => a.handle));
     return found ? { ...found, agent: agentForHandle(found.handle) } : null;
   });
+  // Typing /skill (or $skill) lists the skills of the agent the message is
+  // going to: the @agent it names, else the conversation it replies to, else
+  // a new @claude thread. Claude runs /name and Codex $name; delivery fixes
+  // the spelling if the message ends up with the other one.
+  const skillTarget = createMemo((): { harness: ThreadAgentKind; cwd: string | null } => {
+    const agent = mentionedAgent()?.agent;
+    if (agent) {
+      const command = agent.launch.ok ? agent.launch.agentCommand : null;
+      return { harness: threadAgentKind(command), cwd: agent.preset?.directory || null };
+    }
+    const target = focusedId() ?? replyTarget();
+    if (!target) return { harness: "claude", cwd: null };
+    const root = model.rootOf(target);
+    const latest = model.messages().filter((m) => model.rootOf(m.session_id) === root).at(-1);
+    const thread = model.threadById()[latest?.session_id ?? root] ?? model.threadById()[root];
+    return { harness: threadAgentKind(thread?.agent_command), cwd: thread?.cwd ?? null };
+  });
+  const skillTargetKey = createMemo(() => `${skillTarget().harness}\u0000${skillTarget().cwd ?? ""}`);
+  const [skillToken, setSkillToken] = createSignal<SkillToken | null>(null);
+  const [skillIndex, setSkillIndex] = createSignal(0);
+  const [skillActions, setSkillActions] = createSignal<SkillAction[]>([]);
+  // Listed when the menu opens (the backend caches and rescans on changes).
+  createEffect(
+    on([() => skillToken() !== null, skillTargetKey], ([open, key]) => {
+      if (!open) return;
+      const { harness, cwd } = skillTarget();
+      invoke<SkillAction[]>("composer_list_actions", { cwd, harness })
+        .then((list) => {
+          if (skillTargetKey() === key) setSkillActions(list);
+        })
+        .catch(() => setSkillActions([]));
+    })
+  );
+  const skillMatches = createMemo(() => {
+    const token = skillToken();
+    return token ? filterSkills(skillActions(), token.query) : [];
+  });
+  const skillMenuOpen = () => skillToken() !== null && skillMatches().length > 0;
+  const updateSkill = () => {
+    if (!inputRef || inputRef.selectionStart !== inputRef.selectionEnd) {
+      setSkillToken(null);
+      return;
+    }
+    const token = skillAtCaret(inputRef.value, inputRef.selectionStart);
+    if (token?.query !== skillToken()?.query || token?.start !== skillToken()?.start) setSkillIndex(0);
+    setSkillToken(token);
+  };
+  const chooseSkill = (invocation: string) => {
+    const token = skillToken();
+    if (!token || !inputRef) return;
+    const next = insertSkill(draft(), token, invocation);
+    setDraft(next.text);
+    inputRef.value = next.text;
+    inputRef.setSelectionRange(next.caret, next.caret);
+    setSkillToken(null);
+    resizeInput();
+    inputRef.focus();
+  };
+  const updateTokens = () => {
+    updateMention();
+    updateSkill();
+  };
   // Hovering a pinned thread shows its details and lets you rename it.
   const [popover, setPopover] = createSignal<{ id: string; left: number; top: number } | null>(null);
   const [renaming, setRenaming] = createSignal(false);
@@ -791,6 +855,7 @@ export function OneThread() {
         holdSend(text, images);
       }
       setMention(null);
+      setSkillToken(null);
       setDraft("");
       setPendingImages([]);
       setPasteError(null);
@@ -861,6 +926,7 @@ export function OneThread() {
   const closeMenuOnOutsideClick = (event: MouseEvent) => {
     const target = event.target as HTMLElement | null;
     if (mention() && !target?.closest(".ot-preset-menu, .ot-input")) setMention(null);
+    if (skillToken() && !target?.closest(".ot-preset-menu, .ot-input")) setSkillToken(null);
     if (searchMenu() && !target?.closest(".ot-filter-wrap")) setSearchMenu(null);
     const heldMenu = heldMenuFor();
     if (heldMenu && !target?.closest(".ot-held-menu, .ot-held-agent")) resumeHeld(heldMenu);
@@ -1613,6 +1679,36 @@ export function OneThread() {
             void send();
           }}
         >
+          <Show when={skillMenuOpen()}>
+            <div class="ot-preset-menu ot-skill-menu" role="listbox" aria-label="Skills">
+              <div class="ot-preset-heading">{skillTarget().harness === "codex" ? "Codex" : "Claude"} skills</div>
+              <For each={skillMatches()}>
+                {(skill, i) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={skillIndex() === i()}
+                    class={`ot-preset-item ${skillIndex() === i() ? "active" : ""}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onMouseEnter={() => setSkillIndex(i())}
+                    onClick={() => chooseSkill(skill.invoke)}
+                  >
+                    <span class="ot-preset-text">
+                      <span class="ot-preset-name">
+                        {skill.invoke}
+                        <Show when={skill.kind !== "skill"}>
+                          <span class="ot-preset-kind">{skill.kind}</span>
+                        </Show>
+                      </span>
+                      <Show when={skill.description}>
+                        <span class="ot-preset-dir">{skill.description}</span>
+                      </Show>
+                    </span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
           <Show when={mentionMenuOpen()}>
             <div class="ot-preset-menu" role="listbox" aria-label="Agents">
               <div class="ot-preset-heading">{focused() || replyTarget() ? "Loop in" : "Start with"}</div>
@@ -1691,15 +1787,38 @@ export function OneThread() {
               if (!draft() && /^\s+$/.test(e.currentTarget.value)) e.currentTarget.value = "";
               setDraft(e.currentTarget.value);
               resizeInput();
-              updateMention();
+              updateTokens();
             }}
-            onClick={updateMention}
+            onClick={updateTokens}
             onKeyUp={(e) => {
-              if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateMention();
+              if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateTokens();
             }}
-            onBlur={() => setMention(null)}
+            onBlur={() => {
+              setMention(null);
+              setSkillToken(null);
+            }}
             onPaste={(e) => void handlePaste(e)}
             onKeyDown={(e) => {
+              const skills = skillMatches();
+              if (skillToken() && skills.length > 0 && !e.isComposing) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const step = e.key === "ArrowDown" ? 1 : -1;
+                  setSkillIndex((i) => (i + step + skills.length) % skills.length);
+                  return;
+                }
+                if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+                  e.preventDefault();
+                  chooseSkill(skills[Math.min(skillIndex(), skills.length - 1)].invoke);
+                  return;
+                }
+              }
+              if (skillToken() && e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setSkillToken(null);
+                return;
+              }
               const options = mentionMatches().available;
               if (mention() && options.length > 0 && !e.isComposing) {
                 if (e.key === "ArrowDown" || e.key === "ArrowUp") {

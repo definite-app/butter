@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { DbSession, TerminalPreset, WebSession } from "../../app/types";
 import { shellEscape } from "../../utils/shell";
 import { codexLaunchFlags, shellQuoteWord } from "../../utils/agentResume";
+import { withLeadingSkill } from "./skills";
 import { ROUTINE_INSTRUCTIONS, routinePreamble, type RoutineRecord } from "./routines";
 
 // ===== 1thread =====
@@ -91,6 +92,16 @@ const ROUTINE_FIRST_CHECK_MS = 15_000;
 const ROUTINE_CHECK_MS = 60_000;
 
 export const wrapButterMessage = (text: string) => `<butter_message>${text}</butter_message>`;
+
+/** How `harness` invokes each skill and command it has in `cwd` (`/name`, `$name`, ...). */
+async function agentSkills(harness: ThreadAgentKind, cwd: string | null | undefined): Promise<Set<string>> {
+  try {
+    const actions = await invoke<{ invoke: string }[]>("composer_list_actions", { cwd: cwd ?? null, harness });
+    return new Set(actions.map((a) => a.invoke));
+  } catch {
+    return new Set();
+  }
+}
 
 /** The name a thread's agent goes by in a conversation with several agents. */
 export const threadAgentLabel = (t: Pick<ThreadRecord, "preset_name" | "agent_command"> | undefined) =>
@@ -509,8 +520,10 @@ export function createThreadModel(deps: ThreadModelDeps) {
     try {
       await deps.startSessionTerminal(id);
       const lead = [parent ? missedContext(id, message.created_at) : "", options.preamble ?? ""].filter(Boolean);
-      const text = agentTextForMessage(message);
-      const prompt = lead.length > 0 ? [...lead, wrapButterMessage(text)].join("\n\n") : text;
+      const known = await agentSkills(threadAgentKind(record.agent_command), record.cwd);
+      const prompt = withLeadingSkill(agentTextForMessage(message), known, (text) =>
+        lead.length > 0 ? [...lead, text ? wrapButterMessage(text) : ""].filter(Boolean).join("\n\n") : text
+      );
       await launchAgent(id, prompt, null);
     } catch (err) {
       console.error("[thread] failed to launch thread terminal", err);
@@ -566,7 +579,13 @@ export function createThreadModel(deps: ThreadModelDeps) {
       const entry = rt(threadId);
       const now = Date.now();
       const context = missedContext(threadId, queued[0].created_at);
-      const combined = [context, ...queued.map(agentTextForMessage)].filter(Boolean).join("\n\n");
+      const [first, ...later] = queued.map(agentTextForMessage);
+      // A skill the first message starts with goes in front of the tags.
+      const known = await agentSkills(kindOf(threadId), threadById()[threadId]?.cwd ?? null);
+      const prompt = withLeadingSkill(first, known, (text) => {
+        const combined = [context, text, ...later].filter(Boolean).join("\n\n");
+        return combined ? wrapButterMessage(combined) : "";
+      });
       const session = deps.sessions.find((s) => s.id === threadId);
 
       if (!session || !deps.ptyBySession()[threadId]) {
@@ -581,7 +600,7 @@ export function createThreadModel(deps: ThreadModelDeps) {
         }
         await deps.startSessionTerminal(threadId);
         const resumeId = await resolveAgentSessionId(threadId);
-        await launchAgent(threadId, wrapButterMessage(combined), resumeId);
+        await launchAgent(threadId, prompt, resumeId);
         entry.lastLaunchAt = Date.now();
         entry.awaitingWork = true;
         entry.aliveSince = null;
@@ -604,14 +623,14 @@ export function createThreadModel(deps: ThreadModelDeps) {
           entry.aliveSince ??= now;
           if (now - entry.aliveSince < UNKNOWN_ALIVE_MS) return;
         }
-        const ok = await deps.pasteIntoSession(threadId, wrapButterMessage(combined));
+        const ok = await deps.pasteIntoSession(threadId, prompt);
         if (!ok) return;
       } else {
         entry.aliveSince = null;
         if (now - entry.lastLaunchAt < CLAUDE_BOOT_GRACE_MS) return;
         // Shell is alive but the agent exited: resume it with the message.
         const resumeId = await resolveAgentSessionId(threadId);
-        await launchAgent(threadId, wrapButterMessage(combined), resumeId);
+        await launchAgent(threadId, prompt, resumeId);
       }
       entry.lastLaunchAt = Date.now();
       entry.awaitingWork = true;

@@ -649,6 +649,10 @@
   box-shadow: var(--shadow-lg);
 }
 
+.ot-skill-menu {
+  width: 420px;
+}
+
 .ot-preset-heading {
   padding: 6px 10px 4px;
   color: var(--text-muted);
