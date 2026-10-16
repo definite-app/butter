@@ -153,6 +153,8 @@ private final class HUDView: NSView {
     private var history: [HUDHistoryItem]?
     private var historyButtonRect = NSRect.zero
     private var rowRects: [NSRect] = []
+    /// The row just clicked; it shows "Copied" in place of its time for a moment.
+    private var copiedRow: Int?
     var caption: String?
     var captionBelow = false
     private var state: HUD.State = .transcribing
@@ -205,6 +207,7 @@ private final class HUDView: NSView {
     private func toggleHistory() {
         history = history == nil ? Array((historyProvider?() ?? []).prefix(Self.historyLimit)) : nil
         hovered = nil
+        copiedRow = nil
         onLayoutChange?()
     }
 
@@ -255,8 +258,14 @@ private final class HUDView: NSView {
         } else if historyButtonRect.contains(p) {
             toggleHistory()
         } else if let row = rowRects.firstIndex(where: { $0.contains(p) }), let item = history?[row] {
-            toggleHistory()
             onPick?(item.text)
+            copiedRow = row
+            needsDisplay = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self, self.copiedRow == row else { return }
+                self.copiedRow = nil
+                self.needsDisplay = true
+            }
         }
     }
 
@@ -298,7 +307,7 @@ private final class HUDView: NSView {
         box.stroke()
     }
 
-    /// Recent dictations, newest nearest the pill. Click one to paste it.
+    /// Recent dictations, newest nearest the pill. Click one to copy it.
     private func drawHistory(_ items: [HUDHistoryItem]) {
         let rect = upperRect
         drawBox(rect)
@@ -320,8 +329,10 @@ private final class HUDView: NSView {
                 NSColor(white: 1, alpha: 0.07).setFill()
                 NSBezierPath(roundedRect: row, xRadius: 7, yRadius: 7).fill()
             }
-            let time = NSAttributedString(string: relativeTime(item.at), attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: Self.muted,
+            let copied = copiedRow == i
+            let time = NSAttributedString(string: copied ? "Copied" : relativeTime(item.at), attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: copied ? .medium : .regular),
+                .foregroundColor: copied ? Self.butter : Self.muted,
             ])
             let timeSize = time.size()
             time.draw(at: NSPoint(x: row.maxX - 10 - timeSize.width, y: row.midY - timeSize.height / 2))
