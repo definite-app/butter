@@ -79,6 +79,25 @@ export function PresetEditor() {
               </div>
             </div>
             <div class="preset-field">
+              <label>Browser profile</label>
+              <select
+                class="preset-select"
+                value={app.browserProfileFor(app.editingPreset()?.browserProfile).id}
+                onFocus={() => void app.refreshBrowserConfig()}
+                onChange={(e) => {
+                  const value = e.currentTarget.value;
+                  app.setEditingPreset({
+                    ...app.editingPreset()!,
+                    browserProfile: value === "default" ? undefined : value,
+                  });
+                }}
+              >
+                <For each={app.browserConfig().profiles}>
+                  {(profile) => <option value={profile.id}>{profile.name}</option>}
+                </For>
+              </select>
+            </div>
+            <div class="preset-field">
               <label>Tags</label>
               <div class="preset-tags">
                 <For each={app.tags()}>

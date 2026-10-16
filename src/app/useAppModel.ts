@@ -1,4 +1,4 @@
-import { createSignal, createMemo, onMount, onCleanup, createEffect } from "solid-js";
+import { createSignal, createMemo, onMount, onCleanup, createEffect, untrack } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -26,11 +26,24 @@ import { buildAgentResumeCommand } from "../utils/agentResume";
 import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import { buildThreadResumeCommand, createThreadModel, THREAD_TAG } from "../features/thread/threadModel";
+import {
+  appSessionId,
+  commandNeedsQuery,
+  hostOf,
+  isAppSessionId,
+  isGmailUrl,
+  partitionCommands,
+  resolveCommandUrl,
+} from "../features/browser/logic";
 import type {
   AppView,
   AppConfig,
   BrowserBounds,
+  BrowserCommandDef,
+  BrowserConfig,
+  BrowserProfile,
   BrowserSessionState,
+  InboxKeysCommand,
   CanvasBoard,
   CanvasFileKind,
   CanvasObject,
@@ -64,7 +77,7 @@ const CANVAS_BOARD_STORAGE_KEY = "canvas-board-v1";
 const SIDEBAR_HIDDEN_STORAGE_KEY = "sidebar-hidden";
 const BROWSER_URL_HISTORY_STORAGE_KEY = "butter.browser-url-history.v1";
 const BROWSER_URL_HISTORY_LIMIT = 250;
-const DEFAULT_BROWSER_HISTORY_PROFILE_KEY = "__default__";
+const APP_FULL_WINDOW_STORAGE_KEY = "butter.app-full-window";
 const CANVAS_TEXT_FILE_LIMIT_BYTES = 512 * 1024;
 const BUTTER_TEXT_FILE_LIMIT_BYTES = 2 * 1024 * 1024;
 const TERMINAL_WORKSPACE_TAB_ID = "__terminal__";
@@ -168,14 +181,35 @@ const getButterWorkspaceFileKind = (path: string): WorkspaceFileTabKind | null =
   return null;
 };
 
+/** A Cmd+K item. `group` draws a header; `runWithQuery` makes the palette
+ * ask for text first (browser.toml commands with `{query}`). */
+export interface PaletteCommand {
+  id: string;
+  label: string;
+  description?: string | null;
+  group?: string;
+  hint?: string;
+  action: () => void | Promise<void>;
+  queryPrompt?: string;
+  runWithQuery?: (query: string) => void;
+}
+
+const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
+  path: "",
+  profiles: [{ id: "default", name: "Default", color: "#F5D76E", defined: false }],
+  apps: [],
+  commands: [],
+  errors: [],
+};
+
 const isMarkdownPath = (path: string): boolean => {
   return MARKDOWN_EXTENSIONS.has(getPathExtension(path));
 };
 
-const browserHistoryProfileKey = (profilePath?: string | null) => {
-  const value = (profilePath || "").trim();
-  return value || DEFAULT_BROWSER_HISTORY_PROFILE_KEY;
-};
+// URL history is per browser.toml profile. Keys from before named profiles
+// (folder paths) are left alone, not migrated.
+const browserHistoryProfileKey = (profileId?: string | null) =>
+  `profile:${(profileId || "").trim() || "default"}`;
 
 const shouldStoreBrowserUrl = (url: string) => {
   const value = url.trim();
@@ -220,9 +254,9 @@ const writeBrowserUrlHistoryStore = (store: BrowserUrlHistoryStore) => {
   }
 };
 
-const recordBrowserUrlVisit = (profilePath: string | null | undefined, url: string) => {
+const recordBrowserUrlVisit = (profileId: string | null | undefined, url: string) => {
   if (!shouldStoreBrowserUrl(url)) return;
-  const key = browserHistoryProfileKey(profilePath);
+  const key = browserHistoryProfileKey(profileId);
   const store = readBrowserUrlHistoryStore();
   const current = store[key] || [];
   const next = [url, ...current.filter((entry) => entry !== url)].slice(0, BROWSER_URL_HISTORY_LIMIT);
@@ -233,16 +267,16 @@ const recordBrowserUrlVisit = (profilePath: string | null | undefined, url: stri
   writeBrowserUrlHistoryStore(store);
 };
 
-const getBrowserUrlHistory = (profilePath: string | null | undefined, query = "") => {
-  const key = browserHistoryProfileKey(profilePath);
+const getBrowserUrlHistory = (profileId: string | null | undefined, query = "") => {
+  const key = browserHistoryProfileKey(profileId);
   const urls = readBrowserUrlHistoryStore()[key] || [];
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return urls;
   return urls.filter((url) => url.toLowerCase().includes(normalizedQuery));
 };
 
-const clearBrowserUrlHistory = (profilePath: string | null | undefined) => {
-  const key = browserHistoryProfileKey(profilePath);
+const clearBrowserUrlHistory = (profileId: string | null | undefined) => {
+  const key = browserHistoryProfileKey(profileId);
   const store = readBrowserUrlHistoryStore();
   if (!(key in store)) return;
   delete store[key];
@@ -454,6 +488,24 @@ export function useAppModel() {
   const [browserSessions, setBrowserSessions] = createSignal<Record<string, BrowserSessionState>>({});
   // The active terminal's browser pane fills the whole window.
   const [browserFullscreen, setBrowserFullscreen] = createSignal(false);
+  // browser.toml: profiles, pinned apps, palette commands.
+  const [browserConfig, setBrowserConfig] = createSignal<BrowserConfig>(DEFAULT_BROWSER_CONFIG);
+  // The pinned web app shown instead of the terminals (null: none).
+  const [activeAppId, setActiveAppId] = createSignal<string | null>(null);
+  // Apps fill the window by default; off, they sit beside the sidebar.
+  const [appFullWindow, setAppFullWindow] = createSignal(
+    localStorage.getItem(APP_FULL_WINDOW_STORAGE_KEY) !== "0"
+  );
+  // Footer profile dropdown, by browser session id.
+  const [browserProfileMenuFor, setBrowserProfileMenuFor] = createSignal<string | null>(null);
+  const [showBrowserProfiles, setShowBrowserProfiles] = createSignal(false);
+  // Dimmed pictures of browser panes, shown while a palette hides them.
+  const [browserPreviews, setBrowserPreviews] = createSignal<Record<string, string>>({});
+  // Inbox Keys' commands on the active Gmail page, for Cmd+K.
+  const [inboxKeysCommands, setInboxKeysCommands] = createSignal<InboxKeysCommand[]>([]);
+  // Cmd+K asking for a browser command's {query}.
+  const [paletteArgCommand, setPaletteArgCommand] = createSignal<PaletteCommand | null>(null);
+  const [paletteArgValue, setPaletteArgValue] = createSignal("");
   const [fileTabsBySession, setFileTabsBySession] = createSignal<Record<string, WorkspaceFileTab[]>>({});
   const [pinnedFileTabs, setPinnedFileTabs] = createSignal<WorkspaceFileTab[]>([]);
   const [activeWorkspaceTabBySession, setActiveWorkspaceTabBySession] = createSignal<Record<string, string>>({});
@@ -1664,6 +1716,7 @@ export function useAppModel() {
   };
 
   const setAppViewMode = (view: AppView) => {
+    setActiveAppId(null);
     setAppView(view);
     setCanvasContextMenu(null);
     if (view === "terminal") {
@@ -2068,8 +2121,20 @@ export function useAppModel() {
       {
         id: "browser-fullscreen",
         label: "Full-Screen Browser",
-        description: "Fill the window with this terminal's browser (again to exit)",
+        description: "Fill the window with this terminal's browser, again to exit (Cmd+Shift+F)",
         action: () => void toggleBrowserFullscreen(),
+      },
+      {
+        id: "browser-profiles",
+        label: "Browser Profiles",
+        description: "Profiles, the sites they keep data for, and what uses them",
+        action: () => openBrowserProfiles(),
+      },
+      {
+        id: "open-browser-config",
+        label: "Open browser.toml",
+        description: "Edit browser profiles, pinned apps and palette commands",
+        action: () => void openBrowserConfigFile(),
       },
       {
         id: "recordings",
@@ -2224,14 +2289,6 @@ export function useAppModel() {
     ];
   });
 
-  const filteredCommands = createMemo(() => {
-    const query = commandQuery().trim().toLowerCase();
-    if (!query) return commands();
-    return commands().filter((command) => {
-      const haystack = `${command.label} ${command.description ?? ""}`.toLowerCase();
-      return haystack.includes(query);
-    });
-  });
 
   // File browser: visible entries - shows search results when searching, directory listing otherwise
   const filteredFileBrowserEntries = createMemo(() => {
@@ -3533,6 +3590,7 @@ export function useAppModel() {
   createEffect(() => {
     if (!showCommandPalette()) return;
     commandPaletteMode(); // refocus when Recordings goes back to the command list
+    paletteArgCommand(); // and when a {query} command swaps the input
     requestAnimationFrame(() => {
       commandInputRef?.focus();
       commandInputRef?.select();
@@ -3958,6 +4016,7 @@ export function useAppModel() {
         tags: p.tags || [],
         ...(p.footer ? { footer: true } : {}),
         ...(p.worktree ? { worktree: true } : {}),
+        ...(p.browserProfile ? { browser_profile: p.browserProfile } : {}),
       }));
       const updatedConfig = { ...config, presets: { items: configPresets } };
       setAppConfig(updatedConfig);
@@ -4037,6 +4096,7 @@ export function useAppModel() {
   }
 
   function selectSession(id: string) {
+    setActiveAppId(null);
     const prevId = activeSessionId();
     setActiveSessionId(id);
     setSessionSeenAt((prev) => ({ ...prev, [id]: Date.now() }));
@@ -5017,6 +5077,7 @@ export function useAppModel() {
         // (and Claude, whose history is per project dir) sees the same cwd.
         cwd: pendingAgentResume.get(id)?.cwd || session?.directory || null,
         command: cliCommand ?? null,
+        browserProfile: session?.browserProfile ?? null,
       });
       if (cliCommand !== undefined) {
         pendingCliCommands.delete(id);
@@ -6025,11 +6086,45 @@ export function useAppModel() {
   createEffect(() => {
     const states = Object.values(browserSessions());
     for (const state of states) {
-      recordBrowserUrlVisit(state.profilePath, state.url);
+      recordBrowserUrlVisit(state.profileId, state.url);
     }
   });
 
+  // ---- browser.toml --------------------------------------------------------
+
+  // Cheap: the backend re-reads the file only when its mtime changed. Called
+  // when the palette opens and when the window gets focus.
+  const refreshBrowserConfig = async () => {
+    try {
+      setBrowserConfig(await invoke<BrowserConfig>("browser_config_get"));
+    } catch (err) {
+      console.error("Failed to read browser.toml:", err);
+    }
+  };
+
+  const browserProfileFor = (profileId: string | null | undefined): BrowserProfile => {
+    const profiles = browserConfig().profiles;
+    return profiles.find((p) => p.id === profileId) ?? profiles[0] ?? DEFAULT_BROWSER_CONFIG.profiles[0];
+  };
+
+  const openBrowserConfigFile = async () => {
+    const path = await invoke<string>("browser_config_path");
+    await Command.create("open", [path]).execute();
+  };
+
+  // ---- Pinned web apps -----------------------------------------------------
+
+  const activeApp = createMemo(() => {
+    const id = activeAppId();
+    return id ? browserConfig().apps.find((a) => a.id === id) ?? null : null;
+  });
+  const activeAppSessionId = createMemo(() => {
+    const appEntry = activeApp();
+    return appEntry ? appSessionId(appEntry.id) : null;
+  });
+
   const activeBrowserOpen = createMemo(() => {
+    if (activeApp()) return false;
     if (appView() !== "terminal" || quickInputActive()) return false;
     const sessionId = activeSessionId();
     if (!sessionId) return false;
@@ -6039,12 +6134,18 @@ export function useAppModel() {
     const sessionId = activeSessionId();
     return sessionId && activeBrowserOpen() ? sessionId : null;
   });
+  // The browser palette commands act on: the app on screen, else the active
+  // terminal's open pane.
+  const paletteBrowserSessionId = createMemo(() => activeAppSessionId() ?? activeBrowserSessionId());
 
-  const openBrowserForSession = async (sessionId: string, url?: string) => {
+  const openBrowserForSession = async (sessionId: string, url?: string, profile?: string) => {
     try {
+      const startingProfile =
+        profile ?? (isAppSessionId(sessionId) ? undefined : sessions.find((s) => s.id === sessionId)?.browserProfile);
       const state = await invoke<BrowserSessionState>("browser_open", {
         sessionId,
         url: url || null,
+        profile: startingProfile ?? null,
       });
       upsertBrowserState(state);
     } catch (err) {
@@ -6052,7 +6153,41 @@ export function useAppModel() {
     }
   };
 
+  /** Shows a pinned app full-window. Its webview stays loaded when hidden. */
+  const openApp = async (appId: string) => {
+    await refreshBrowserConfig();
+    const appEntry = browserConfig().apps.find((a) => a.id === appId);
+    if (!appEntry) return;
+    if (appView() !== "terminal") setAppViewMode("terminal");
+    setQuickInputActive(false);
+    setBrowserFullscreen(false);
+    const sessionId = appSessionId(appEntry.id);
+    // Open before the pane mounts: its first bounds update would otherwise
+    // create the webview on the default profile.
+    if (!browserSessions()[sessionId]?.open) {
+      await openBrowserForSession(sessionId, appEntry.url, appEntry.profile);
+    }
+    setActiveAppId(appEntry.id);
+  };
+
+  /** Back to the terminals; the app keeps running hidden. */
+  const closeActiveApp = () => {
+    setActiveAppId(null);
+    const sessionId = activeSessionId();
+    if (sessionId) setTimeout(() => focusTerminal(sessionId), 0);
+  };
+
+  const toggleAppFullWindow = () => {
+    const next = !appFullWindow();
+    setAppFullWindow(next);
+    localStorage.setItem(APP_FULL_WINDOW_STORAGE_KEY, next ? "1" : "0");
+  };
+
   const toggleBrowserFullscreen = async () => {
+    if (activeApp()) {
+      toggleAppFullWindow();
+      return;
+    }
     if (browserFullscreen() && activeBrowserOpen()) {
       setBrowserFullscreen(false);
       return;
@@ -6078,6 +6213,7 @@ export function useAppModel() {
             loading: false,
             url: "",
             title: "",
+            profileId: "default",
             canGoBack: false,
             canGoForward: false,
           }),
@@ -6095,7 +6231,7 @@ export function useAppModel() {
 
   const navigateBrowser = async (sessionId: string, url: string) => {
     try {
-      const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+      const normalized = /^(https?|file):/i.test(url) ? url : `https://${url}`;
       const state = await invoke<BrowserSessionState>("browser_navigate", {
         sessionId,
         url: normalized,
@@ -6137,6 +6273,8 @@ export function useAppModel() {
     try {
       const state = await invoke<BrowserSessionState>("browser_set_bounds", { sessionId, bounds });
       upsertBrowserState(state);
+      // Leave it hidden while a palette is over it; the overlay restores it.
+      if (anyOverlayOpen()) return;
       const visibleState = await invoke<BrowserSessionState>("browser_set_visible", {
         sessionId,
         visible: true,
@@ -6156,9 +6294,13 @@ export function useAppModel() {
     }
   };
 
+  const focusBrowser = (sessionId: string) => {
+    void invoke("browser_focus", { sessionId }).catch(() => {});
+  };
+
   // Native browser webviews render above DOM. Hide them whenever a DOM overlay
   // opens so modals/palettes aren't occluded by the browser; restore when the
-  // overlay closes.
+  // overlay closes. A dimmed picture of the page stands in meanwhile.
   const anyOverlayOpen = createMemo(
     () =>
       showCommandPalette() ||
@@ -6166,28 +6308,75 @@ export function useAppModel() {
       showFileBrowser() ||
       scratchpadOpen() ||
       imageEditorOpen() ||
-      showPresetEditor()
+      showPresetEditor() ||
+      showBrowserProfiles() ||
+      browserProfileMenuFor() !== null
   );
 
-  let suspendedBrowserIds: string[] = [];
+  // The page that sent Cmd+K gets focus back when the palette closes.
+  let browserFocusAfterOverlay: string | null = null;
+
+  const dropBrowserPreview = (sessionId: string) => {
+    const url = browserPreviews()[sessionId];
+    if (!url) return;
+    URL.revokeObjectURL(url);
+    setBrowserPreviews((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+  };
+
+  const suspendBrowserWithPreview = async (sessionId: string) => {
+    try {
+      const jpeg = await invoke<ArrayBuffer>("browser_suspend", { sessionId });
+      if (!anyOverlayOpen()) {
+        // The overlay closed before the snapshot finished: show it again.
+        if (sessionId === activeBrowserSessionId() || sessionId === activeAppSessionId()) {
+          void setBrowserVisibility(sessionId, true);
+        }
+        return;
+      }
+      if (jpeg && jpeg.byteLength > 0) {
+        dropBrowserPreview(sessionId);
+        const url = URL.createObjectURL(new Blob([jpeg], { type: "image/jpeg" }));
+        setBrowserPreviews((prev) => ({ ...prev, [sessionId]: url }));
+      }
+    } catch (err) {
+      console.error(`Failed to suspend browser ${sessionId}:`, err);
+      void setBrowserVisibility(sessionId, false);
+    }
+  };
+
+  let suspendedBrowserIds = new Set<string>();
   createEffect(() => {
     const overlayOpen = anyOverlayOpen();
-    if (overlayOpen) {
-      const visibleNow = Object.values(browserSessions())
-        .filter((s) => s.open && s.visible)
-        .map((s) => s.sessionId);
-      if (visibleNow.length === 0) return;
-      suspendedBrowserIds = visibleNow;
-      for (const id of visibleNow) {
-        void setBrowserVisibility(id, false);
+    // Re-runs on browser state while open, to catch a pane that shows late.
+    const states = Object.values(browserSessions());
+    untrack(() => {
+      if (overlayOpen) {
+        for (const state of states) {
+          if (!state.open || !state.visible || suspendedBrowserIds.has(state.sessionId)) continue;
+          suspendedBrowserIds.add(state.sessionId);
+          void suspendBrowserWithPreview(state.sessionId);
+        }
+        return;
       }
-    } else {
-      const toRestore = suspendedBrowserIds;
-      suspendedBrowserIds = [];
+      const toRestore = [...suspendedBrowserIds];
+      suspendedBrowserIds = new Set();
+      for (const id of Object.keys(browserPreviews())) dropBrowserPreview(id);
+      // Only panes still on screen: the palette may have switched terminal
+      // or app, and an unmounted pane's webview must stay hidden.
+      const onScreen = new Set([activeBrowserSessionId(), activeAppSessionId()].filter(Boolean));
       for (const id of toRestore) {
-        void setBrowserVisibility(id, true);
+        if (onScreen.has(id)) void setBrowserVisibility(id, true);
       }
-    }
+      const focusId = browserFocusAfterOverlay;
+      browserFocusAfterOverlay = null;
+      if (focusId && onScreen.has(focusId)) {
+        setTimeout(() => focusBrowser(focusId), 40);
+      }
+    });
   });
 
   const openBrowserInspector = async (sessionId: string) => {
@@ -6207,21 +6396,195 @@ export function useAppModel() {
   };
 
   const getBrowserUrlSuggestions = (sessionId: string, query = "") => {
-    const profilePath = browserSessions()[sessionId]?.profilePath ?? null;
-    return getBrowserUrlHistory(profilePath, query);
+    const profileId = browserSessions()[sessionId]?.profileId ?? null;
+    return getBrowserUrlHistory(profileId, query);
   };
 
-  const clearBrowserProfileState = async (sessionId: string) => {
-    const profilePath = browserSessions()[sessionId]?.profilePath ?? null;
+  // ---- Profiles ------------------------------------------------------------
+
+  /** Moves a pane to another profile; the backend reloads its page there. */
+  const switchBrowserProfile = async (sessionId: string, profileId: string) => {
+    setBrowserProfileMenuFor(null);
     try {
-      await invoke("browser_clear_profile", { sessionId });
-      clearBrowserUrlHistory(profilePath);
-      await openBrowserForSession(sessionId);
+      const state = await invoke<BrowserSessionState>("browser_set_profile", {
+        sessionId,
+        profile: profileId,
+      });
+      upsertBrowserState(state);
     } catch (err) {
-      console.error(`Failed to clear browser profile for session ${sessionId}:`, err);
-      throw err;
+      console.error(`Failed to switch browser profile for ${sessionId}:`, err);
     }
   };
+
+  const openBrowserProfiles = () => {
+    setBrowserProfileMenuFor(null);
+    setShowCommandPalette(false);
+    void refreshBrowserConfig();
+    setShowBrowserProfiles(true);
+  };
+
+  /** Clears cookies, storage and cache, and that profile's URL history. */
+  const clearBrowserProfile = async (profileId: string) => {
+    const reopen = await invoke<string[]>("browser_profile_clear", { profile: profileId });
+    clearBrowserUrlHistory(profileId);
+    for (const sessionId of reopen) {
+      const appEntry = isAppSessionId(sessionId)
+        ? browserConfig().apps.find((a) => appSessionId(a.id) === sessionId)
+        : null;
+      await openBrowserForSession(sessionId, appEntry?.url);
+    }
+  };
+
+  const browserProfileSites = (profileId: string) =>
+    invoke<string[]>("browser_profile_sites", { profile: profileId });
+
+  const removeBrowserProfileSite = (profileId: string, site: string) =>
+    invoke("browser_profile_remove_site", { profile: profileId, site });
+
+  const createBrowserProfile = async (name: string, color?: string) => {
+    const profile = await invoke<BrowserProfile>("browser_profile_create", {
+      name,
+      color: color || null,
+    });
+    await refreshBrowserConfig();
+    return profile;
+  };
+
+  const updateBrowserProfile = async (id: string, changes: { name?: string; color?: string }) => {
+    await invoke("browser_profile_update", {
+      id,
+      name: changes.name ?? null,
+      color: changes.color ?? null,
+    });
+    await refreshBrowserConfig();
+  };
+
+  /** What uses a profile, for the Profiles view. */
+  const browserProfileUsage = (profileId: string) => ({
+    presets: presets().filter((p) => (browserProfileFor(p.browserProfile).id) === profileId),
+    apps: browserConfig().apps.filter((a) => a.profile === profileId),
+    openPanes: Object.values(browserSessions()).filter((s) => s.open && s.profileId === profileId).length,
+  });
+
+  // ---- Palette: browser.toml commands, apps, Inbox Keys --------------------
+
+  const runBrowserCommand = async (command: BrowserCommandDef, query = "") => {
+    const target = paletteBrowserSessionId();
+    const currentUrl = target ? browserSessions()[target]?.url : null;
+    const url = resolveCommandUrl(command.url, currentUrl, query);
+    if (!url) {
+      console.warn(`[browser.toml] ${command.name}: ${command.url} needs a web page to resolve against`);
+      return;
+    }
+    if (target) {
+      browserFocusAfterOverlay = target;
+      await navigateBrowser(target, url);
+      return;
+    }
+    const sessionId = activeSessionId();
+    if (!sessionId) return;
+    if (appView() !== "terminal") setAppViewMode("terminal");
+    await openBrowserForSession(sessionId, url);
+  };
+
+  const runInboxKeysCommand = (sessionId: string, commandId: string) => {
+    browserFocusAfterOverlay = sessionId;
+    // After the palette closes and the page is showing and focused again:
+    // some commands focus an input or open a menu.
+    setTimeout(() => {
+      void invoke("browser_inbox_keys_run", { sessionId, command: commandId }).catch((err) =>
+        console.error("Inbox Keys command failed:", err)
+      );
+    }, 160);
+  };
+
+  // Ask the Gmail page for Inbox Keys' commands each time Cmd+K opens there.
+  let inboxKeysRequest = 0;
+  createEffect(() => {
+    if (!showCommandPalette() || commandPaletteMode() !== "commands") return;
+    const target = paletteBrowserSessionId();
+    const url = untrack(() => (target ? browserSessions()[target]?.url : null));
+    const request = ++inboxKeysRequest;
+    setInboxKeysCommands([]);
+    if (!target || !isGmailUrl(url)) return;
+    void invoke<InboxKeysCommand[] | null>("browser_inbox_keys_commands", { sessionId: target })
+      .then((list) => {
+        if (request === inboxKeysRequest && Array.isArray(list)) setInboxKeysCommands(list);
+      })
+      .catch(() => {});
+  });
+
+  const browserPaletteCommands = createMemo(() => {
+    const config = browserConfig();
+    const target = paletteBrowserSessionId();
+    const url = target ? browserSessions()[target]?.url ?? null : null;
+    const { matched, global } = partitionCommands(config.commands, url);
+    const toItem = (command: BrowserCommandDef, index: number, group?: string): PaletteCommand => {
+      const needsQuery = commandNeedsQuery(command.url);
+      return {
+        id: `browser-command-${index}-${command.name}`,
+        label: command.name,
+        description: command.url,
+        group,
+        hint: needsQuery ? "Tab ⇥" : undefined,
+        action: () => void runBrowserCommand(command),
+        ...(needsQuery
+          ? {
+              queryPrompt: command.name,
+              runWithQuery: (query: string) => void runBrowserCommand(command, query),
+            }
+          : {}),
+      };
+    };
+    const host = hostOf(url) || "This page";
+    const siteItems = matched.map((command, index) => toItem(command, index, host));
+    const bookmarkItems = global.map((command, index) => toItem(command, matched.length + index));
+    const inboxKeysItems: PaletteCommand[] = target
+      ? inboxKeysCommands().map((command) => ({
+          id: `inbox-keys-${command.id}`,
+          label: command.title,
+          description: command.group || null,
+          group: "Inbox Keys",
+          hint: command.keys || command.hint || undefined,
+          action: () => runInboxKeysCommand(target, command.id),
+        }))
+      : [];
+    const appItems: PaletteCommand[] = config.apps.map((appEntry) => ({
+      id: `open-app-${appEntry.id}`,
+      label: `Open ${appEntry.name}`,
+      description: appEntry.url,
+      action: () => void openApp(appEntry.id),
+    }));
+    return { siteItems: [...siteItems, ...inboxKeysItems], appItems, bookmarkItems };
+  });
+
+  const clearPaletteArg = () => {
+    setPaletteArgCommand(null);
+    setPaletteArgValue("");
+  };
+
+  createEffect(() => {
+    if (!showCommandPalette()) clearPaletteArg();
+  });
+
+  // Defined here, after the browser state it reads (memos run on creation).
+  // Site commands come first under the page's host, then apps and
+  // bookmarks, then Butter's own commands.
+  const paletteCommands = createMemo((): PaletteCommand[] => {
+    const { siteItems, appItems, bookmarkItems } = browserPaletteCommands();
+    const rest: PaletteCommand[] = [...appItems, ...bookmarkItems, ...commands()];
+    if (siteItems.length === 0) return rest;
+    return [...siteItems, ...rest.map((command) => ({ ...command, group: "Butter" }))];
+  });
+
+  const filteredCommands = createMemo(() => {
+    const query = commandQuery().trim().toLowerCase();
+    if (!query) return paletteCommands();
+    return paletteCommands().filter((command) => {
+      const haystack = `${command.label} ${command.description ?? ""} ${command.group ?? ""}`.toLowerCase();
+      return haystack.includes(query);
+    });
+  });
 
   function createSession(
     preset?: TerminalPreset,
@@ -6241,6 +6604,7 @@ export function useAppModel() {
       createdAt: now,
       directory: directory || undefined,
       command: command || undefined,
+      browserProfile: preset?.browserProfile || undefined,
     };
     setSessions(sessions.length, newSession);
     setSessionSeenAt((prev) => ({ ...prev, [id]: now }));
@@ -6415,25 +6779,58 @@ export function useAppModel() {
       void warmClipboard("startup");
     }, 400);
 
-    const handlePaletteShortcut = (event: KeyboardEvent) => {
-      const isK = event.key === "k" || event.key === "K";
-      if (!isK || !event.metaKey) return;
-      const requestedMode: "commands" | "switcher" = event.shiftKey ? "switcher" : "commands";
-      event.preventDefault();
-      event.stopPropagation();
+    const togglePalette = (requestedMode: "commands" | "switcher") => {
       const isOpen = showCommandPalette();
       const sameMode = commandPaletteMode() === requestedMode;
       if (isOpen && sameMode) {
         setShowCommandPalette(false);
         return;
       }
+      // browser.toml may have changed; the backend only re-reads on a new mtime.
+      void refreshBrowserConfig();
+      setBrowserProfileMenuFor(null);
       setCommandPaletteMode(requestedMode);
       setShowCommandPalette(true);
       setCommandQuery("");
       setCommandIndex(0);
       setSwitcherIndex(0);
     };
+
+    const handlePaletteShortcut = (event: KeyboardEvent) => {
+      const isK = event.key === "k" || event.key === "K";
+      if (!isK || !event.metaKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      togglePalette(event.shiftKey ? "switcher" : "commands");
+    };
     window.addEventListener("keydown", handlePaletteShortcut, true); // capture phase
+
+    // Cmd+Shift+F: full-screen browser (or an app's full-window toggle). The
+    // page's own copy of these shortcuts arrives as "browser-shortcut".
+    const handleBrowserFullscreenShortcut = (event: KeyboardEvent) => {
+      const isF = event.key === "f" || event.key === "F";
+      if (!isF || !event.metaKey || !event.shiftKey) return;
+      if (!activeApp() && !activeBrowserOpen()) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void toggleBrowserFullscreen();
+    };
+    window.addEventListener("keydown", handleBrowserFullscreenShortcut, true);
+
+    const unlistenBrowserShortcut = await listen<{ sessionId: string; action: string }>(
+      "browser-shortcut",
+      (event) => {
+        const { sessionId, action } = event.payload;
+        if (action === "fullscreen") {
+          void toggleBrowserFullscreen().then(() => setTimeout(() => focusBrowser(sessionId), 60));
+          return;
+        }
+        const mode = action === "switcher" ? "switcher" : "commands";
+        const closing = showCommandPalette() && commandPaletteMode() === mode;
+        if (!closing) browserFocusAfterOverlay = sessionId;
+        togglePalette(mode);
+      }
+    );
 
     const handleClipboardHistoryShortcut = (event: KeyboardEvent) => {
       const isCmdShiftV =
@@ -6664,6 +7061,7 @@ export function useAppModel() {
       }
       // Pick up any external file changes while the user was away.
       reloadAllOpenTextFilesFromDisk();
+      void refreshBrowserConfig();
     };
     window.addEventListener("focus", handleWindowFocus);
 
@@ -6995,6 +7393,7 @@ export function useAppModel() {
           tags: p.tags,
           footer: p.footer,
           worktree: p.worktree,
+          browserProfile: p.browser_profile || undefined,
         }));
         setPresets(loadedPresets);
       }
@@ -7188,6 +7587,7 @@ export function useAppModel() {
       const payload = event.payload;
       upsertBrowserState(payload);
     });
+    void refreshBrowserConfig();
 
     const unlistenClipHistory = await listen<ClipboardHistoryEntry[]>(
       "clipboard-history-changed",
@@ -7428,6 +7828,8 @@ export function useAppModel() {
       document.removeEventListener("beforeinput", handleBeforeInput, true);
       void unlisten();
       void unlistenBrowser();
+      void unlistenBrowserShortcut();
+      window.removeEventListener("keydown", handleBrowserFullscreenShortcut, true);
       void unlistenClipHistory();
       void unlistenDragDrop();
       unlistenCloseRequest();
@@ -7548,6 +7950,35 @@ export function useAppModel() {
     setBrowserFullscreen,
     toggleBrowserFullscreen,
     activeBrowserSessionId,
+    browserConfig,
+    refreshBrowserConfig,
+    browserProfileFor,
+    openBrowserConfigFile,
+    activeApp,
+    activeAppId,
+    activeAppSessionId,
+    openApp,
+    closeActiveApp,
+    appFullWindow,
+    toggleAppFullWindow,
+    browserProfileMenuFor,
+    setBrowserProfileMenuFor,
+    showBrowserProfiles,
+    setShowBrowserProfiles,
+    openBrowserProfiles,
+    switchBrowserProfile,
+    clearBrowserProfile,
+    browserProfileSites,
+    removeBrowserProfileSite,
+    createBrowserProfile,
+    updateBrowserProfile,
+    browserProfileUsage,
+    browserPreviews,
+    paletteArgCommand,
+    setPaletteArgCommand,
+    paletteArgValue,
+    setPaletteArgValue,
+    clearPaletteArg,
     sessionPreview,
     setSessionPreview,
     sessionInputDraft,
@@ -7859,7 +8290,6 @@ export function useAppModel() {
     openBrowserInspector,
     closeBrowserInspector,
     getBrowserUrlSuggestions,
-    clearBrowserProfileState,
     setCanvasZoom,
     zoomInCanvas,
     zoomOutCanvas,

@@ -20,6 +20,8 @@ import { ReopenPicker } from "../features/overlays/ReopenPicker";
 import { PresetEditor } from "../features/presets/PresetEditor";
 import { ScratchpadModal } from "../features/scratchpad/ScratchpadModal";
 import { ImageEditorModal } from "../features/overlays/ImageEditorModal";
+import { BrowserPane } from "../features/browser/BrowserPane";
+import { BrowserProfiles } from "../features/browser/BrowserProfiles";
 
 export function AppShell() {
   const app = useAppContext();
@@ -116,6 +118,15 @@ export function AppShell() {
           <Match when={app.appView() === "canvas"}>
             <CanvasView />
           </Match>
+          {/* Keyed by the app id, not the entry: browser.toml refreshes hand
+              back new objects, and a remount would flash the page. */}
+          <Match when={app.activeApp() ? app.activeAppId() : null} keyed>
+            {(appId) => (
+              <main class="butter-web-main butter-app-main">
+                <BrowserPane sessionId={`app:${appId}`} app={app.activeApp() ?? undefined} />
+              </main>
+            )}
+          </Match>
           <Match when={true}>
             <TerminalArea />
           </Match>
@@ -134,6 +145,7 @@ export function AppShell() {
       <PresetEditor />
       <ScratchpadModal />
       <ImageEditorModal />
+      <BrowserProfiles />
       <ConfirmModal />
       <Show when={isDevFlavor()}>
         <div class="butter-dev-badge" title="Butter Dev build (isolated data in ~/.butter-dev)">

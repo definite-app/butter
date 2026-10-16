@@ -240,7 +240,7 @@ export function Sidebar() {
   const renderSessionItem = (id: string, draggable = true) => {
     const session = app.sessions.find((entry) => entry.id === id);
     if (!session) return null;
-    const isActive = () => app.activeSessionId() === id;
+    const isActive = () => app.activeSessionId() === id && !app.activeAppId();
     const extraTagCount = () => {
       const allTags = app.terminalTags()[id] || [];
       return allTags.length > 1 ? allTags.length - 1 : 0;
@@ -540,6 +540,37 @@ export function Sidebar() {
           </Show>
         </div>
       </div>
+      <Show when={app.browserConfig().apps.length > 0}>
+        <div class="sidebar-apps" onClick={(e) => e.stopPropagation()}>
+          <div class="sidebar-apps-label">Apps</div>
+          <For each={app.browserConfig().apps}>
+            {(entry) => {
+              const isActive = () => app.activeAppId() === entry.id;
+              const isLoaded = () => app.browserSessions()[`app:${entry.id}`]?.open ?? false;
+              const profile = () => app.browserProfileFor(entry.profile);
+              return (
+                <button
+                  type="button"
+                  class={`sidebar-app ${isActive() ? "active" : ""}`}
+                  title={`${entry.name} · ${entry.url} · profile: ${profile().name}`}
+                  onClick={() => (isActive() ? app.closeActiveApp() : void app.openApp(entry.id))}
+                >
+                  <span class="sidebar-app-icon" aria-hidden="true">
+                    {entry.name.trim().charAt(0).toUpperCase() || "•"}
+                  </span>
+                  <span class="sidebar-app-name">{entry.name}</span>
+                  <Show when={entry.profile !== "default"}>
+                    <span class="butter-profile-dot" style={{ background: profile().color }} />
+                  </Show>
+                  <Show when={isLoaded() && !isActive()}>
+                    <span class="sidebar-app-loaded" title="Loaded in the background" />
+                  </Show>
+                </button>
+              );
+            }}
+          </For>
+        </div>
+      </Show>
       <div
         class={`butter-web-session-list ${app.draggingSessionId() ? "dragging" : ""}`}
         onScroll={() => setMetadataPopover(null)}

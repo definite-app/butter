@@ -43,6 +43,7 @@ export interface ConfigPreset {
   tags: string[];
   footer?: boolean;
   worktree?: boolean;
+  browser_profile?: string;
 }
 
 export interface TagsConfig {
@@ -68,6 +69,8 @@ export interface WebSession {
   createdAt: number;
   directory?: string;
   command?: string;
+  /** The preset's browser profile, given to the pane when it first opens. */
+  browserProfile?: string;
 }
 
 export type WorkspaceFileTabKind = "text_file" | "image_file";
@@ -110,7 +113,8 @@ export interface BrowserSessionState {
   loading: boolean;
   url: string;
   title: string;
-  profilePath?: string | null;
+  /** browser.toml profile id ("default" when none). */
+  profileId: string;
   canGoBack: boolean;
   canGoForward: boolean;
   bounds?: BrowserBounds | null;
@@ -168,6 +172,51 @@ export interface TerminalPreset {
   tags?: string[];
   footer?: boolean;
   worktree?: boolean;
+  /** browser.toml profile id for this preset's browser pane. */
+  browserProfile?: string;
+}
+
+/** A `[[profile]]` in browser.toml (`default` always exists). */
+export interface BrowserProfile {
+  id: string;
+  name: string;
+  color: string;
+  /** Whether browser.toml lists it (`default` may not). */
+  defined: boolean;
+}
+
+/** A pinned web app: `[[app]]` in browser.toml. */
+export interface BrowserApp {
+  id: string;
+  name: string;
+  url: string;
+  profile: string;
+}
+
+/** A URL palette command: `[[command]]` in browser.toml. */
+export interface BrowserCommandDef {
+  name: string;
+  url: string;
+  match?: string | null;
+  /** `match` as a regex over the URL without its #fragment. */
+  matchRegex?: string | null;
+}
+
+export interface BrowserConfig {
+  path: string;
+  profiles: BrowserProfile[];
+  apps: BrowserApp[];
+  commands: BrowserCommandDef[];
+  errors: string[];
+}
+
+/** One of Inbox Keys' commands, as its Butter shim lists them. */
+export interface InboxKeysCommand {
+  id: string;
+  title: string;
+  group: string;
+  hint: string;
+  keys: string;
 }
 
 export interface FileBrowserEntry {
