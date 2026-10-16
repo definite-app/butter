@@ -104,6 +104,8 @@ final class Daemon {
     private var dictationStartedAt: Date?
     private var dictationPressedAt: Date?
     private var dictationHandsFree = false
+    /// System audio alongside a hands-free session, kept as a meeting if it was a call.
+    private var callCapture: CallCapture?
     private var dictationSession = 0
     private var previewTimer: Timer?
     private var previewInFlight = false
@@ -147,6 +149,10 @@ final class Daemon {
         }
         dictationMic?.stop()
         dictationSink?.close()
+        if let callCapture, let sink = dictationSink {
+            // Saved as "recorded"; the next daemon start transcribes it.
+            _ = callCapture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds)
+        }
         worker.stop(reason: "shutdown")
         unlink(Paths.socket.path)
     }
@@ -249,6 +255,28 @@ final class Daemon {
             worker.preload(engine: config.engine, model: config.model)
             if config.livePreview && config.hud { schedulePreview(session: dictationSession) }
             sound(config.startSound)
+            // A meeting already records system audio; otherwise catch the other
+            // side in case this hands-free session is really a call.
+            // Setting up the tap takes ~0.3-0.5s, so it happens off the main thread.
+            if handsFree && config.handsFreeCallAudio && meeting == nil {
+                let session = dictationSession, config = self.config
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let t0 = Date()
+                    let capture: CallCapture?
+                    do {
+                        capture = try CallCapture(origin: pressedAt, config: config)
+                        log("hands-free: system audio started in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+                    } catch {
+                        capture = nil
+                        log("hands-free: not recording system audio: \(error)")
+                    }
+                    DispatchQueue.main.async {
+                        // Stopped or cancelled while the tap was starting.
+                        guard let self, session == self.dictationSession else { capture?.discard(); return }
+                        self.callCapture = capture
+                    }
+                }
+            }
             return ["ok": true, "dictation": "recording", "hands_free": handsFree]
         } catch {
             sound(config.errorSound)
@@ -263,6 +291,8 @@ final class Daemon {
         guard let mic = dictationMic, let sink = dictationSink else { return ["ok": false, "error": "dictation not running"] }
         mic.stop()
         sink.close()
+        callCapture?.discard()
+        callCapture = nil
         endDictationState()
         restoreHUD()
         return ["ok": true, "dictation": "cancelled"]
@@ -278,6 +308,12 @@ final class Daemon {
         mic.stop()
         sink.close()
         let held = Date().timeIntervalSince(dictationStartedAt ?? Date())
+        var callMeeting: String?
+        if let capture = callCapture, let dir = capture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds) {
+            callMeeting = dir.lastPathComponent
+            enqueueProcessing(dir)
+        }
+        callCapture = nil
         endDictationState()
         guard held >= 0.3, sink.seconds > 0.2 else {
             restoreHUD()
@@ -289,9 +325,9 @@ final class Daemon {
         // Segments carry the timestamps that turn pauses into paragraph breaks.
         worker.transcribe(audio: sink.url, engine: config.engine, model: config.model, language: config.language,
                           prompt: config.prompt, segments: true, vad: false) { [weak self] result in
-            DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup) }
+            DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup, meeting: callMeeting) }
         }
-        return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds, "cleanup": cleanup]
+        return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds, "cleanup": cleanup, "meeting": callMeeting ?? NSNull()]
     }
 
     private func endDictationState() {
@@ -331,7 +367,7 @@ final class Daemon {
         }
     }
 
-    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double, cleanup: Bool) {
+    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double, cleanup: Bool, meeting: String?) {
         switch result {
         case let .failure(error):
             sound(config.errorSound)
@@ -341,7 +377,7 @@ final class Daemon {
             let text = transcription.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)
             log("dictation: \(String(format: "%.1f", audioSeconds))s audio -> \(text.count) chars in \(String(format: "%.2f", transcription.elapsed))s")
             guard cleanup, !text.isEmpty else {
-                deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil)
+                deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil, meeting: meeting)
                 return
             }
             if config.hud && dictationMic == nil {
@@ -352,27 +388,30 @@ final class Daemon {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let outcome = Cleanup.run(text, config: config)
                 DispatchQueue.main.async {
-                    self?.deliver(outcome.text, transcription: transcription, audioSeconds: audioSeconds, cleanup: outcome)
+                    self?.deliver(outcome.text, transcription: transcription, audioSeconds: audioSeconds, cleanup: outcome, meeting: meeting)
                 }
             }
         }
     }
 
     /// Saves to history and pastes/copies, per [dictation] output.
-    private func deliver(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?) {
+    private func deliver(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?, meeting callMeeting: String?) {
         // A new dictation may have started while this one was transcribing or
         // cleaning up; leave its pill alone.
         if dictationMic == nil {
             if let cleanup, !cleanup.cleaned, config.hud, meeting == nil {
                 hud.setCaption(nil)
                 hud.show(.message("Pasted without cleanup"))
+            } else if callMeeting != nil, config.hud, meeting == nil {
+                hud.setCaption(nil)
+                hud.show(.message("Call saved as a meeting"))
             } else {
                 restoreHUD()
             }
         }
         guard !text.isEmpty else { return }
         lastDictation = text
-        appendHistory(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: cleanup)
+        appendHistory(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: cleanup, meeting: callMeeting)
         switch config.dictationOutput {
         case "paste": paste(text)
         case "clipboard": setClipboard(text)
@@ -406,9 +445,10 @@ final class Daemon {
         hud.show(.error)
     }
 
-    private func appendHistory(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?) {
+    private func appendHistory(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?, meeting: String?) {
         var entry: [String: Any] = ["at": isoString(Date()), "text": text, "engine": transcription.engine,
                                     "model": transcription.model, "seconds": audioSeconds, "elapsed": transcription.elapsed]
+        if let meeting { entry["meeting"] = meeting }
         if let cleanup {
             // "text" is what was pasted; "raw" is what the transcriber heard.
             entry["raw"] = cleanup.raw
@@ -597,7 +637,10 @@ final class Daemon {
         if let meeting {
             out["meeting"] = ["id": meeting.dir.lastPathComponent, "title": meeting.title, "elapsed": meeting.elapsed]
         }
-        if let dictationStartedAt { out["dictation"] = ["elapsed": Date().timeIntervalSince(dictationStartedAt)] }
+        if let dictationStartedAt {
+            out["dictation"] = ["elapsed": Date().timeIntervalSince(dictationStartedAt),
+                                "call_audio": callCapture?.dir.lastPathComponent ?? NSNull()] as [String: Any]
+        }
         if let lastDictation { out["last_dictation"] = lastDictation }
         return out
     }
