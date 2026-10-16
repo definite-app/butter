@@ -125,6 +125,8 @@ final class Daemon {
             if self.dictationMic != nil { _ = self.stopDictation() } else if self.meeting != nil { _ = self.stopMeeting() }
         }
         hud.onCancel = { [unowned self] in _ = self.cancelDictation() }
+        hud.onCleanup = { [unowned self] in _ = self.stopDictation(cleanup: true) }
+        hud.showCleanup = config.cleanupButton
         hud.historyProvider = {
             DictationHistory.recent(limit: 6).compactMap { entry in
                 (entry["text"] as? String).map { HUDHistoryItem(text: $0, at: parseISO(entry["at"] as? String)) }
@@ -173,6 +175,7 @@ final class Daemon {
     private func reload() {
         config = Config.load()
         worker.idleMinutes = config.idleUnloadMinutes
+        hud.showCleanup = config.cleanupButton
         registerHotkeys()
         log("config reloaded")
     }
@@ -265,7 +268,9 @@ final class Daemon {
         return ["ok": true, "dictation": "cancelled"]
     }
 
-    private func stopDictation() -> [String: Any] {
+    /// Stops, transcribes and pastes. With `cleanup`, the transcript goes through
+    /// the [cleanup] harness first.
+    private func stopDictation(cleanup: Bool = false) -> [String: Any] {
         guard let mic = dictationMic, let sink = dictationSink else { return ["ok": false, "error": "dictation not running"] }
         if let first = mic.firstBufferAt, let pressed = dictationPressedAt {
             log("dictation: first audio \(Int(first.timeIntervalSince(pressed) * 1000))ms after the hotkey")
@@ -283,9 +288,9 @@ final class Daemon {
         let config = self.config
         worker.transcribe(audio: sink.url, engine: config.engine, model: config.model, language: config.language,
                           prompt: config.prompt, segments: false, vad: false) { [weak self] result in
-            DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds) }
+            DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup) }
         }
-        return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds]
+        return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds, "cleanup": cleanup]
     }
 
     private func endDictationState() {
@@ -325,24 +330,52 @@ final class Daemon {
         }
     }
 
-    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double) {
+    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double, cleanup: Bool) {
         switch result {
         case let .failure(error):
             sound(config.errorSound)
-            showError()
+            if dictationMic == nil { showError() }
             log("dictation failed: \(error)")
         case let .success(transcription):
             let text = transcription.text
             log("dictation: \(String(format: "%.1f", audioSeconds))s audio -> \(text.count) chars in \(String(format: "%.2f", transcription.elapsed))s")
-            restoreHUD()
-            guard !text.isEmpty else { return }
-            lastDictation = text
-            appendHistory(text, transcription: transcription, audioSeconds: audioSeconds)
-            switch config.dictationOutput {
-            case "paste": paste(text)
-            case "clipboard": setClipboard(text)
-            default: break
+            guard cleanup, !text.isEmpty else {
+                deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil)
+                return
             }
+            if config.hud && dictationMic == nil {
+                hud.show(.cleaning)
+                hud.setCaption(text)
+            }
+            let config = self.config
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let outcome = Cleanup.run(text, config: config)
+                DispatchQueue.main.async {
+                    self?.deliver(outcome.text, transcription: transcription, audioSeconds: audioSeconds, cleanup: outcome)
+                }
+            }
+        }
+    }
+
+    /// Saves to history and pastes/copies, per [dictation] output.
+    private func deliver(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?) {
+        // A new dictation may have started while this one was transcribing or
+        // cleaning up; leave its pill alone.
+        if dictationMic == nil {
+            if let cleanup, !cleanup.cleaned, config.hud, meeting == nil {
+                hud.setCaption(nil)
+                hud.show(.message("Pasted without cleanup"))
+            } else {
+                restoreHUD()
+            }
+        }
+        guard !text.isEmpty else { return }
+        lastDictation = text
+        appendHistory(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: cleanup)
+        switch config.dictationOutput {
+        case "paste": paste(text)
+        case "clipboard": setClipboard(text)
+        default: break
         }
     }
 
@@ -372,9 +405,16 @@ final class Daemon {
         hud.show(.error)
     }
 
-    private func appendHistory(_ text: String, transcription: Transcription, audioSeconds: Double) {
-        let entry: [String: Any] = ["at": isoString(Date()), "text": text, "engine": transcription.engine,
+    private func appendHistory(_ text: String, transcription: Transcription, audioSeconds: Double, cleanup: Cleanup.Outcome?) {
+        var entry: [String: Any] = ["at": isoString(Date()), "text": text, "engine": transcription.engine,
                                     "model": transcription.model, "seconds": audioSeconds, "elapsed": transcription.elapsed]
+        if let cleanup {
+            // "text" is what was pasted; "raw" is what the transcriber heard.
+            entry["raw"] = cleanup.raw
+            entry["cleanup"] = cleanup.cleaned
+                ? ["harness": config.cleanupHarness, "model": config.cleanupModel, "elapsed": cleanup.elapsed] as [String: Any]
+                : ["failed": cleanup.fallbackReason ?? "", "elapsed": cleanup.elapsed] as [String: Any]
+        }
         let url = Paths.dictationDir.appendingPathComponent("history.jsonl")
         let line = (jsonString(entry) + "\n").data(using: .utf8)!
         if let handle = try? FileHandle(forWritingTo: url) {
@@ -532,7 +572,7 @@ final class Daemon {
         case "dictate.paste_last":
             return pasteLast()
         case "dictate.stop":
-            return stopDictation()
+            return stopDictation(cleanup: request["cleanup"] as? Bool ?? false)
         case "dictate.toggle":
             return toggleDictation()
         default:
@@ -548,6 +588,8 @@ final class Daemon {
             "hotkeys": ["dictation": "\(config.dictationHotkey) (\(config.dictationMode))", "hands_free": config.handsFreeHotkey,
                         "paste_last": config.pasteLastHotkey, "meeting": config.meetingHotkey],
             "permissions": permissions, "processing": processingIDs,
+            "cleanup": ["button": config.cleanupButton, "harness": config.cleanupHarness,
+                        "model": config.cleanupHarness == "claude" ? config.cleanupModel : config.cleanupCommand],
         ]
         if !hotkeyErrors.isEmpty { out["hotkey_errors"] = hotkeyErrors }
         if let meeting {

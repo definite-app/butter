@@ -23,11 +23,11 @@ Speech recognition runs in `asr/worker.py`, a uv script that keeps the model war
 | | Hotkey (default) | CLI |
 |---|---|---|
 | Dictate (push-to-talk) | hold `ctrl+opt+space`, release to paste | |
-| Dictate (hands-free) | `ctrl+opt+shift+space` to start; same key, the push-to-talk key, or ■ to stop | `butter-cli rec dictate start` / `stop` / `cancel` |
+| Dictate (hands-free) | `ctrl+opt+shift+space` to start; same key, the push-to-talk key, or ■ to stop; ✦ to stop and clean up | `butter-cli rec dictate start` / `stop [--clean]` / `cancel` |
 | Paste last dictation again | `ctrl+opt+v` | `butter-cli rec last [--copy]` |
 | Meeting | `ctrl+opt+m` to start/stop | `butter-cli rec meeting start --title "Acme sync"` / `meeting stop --wait` |
 
-A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app.
+A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. Hands-free sessions also get ✦, which stops and [cleans up](#cleanup) the text before pasting. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app.
 
 By default (`input_device = "auto"`), when your system mic is Bluetooth, such as AirPods, the recorder uses the built-in mic instead. Opening a Bluetooth mic switches the headset into call mode, which takes seconds and makes playback sound worse. Run `butter-cli rec devices` to see which mic it's using.
 
@@ -72,6 +72,29 @@ summarize_command = "ollama run llama3.2 'Summarize this meeting as notes with a
 ```
 
 `summarize_command` runs in a login shell with the transcript on stdin, and its stdout is saved as `summary.md`. Point it at a local model to keep everything on your machine.
+
+### Cleanup
+
+The hands-free pill has a ✦ button next to ■. It stops the recording, transcribes it, and rewrites the text with a model before pasting. The rewrite removes filler words and stutters, keeps only the correction when you correct yourself, and fixes misheard words, product names and punctuation:
+
+```
+uhhh, can you chex, I mean, can you runs lookup in sales force
+→ can you run a lookup in Salesforce
+```
+
+■ still pastes the raw transcript. By default the cleanup runs headless Claude Code. A cleanup takes about 2–4 seconds, and the dictation leaves your Mac:
+
+```toml
+[cleanup]
+harness = "claude"         # claude -p with no tools, MCP servers, hooks or saved session
+model = "haiku"
+vocabulary = ["Salesforce", "ClickHouse", "Postgres"]
+instructions = "Use British spelling."
+```
+
+With `harness = "command"`, any program can do the cleanup. It gets the prompt on stdin and prints the cleaned text, for example `command = "ollama run qwen3:4b"` to stay local. `prompt` replaces the built-in prompt, using `{{text}}`, `{{vocabulary}}` and `{{instructions}}` as placeholders.
+
+If the model fails, times out (`timeout_seconds`), or returns something that isn't a cleanup, the raw text is pasted and the pill says "Pasted without cleanup". One example is answering a question you dictated instead of cleaning it up. History keeps both versions: `text` is what was pasted and `raw` is what was heard. Use `butter-cli rec history --raw` to see the raw versions, and `butter-cli rec cleanup "some text"` to try your settings.
 
 ## How it fits together
 

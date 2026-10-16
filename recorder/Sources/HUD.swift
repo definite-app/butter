@@ -10,12 +10,19 @@ final class HUD {
         case handsFree(level: () -> Float, since: Date)
         case meeting(level: () -> Float, since: Date)
         case transcribing
+        case cleaning
         case message(String)
         case error
     }
 
     var onStop: (() -> Void)?
     var onCancel: (() -> Void)?
+    /// Stop, then clean up the transcript before pasting (hands-free only).
+    var onCleanup: (() -> Void)?
+    var showCleanup: Bool {
+        get { view.showCleanup }
+        set { view.showCleanup = newValue }
+    }
     /// Recent dictations for the history list (newest first), and what to do when one is picked.
     var historyProvider: (() -> [HUDHistoryItem])?
     var onPickHistory: ((String) -> Void)?
@@ -40,6 +47,7 @@ final class HUD {
         panel.contentView = view
         view.onStop = { [weak self] in self?.onStop?() }
         view.onCancel = { [weak self] in self?.onCancel?() }
+        view.onCleanup = { [weak self] in self?.onCleanup?() }
         view.historyProvider = { [weak self] in self?.historyProvider?() ?? [] }
         view.onPick = { [weak self] in self?.onPickHistory?($0) }
         view.onLayoutChange = { [weak self] in
@@ -128,10 +136,11 @@ private final class HUDView: NSView {
     private static let barCount = 9
     private static let compactBars = 5
 
-    static func size(for state: HUD.State) -> NSSize {
+    static func size(for state: HUD.State, cleanup: Bool = false) -> NSSize {
         switch state {
-        case .handsFree: return NSSize(width: 226, height: height)
+        case .handsFree: return NSSize(width: cleanup ? 256 : 226, height: height)
         case .meeting: return NSSize(width: 170, height: height)
+        case .cleaning: return NSSize(width: 150, height: height)
         case .message: return NSSize(width: 210, height: height)
         default: return NSSize(width: 112, height: height)
         }
@@ -146,6 +155,8 @@ private final class HUDView: NSView {
 
     var onStop: (() -> Void)?
     var onCancel: (() -> Void)?
+    var onCleanup: (() -> Void)?
+    var showCleanup = true
     var historyProvider: (() -> [HUDHistoryItem])?
     var onPick: ((String) -> Void)?
     var onLayoutChange: (() -> Void)?
@@ -163,8 +174,9 @@ private final class HUDView: NSView {
     private var hovered: String?
     private var stopRect = NSRect.zero
     private var cancelRect = NSRect.zero
+    private var cleanupRect = NSRect.zero
 
-    private var pillSize: NSSize { Self.size(for: state) }
+    private var pillSize: NSSize { Self.size(for: state, cleanup: showCleanup) }
 
     /// One or two lines, depending on how much text there is.
     private var captionHeight: CGFloat {
@@ -239,6 +251,7 @@ private final class HUDView: NSView {
         var next: String?
         if stopRect.contains(p) { next = "stop" }
         else if cancelRect.contains(p) { next = "cancel" }
+        else if cleanupRect.contains(p) { next = "cleanup" }
         else if historyButtonRect.contains(p) { next = "history" }
         else if let row = rowRects.firstIndex(where: { $0.contains(p) }) { next = "row\(row)" }
         if next != hovered { hovered = next; needsDisplay = true }
@@ -255,6 +268,8 @@ private final class HUDView: NSView {
             onStop?()
         } else if cancelRect.contains(p) {
             onCancel?()
+        } else if cleanupRect.contains(p) {
+            onCleanup?()
         } else if historyButtonRect.contains(p) {
             toggleHistory()
         } else if let row = rowRects.firstIndex(where: { $0.contains(p) }), let item = history?[row] {
@@ -295,6 +310,7 @@ private final class HUDView: NSView {
         // Hit rects were computed in pill space.
         stopRect = stopRect.offsetBy(dx: origin.x, dy: origin.y)
         cancelRect = cancelRect.offsetBy(dx: origin.x, dy: origin.y)
+        cleanupRect = cleanupRect.offsetBy(dx: origin.x, dy: origin.y)
         historyButtonRect = historyButtonRect.offsetBy(dx: origin.x, dy: origin.y)
     }
 
@@ -400,6 +416,7 @@ private final class HUDView: NSView {
         pill.stroke()
         stopRect = .zero
         cancelRect = .zero
+        cleanupRect = .zero
         historyButtonRect = .zero
 
         let t = Date().timeIntervalSince(start)
@@ -408,14 +425,17 @@ private final class HUDView: NSView {
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter) { i in levels[i] }
 
         case let .handsFree(_, since):
-            // [ bars  0:42  ×  ■ ]
+            // [ bars  0:42  ⟲  ×  ✦  ■ ]  (✦ = stop and clean up)
             drawBars(count: Self.compactBars, centerX: 36, color: Self.butter) { i in levels[Self.barCount - Self.compactBars + i] }
             drawText(clock(since), at: 64, color: Self.text)
-            historyButtonRect = NSRect(x: bounds.maxX - 96, y: bounds.midY - 12, width: 24, height: 24)
-            cancelRect = NSRect(x: bounds.maxX - 66, y: bounds.midY - 12, width: 24, height: 24)
+            let extra: CGFloat = showCleanup ? 30 : 0
+            historyButtonRect = NSRect(x: bounds.maxX - 96 - extra, y: bounds.midY - 12, width: 24, height: 24)
+            cancelRect = NSRect(x: bounds.maxX - 66 - extra, y: bounds.midY - 12, width: 24, height: 24)
+            if showCleanup { cleanupRect = NSRect(x: bounds.maxX - 66, y: bounds.midY - 12, width: 24, height: 24) }
             stopRect = NSRect(x: bounds.maxX - 36, y: bounds.midY - 13, width: 26, height: 26)
             drawHistoryButton(historyButtonRect)
             drawCancel(cancelRect)
+            if showCleanup { drawCleanupButton(cleanupRect) }
             drawStop(stopRect)
 
         case let .meeting(_, since):
@@ -432,6 +452,16 @@ private final class HUDView: NSView {
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter.withAlphaComponent(0.55)) { i in
                 CGFloat(0.16 + 0.22 * (1 + sin(t * 7 - Double(i) * 0.7)) / 2)
             }
+
+        case .cleaning:
+            // [ ✦ Cleaning up ]  — the sparkle breathes while the model works
+            let label = attributedString("Cleaning up", color: Self.text)
+            let total = 14 + 8 + label.size().width
+            let x = bounds.midX - total / 2
+            let alpha = 0.55 + 0.45 * (1 + sin(t * 4)) / 2
+            drawSymbol("sparkles", in: NSRect(x: x, y: bounds.midY - 7, width: 14, height: 14), size: 12,
+                       color: Self.butter.withAlphaComponent(alpha))
+            label.draw(at: NSPoint(x: x + 22, y: bounds.midY - label.size().height / 2))
 
         case .error:
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.errorColor) { _ in 0.1 }
@@ -483,6 +513,23 @@ private final class HUDView: NSView {
             .withSymbolConfiguration(config) else { return }
         let size = image.size
         image.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height))
+    }
+
+    private func drawCleanupButton(_ rect: NSRect) {
+        let hover = hovered == "cleanup"
+        if hover {
+            Self.butter.withAlphaComponent(0.16).setFill()
+            NSBezierPath(ovalIn: rect).fill()
+        }
+        drawSymbol("sparkles", in: rect, size: 11.5, color: hover ? Self.butter : Self.butter.withAlphaComponent(0.75))
+    }
+
+    private func drawSymbol(_ name: String, in rect: NSRect, size: CGFloat, color: NSColor) {
+        let config = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config) else { return }
+        let s = image.size
+        image.draw(in: NSRect(x: rect.midX - s.width / 2, y: rect.midY - s.height / 2, width: s.width, height: s.height))
     }
 
     private func drawCancel(_ rect: NSRect) {
