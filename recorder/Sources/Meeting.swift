@@ -135,6 +135,70 @@ final class MeetingRecording {
     }
 }
 
+/// What the Mac plays during a hands-free session (the other side of a call in
+/// your AirPods, say). The session's mic recording is the "Me" track, so when it
+/// ends the pair is saved as a meeting; short or silent sessions leave nothing.
+final class CallCapture {
+    let dir: URL
+    /// The timeline both tracks are offset from: when the hotkey was pressed.
+    private let origin: Date
+    private let system = SystemAudioRecorder()
+    private let sink: WavSink
+
+    init(origin: Date, config: Config) throws {
+        self.origin = origin
+        dir = try Meetings.newDirectory(title: "Hands-free", config)
+        do {
+            sink = try WavSink(url: dir.appendingPathComponent("system.wav"))
+            try system.start(into: sink)
+        } catch {
+            try? FileManager.default.removeItem(at: dir)
+            throw error
+        }
+        MeetingMeta(dict: [
+            "id": dir.lastPathComponent, "title": "Hands-free call", "started_at": isoString(origin),
+            "status": "recording", "system_audio": true, "source": "hands_free", "warnings": [] as [String],
+        ]).save(dir)
+    }
+
+    /// Stops recording. Keeps the folder as a meeting (returned, ready to process)
+    /// when the session ran at least `minSeconds` and the Mac played something.
+    func finish(mic: WavSink, minSeconds: Double) -> URL? {
+        system.stop()
+        sink.close()
+        let ended = Date()
+        let duration = ended.timeIntervalSince(origin)
+        guard duration >= minSeconds, sink.peak >= 0.001 else {
+            log("hands-free: no call audio kept (\(formatDuration(duration)), peak \(String(format: "%.4f", sink.peak)))")
+            discard()
+            return nil
+        }
+        do {
+            // A clone on APFS, so even a long session copies instantly.
+            try FileManager.default.copyItem(at: mic.url, to: dir.appendingPathComponent("mic.wav"))
+        } catch {
+            log("hands-free: couldn't save the mic track: \(error)")
+            discard()
+            return nil
+        }
+        MeetingMeta.update(dir) { meta in
+            meta.dict["ended_at"] = isoString(ended)
+            meta.dict["duration"] = duration
+            meta.dict["mic_offset"] = mic.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
+            meta.dict["system_offset"] = sink.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
+            meta.status = "recorded"
+        }
+        log("hands-free: saved the call as meeting \(dir.lastPathComponent) (\(formatDuration(duration)))")
+        return dir
+    }
+
+    func discard() {
+        system.stop()
+        sink.close()
+        try? FileManager.default.removeItem(at: dir)
+    }
+}
+
 /// Transcribes both tracks, merges them into one speaker-labelled transcript,
 /// then runs the optional summarizer.
 enum MeetingProcessor {

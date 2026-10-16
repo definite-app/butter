@@ -170,6 +170,8 @@ struct Config {
     var previewIntervalMs: Int { int("dictation", "preview_interval_ms", 700) }
     var paragraphPause: Double { double("dictation", "paragraph_pause_seconds", 2.0) }
     var paragraphMaxWords: Int { int("dictation", "paragraph_max_words", 120) }
+    var handsFreeCallAudio: Bool { bool("dictation", "hands_free_call_audio", true) }
+    var handsFreeCallMinSeconds: Double { double("dictation", "hands_free_call_min_seconds", 60) }
 
     // [ui]
     var hud: Bool { bool("ui", "hud", true) }
@@ -250,7 +252,13 @@ struct Config {
     preview_interval_ms = 700
     paragraph_pause_seconds = 2.0 # start a new paragraph after a pause this long (0 = one block of text)
     paragraph_max_words = 120    # ...or at the next sentence once a paragraph gets this long (0 = no limit)
-    output = "paste"          # paste | clipboard | none
+    # Hands-free also records what your Mac plays (e.g. the other side of a call
+    # in your AirPods). Only your words are pasted; if the session ran at least
+    # hands_free_call_min_seconds and the Mac played something, both sides are
+    # saved as a meeting too (butter-rec list / transcript).
+    hands_free_call_audio = true
+    hands_free_call_min_seconds = 60
+    output = "paste"       # paste | clipboard | none
     restore_clipboard = true     # put the previous clipboard back after pasting
     sounds = true                # start/stop sounds (also used for meetings)
     start_sound = "butter-start" # butter-start | butter-stop | butter-error, a macOS sound

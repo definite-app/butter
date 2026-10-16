@@ -29,7 +29,9 @@ Speech recognition runs in `asr/worker.py`, a uv script that keeps the model war
 
 A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. Hands-free sessions also get ✦, which stops and [cleans up](#cleanup) the text before pasting. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app.
 
-Long dictations are split into paragraphs. A pause of 2 seconds or more (`paragraph_pause_seconds`) starts a new one. A paragraph that runs past 120 words (`paragraph_max_words`) breaks at the next sentence. `butter-cli rec transcribe` formats files the same way. Hands-free records only your mic, so for a call use meeting mode, which separates you from the other side.
+Long dictations are split into paragraphs. A pause of 2 seconds or more (`paragraph_pause_seconds`) starts a new one. A paragraph that runs past 120 words (`paragraph_max_words`) breaks at the next sentence. `butter-cli rec transcribe` formats files the same way.
+
+Hands-free also records what your Mac plays, in case the session is really a call (the other side in your AirPods, say). Only your words are pasted. If the session ran for at least a minute (`hands_free_call_min_seconds`) and the Mac played something, both sides are also saved as a meeting called "Hands-free call". The pill says "Call saved as a meeting", and `butter-cli rec transcript` shows it labelled Me/Them. Shorter or silent sessions leave nothing behind. Turn this off with `hands_free_call_audio = false`.
 
 By default (`input_device = "auto"`), when your system mic is Bluetooth, such as AirPods, the recorder uses the built-in mic instead. Opening a Bluetooth mic switches the headset into call mode, which takes seconds and makes playback sound worse. Run `butter-cli rec devices` to see which mic it's using.
 
