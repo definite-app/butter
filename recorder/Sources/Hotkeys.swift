@@ -92,7 +92,7 @@ enum HotkeyEvent {
 final class HotkeyManager {
     typealias Handler = (HotkeyEvent) -> Void
 
-    private var refs: [EventHotKeyRef] = []
+    private var refs: [UInt32: EventHotKeyRef] = [:]
     private var handlers: [UInt32: Handler] = [:]
     private var handlerRef: EventHandlerRef?
     private var nextID: UInt32 = 1
@@ -116,25 +116,34 @@ final class HotkeyManager {
         }, types.count, &types, selfPtr, &handlerRef)
     }
 
-    func register(_ spec: HotkeySpec, handler: @escaping Handler) throws {
-        if spec.needsEventTap {
-            try tap.add(spec, handler: handler)
-            return
-        }
+    /// Returns an id for `unregister`.
+    @discardableResult
+    func register(_ spec: HotkeySpec, handler: @escaping Handler) throws -> UInt32 {
         let id = nextID
         nextID += 1
+        if spec.needsEventTap {
+            try tap.add(spec, id: id, handler: handler)
+            return id
+        }
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(spec.keyCode ?? 0, spec.modifiers, EventHotKeyID(signature: OSType(0x4252_5452), id: id),
                                          GetApplicationEventTarget(), 0, &ref)
         guard status == noErr, let ref else {
             throw CLIError("Couldn't register hotkey \(spec) (status \(status)); another app may own it")
         }
-        refs.append(ref)
+        refs[id] = ref
         handlers[id] = handler
+        return id
+    }
+
+    func unregister(_ id: UInt32) {
+        if let ref = refs.removeValue(forKey: id) { UnregisterEventHotKey(ref) }
+        handlers[id] = nil
+        tap.remove(id)
     }
 
     func unregisterAll() {
-        refs.forEach { UnregisterEventHotKey($0) }
+        refs.values.forEach { UnregisterEventHotKey($0) }
         refs.removeAll()
         handlers.removeAll()
         tap.removeAll()
@@ -148,6 +157,7 @@ final class HotkeyManager {
 /// set it off; if a key comes after that, it gets `.interrupted`.
 final class EventTapHotkeys {
     private struct Binding {
+        let id: UInt32
         let spec: HotkeySpec
         let handler: HotkeyManager.Handler
     }
@@ -178,9 +188,18 @@ final class EventTapHotkeys {
     /// Hotkeys whose key is down, by key code.
     private var down: [Int64: Int] = [:]
 
-    func add(_ spec: HotkeySpec, handler: @escaping HotkeyManager.Handler) throws {
+    func add(_ spec: HotkeySpec, id: UInt32, handler: @escaping HotkeyManager.Handler) throws {
         try start()
-        bindings.append(Binding(spec: spec, handler: handler))
+        bindings.append(Binding(id: id, spec: spec, handler: handler))
+    }
+
+    /// Key state is kept by index, so it starts over.
+    func remove(_ id: UInt32) {
+        guard bindings.contains(where: { $0.id == id }) else { return }
+        bindings.removeAll { $0.id == id }
+        if case let .pending(_, work) = chord { work.cancel() }
+        chord = .idle
+        down.removeAll()
     }
 
     func removeAll() {

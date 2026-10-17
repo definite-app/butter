@@ -183,6 +183,7 @@ struct Config {
     var dictationMode: String { string("dictation", "mode", "push_to_talk") }
     var handsFreeHotkey: String { string("dictation", "hands_free_hotkey", "ctrl+alt+shift+space") }
     var pasteLastHotkey: String { string("dictation", "paste_last_hotkey", "ctrl+alt+v") }
+    var cancelHotkey: String { string("dictation", "cancel_hotkey", "esc") }
     var livePreview: Bool { bool("dictation", "live_preview", true) }
     var previewIntervalMs: Int { int("dictation", "preview_interval_ms", 700) }
     var paragraphPause: Double { double("dictation", "paragraph_pause_seconds", 2.0) }
@@ -294,6 +295,7 @@ struct Config {
     hotkey = "ctrl+alt+space"
     mode = "push_to_talk"        # push_to_talk (hold) | toggle (press to start, press to stop)
     hands_free_hotkey = "ctrl+alt+shift+space"  # records until you press it (or the dictation hotkey) again, or click stop
+    cancel_hotkey = "esc"        # cancels a hands-free session; only taken while one is running ("" = off)
     paste_last_hotkey = "ctrl+alt+v"            # paste the last dictation again (e.g. it landed in the wrong window)
     live_preview = true          # show words as you speak (re-transcribes the last ~20s every interval)
     preview_interval_ms = 700

@@ -112,6 +112,8 @@ final class Daemon {
     /// The dictation hotkey went down during hands-free: stop when it's let go
     /// (unless it turns out to be part of the hands-free hotkey).
     private var stopOnRelease = false
+    /// cancel_hotkey (Esc), registered only while a hands-free session runs.
+    private var cancelHotkeyID: UInt32?
     private var previewTimer: Timer?
     private var previewInFlight = false
     private let hud = HUD()
@@ -166,6 +168,7 @@ final class Daemon {
 
     private func registerHotkeys() {
         hotkeys.unregisterAll()
+        cancelHotkeyID = nil
         hotkeyErrors.removeAll()
         let bindings: [(String, String, HotkeyManager.Handler)] = [
             ("dictation", config.dictationHotkey, { [unowned self] event in self.dictationHotkey(event) }),
@@ -180,6 +183,24 @@ final class Daemon {
                 hotkeyErrors.append("\(name): \(error)")
                 log("hotkey \(name): \(error)")
             }
+        }
+        updateCancelHotkey()
+    }
+
+    /// Esc cancels hands-free, so it's only taken from other apps while a session runs.
+    private func updateCancelHotkey() {
+        let wanted = dictationMic != nil && dictationHandsFree && !config.cancelHotkey.isEmpty
+        if wanted, cancelHotkeyID == nil {
+            do {
+                cancelHotkeyID = try hotkeys.register(try HotkeySpec.parse(config.cancelHotkey)) { [unowned self] event in
+                    if event == .pressed, self.dictationHandsFree { _ = self.cancelDictation() }
+                }
+            } catch {
+                log("hotkey cancel: \(error)")
+            }
+        } else if !wanted, let id = cancelHotkeyID {
+            hotkeys.unregister(id)
+            cancelHotkeyID = nil
         }
     }
 
@@ -257,6 +278,7 @@ final class Daemon {
         guard let mic = dictationMic, !dictationHandsFree else { return }
         let since = dictationPressedAt ?? Date()
         dictationHandsFree = true
+        updateCancelHotkey()
         if config.hud { hud.show(.handsFree(level: { mic.level }, since: since)) }
         startCallCapture(origin: since)
         log("dictation: switched to hands-free")
@@ -287,6 +309,7 @@ final class Daemon {
             dictationMic = mic
             dictationSink = sink
             dictationStartedAt = Date()
+            updateCancelHotkey()
             // Load the model while the user is still talking.
             worker.preload(engine: config.engine, model: config.model)
             if config.livePreview && config.hud { schedulePreview(session: dictationSession) }
@@ -375,6 +398,7 @@ final class Daemon {
         dictationStartedAt = nil
         dictationHandsFree = false
         stopOnRelease = false
+        updateCancelHotkey()
         dictationSession += 1  // invalidates in-flight previews
         previewTimer?.invalidate()
         previewTimer = nil
