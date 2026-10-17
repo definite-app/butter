@@ -222,6 +222,7 @@ enum MeetingProcessor {
                 usedModel = result.model
                 let offset = (meta.dict[track.offsetKey] as? NSNumber)?.doubleValue ?? 0
                 for var seg in result.segments where !seg.text.isEmpty {
+                    seg.text = config.applyReplacements(seg.text)
                     seg.start += offset
                     seg.end += offset
                     segments.append((track.speaker, seg))

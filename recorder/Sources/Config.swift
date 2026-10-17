@@ -19,12 +19,29 @@ enum MiniTOML {
                 section = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
                 continue
             }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
-            let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            guard let (key, value) = keyValue(line) else { continue }
             result[section, default: [:]][key] = parseValue(value)
         }
         return result
+    }
+
+    /// `key = value` or `"quoted key" = value` (for keys with spaces, as in [replacements]).
+    private static func keyValue(_ line: String) -> (String, String)? {
+        var rest = Substring(line)
+        let key: String
+        if let quote = rest.first, quote == "\"" || quote == "'" {
+            rest = rest.dropFirst()
+            guard let close = rest.firstIndex(of: quote) else { return nil }
+            key = String(rest[..<close])
+            rest = rest[rest.index(after: close)...].drop { $0 == " " || $0 == "\t" }
+            guard rest.first == "=" else { return nil }
+            rest = rest.dropFirst()
+        } else {
+            guard let eq = rest.firstIndex(of: "=") else { return nil }
+            key = rest[..<eq].trimmingCharacters(in: .whitespaces)
+            rest = rest[rest.index(after: eq)...]
+        }
+        return (key, rest.trimmingCharacters(in: .whitespaces))
     }
 
     /// `key = """` ... `"""`: the text in between, verbatim, minus the newline
@@ -214,6 +231,34 @@ struct Config {
     var cleanupPrompt: String { string("cleanup", "prompt", "") }
     var cleanupInstructions: String { string("cleanup", "instructions", "") }
     var cleanupVocabulary: [String] { strings("cleanup", "vocabulary") }
+
+    // [replacements]
+    /// What the transcriber writes -> what it should say, longest first so
+    /// "click house" wins over "click".
+    var replacements: [(heard: String, written: String)] {
+        (raw["replacements"] ?? [:])
+            .compactMap { key, value in
+                let heard = key.trimmingCharacters(in: .whitespaces)
+                guard let written = value as? String, !heard.isEmpty else { return nil }
+                return (heard, written)
+            }
+            .sorted { $0.heard.count != $1.heard.count ? $0.heard.count > $1.heard.count : $0.heard < $1.heard }
+    }
+
+    /// The text with [replacements] applied: whole words, any case, and a
+    /// multi-word phrase matches across spaces or hyphens ("click-house").
+    func applyReplacements(_ text: String) -> String {
+        var text = text
+        for (heard, written) in replacements {
+            let words = heard.split { $0 == " " || $0 == "-" }.map { NSRegularExpression.escapedPattern(for: String($0)) }
+            guard !words.isEmpty, let regex = try? NSRegularExpression(
+                pattern: "(?<![\\p{L}\\p{N}])" + words.joined(separator: "[\\s-]+") + "(?![\\p{L}\\p{N}])",
+                options: [.caseInsensitive]) else { continue }
+            text = regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
+                                                  withTemplate: NSRegularExpression.escapedTemplate(for: written))
+        }
+        return text
+    }
     var cleanupTimeout: Double { double("cleanup", "timeout_seconds", 20) }
 
     static func load() -> Config {
@@ -233,8 +278,10 @@ struct Config {
     # butter-rec: local dictation + meeting recorder (no app, just this file).
     # Apply changes with `butter-cli rec reload`.
     #
-    # Hotkeys: modifiers (cmd, ctrl, alt/opt, shift) + one key, e.g. "ctrl+alt+space",
-    # "cmd+shift+d", "f13". Modifier-only hotkeys aren't supported.
+    # Hotkeys: modifiers (cmd, ctrl, alt/opt, shift, fn) + one key, e.g. "ctrl+alt+space",
+    # "cmd+shift+d", "f13", "fn+shift+tab"; or modifiers alone: fn, or two or more,
+    # e.g. "fn+shift" (fires once they're held a moment with no other key). fn and
+    # modifier-only hotkeys need Accessibility access. Caps Lock can't be used.
 
     [asr]
     engine = "parakeet"          # parakeet | canary | whisper
@@ -309,6 +356,13 @@ struct Config {
     # The whole prompt, if you want to replace it. {{text}} is the transcript,
     # {{vocabulary}} and {{instructions}} the settings above. Empty = built in.
     prompt = ""
+
+    [replacements]
+    # Words the transcriber gets wrong -> how to write them, applied to every
+    # dictation and meeting transcript (whole words, any case). Quote keys with
+    # spaces. Cleanup (✦) gets this list too, so it also fixes near misses.
+    # clinko = "Klinko"
+    # "click house" = "ClickHouse"
 
     """
 }

@@ -42,7 +42,8 @@ enum Cleanup {
         guard !trimmed.isEmpty else { return outcome(raw, "nothing to clean up") }
         do {
             let output = tidy(try invoke(prompt(for: trimmed, config: config), config: config))
-            if let problem = problem(raw: trimmed, cleaned: output, vocabulary: config.cleanupVocabulary) {
+            if let problem = problem(raw: trimmed, cleaned: output,
+                                     vocabulary: config.cleanupVocabulary + config.replacements.map(\.written)) {
                 return outcome(raw, problem)
             }
             log("cleanup: \(trimmed.count) -> \(output.count) chars in \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
@@ -54,7 +55,7 @@ enum Cleanup {
 
     static func prompt(for text: String, config: Config) -> String {
         let template = config.cleanupPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultPrompt : config.cleanupPrompt
-        let vocabulary = config.cleanupVocabulary
+        let vocabulary = spellings(config)
         let instructions = config.cleanupInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         var prompt = template
             .replacingOccurrences(of: "{{vocabulary}}", with: vocabulary.isEmpty ? "" : " Preferred spellings: \(vocabulary.joined(separator: ", ")).")
@@ -65,6 +66,24 @@ enum Cleanup {
             prompt += "\n\n\(text)"
         }
         return prompt
+    }
+
+    /// [cleanup] vocabulary plus the [replacements] targets, each with what the
+    /// transcriber writes instead, so the model also catches near misses
+    /// ("Clinco" when only "clinko" is listed).
+    static func spellings(_ config: Config) -> [String] {
+        var heardBy: [String: [String]] = [:]
+        var order: [String] = []
+        for (heard, written) in config.replacements.reversed() {
+            if heardBy[written] == nil { order.append(written) }
+            heardBy[written, default: []].append(heard)
+        }
+        var spellings = config.cleanupVocabulary.filter { word in !order.contains { $0.caseInsensitiveCompare(word) == .orderedSame } }
+        for written in order {
+            let heard = heardBy[written, default: []].map { "\"\($0)\"" }.joined(separator: ", ")
+            spellings.append("\(written) (often transcribed as \(heard))")
+        }
+        return spellings
     }
 
     private static func invoke(_ prompt: String, config: Config) throws -> String {

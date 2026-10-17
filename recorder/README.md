@@ -77,6 +77,30 @@ summarize_command = "ollama run llama3.2 'Summarize this meeting as notes with a
 
 `summarize_command` runs in a login shell with the transcript on stdin, and its stdout is saved as `summary.md`. Point it at a local model to keep everything on your machine.
 
+### Hotkeys
+
+A hotkey is any modifiers plus one key: `"cmd+shift+d"`, `"f13"`, `"fn+shift+tab"`. It can also be modifiers alone, either `fn` or two or more, such as `"fn+shift"`. This setup keeps everything on the left side of the keyboard:
+
+```toml
+[dictation]
+hotkey = "fn+shift"              # hold to talk
+hands_free_hotkey = "fn+shift+tab"
+```
+
+A modifier-only hotkey fires after its modifiers have been held for 0.15s with no other key pressed, so fn+shift+arrow still selects text. If you press a key after it has started, the dictation is cancelled. One exception: holding the dictation hotkey and then pressing the hands-free one switches the recording you're in to hands-free. fn and modifier-only hotkeys need Accessibility access, which paste already uses. Caps Lock can't be part of a hotkey. If the 🌐 key opens the emoji picker or switches input source, set System Settings › Keyboard › "Press 🌐 key to" to "Do Nothing".
+
+### Replacements
+
+Map words the transcriber gets wrong to how they should be written. This applies to every dictation and meeting transcript, matching whole words in any case:
+
+```toml
+[replacements]
+clinko = "Klinko"
+"click house" = "ClickHouse"     # quote keys with spaces; also matches "click-house"
+```
+
+[Cleanup](#cleanup) gets the list too ("Klinko, often transcribed as "clinko""), so it also catches near misses like "Clinco".
+
 ### Cleanup
 
 The hands-free pill has a ✦ button next to ■. It stops the recording, transcribes it, and rewrites the text with a model before pasting. The rewrite removes filler words and stutters, keeps only the correction when you correct yourself, and fixes misheard words, product names and punctuation:
@@ -102,7 +126,7 @@ If the model fails, times out (`timeout_seconds`), or returns something that isn
 
 ## How it fits together
 
-- `Sources/`: Swift daemon in a UI-less `.app` bundle (`LSUIElement`), so macOS can grant it permissions under its own identity. Carbon `RegisterEventHotKey` handles the hotkeys, so no Accessibility permission is needed just to listen. `AVAudioEngine` records the mic, a Core Audio process tap records system audio, and the CLI talks to the daemon over a unix socket (`~/.butter/rec.sock`).
+- `Sources/`: Swift daemon in a UI-less `.app` bundle (`LSUIElement`), so macOS can grant it permissions under its own identity. Carbon `RegisterEventHotKey` handles plain hotkeys without Accessibility. fn and modifier-only hotkeys use a `CGEventTap`. `AVAudioEngine` records the mic, a Core Audio process tap records system audio, and the CLI talks to the daemon over a unix socket (`~/.butter/rec.sock`).
 - `asr/worker.py`: speech recognition engines behind a JSON-lines protocol on stdin/stdout.
 - `butter-cli rec …` passes its arguments through to `~/.butter/bin/butter-rec`.
 
