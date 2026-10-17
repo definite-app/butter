@@ -7,16 +7,18 @@ Local dictation and meeting recording for Butter. Like Handy, it has push-to-tal
 | | Default shortcut | CLI |
 |---|---|---|
 | Dictate (push-to-talk) | hold `ctrl+opt+space`, release to paste | |
-| Dictate (hands-free) | `ctrl+opt+shift+space` to start | `butter-cli rec dictate start` |
+| Dictate (hands-free) | tap `ctrl+opt+space`, or `ctrl+opt+shift+space` | `butter-cli rec dictate start` |
+| ↳ record as a meeting instead | the pill's Dictate \| Meeting switch | `butter-cli rec dictate meeting` |
+| ↳ screenshot | `ctrl+opt+s` or 📷 (also during a meeting) | `butter-cli rec screenshot` |
 | ↳ stop and paste | the same shortcut again, the push-to-talk shortcut, or ■ | `butter-cli rec dictate stop` |
 | ↳ stop, [clean up](#cleanup), paste | ✦ | `butter-cli rec dictate stop --clean` |
 | ↳ cancel (nothing pasted) | `esc` or × | `butter-cli rec dictate cancel` |
 | Paste the last dictation again | `ctrl+opt+v` | `butter-cli rec last [--copy]` |
 | Meeting | `ctrl+opt+m` to start, again to stop | `butter-cli rec meeting start --title "Acme sync"` / `meeting stop --wait` |
 
-Holding the push-to-talk shortcut and then pressing the hands-free one switches the recording you're in to hands-free. `esc` is only taken from other apps while a hands-free session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
+A quick tap of the push-to-talk shortcut (let go within 0.4s, `tap_seconds`) keeps recording hands-free; `tap_for_hands_free = false` turns that off. Holding it and then pressing the hands-free shortcut also switches the recording you're in to hands-free. `esc` and the screenshot shortcut are only taken from other apps while a session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
 
-Meetings start only when you start them, with the shortcut or the CLI. Nothing watches for calls on its own. The exception is a hands-free session that turns out to be a call: it's also [saved as a meeting](#use).
+Meetings start only when you start them: with the meeting shortcut, the CLI, or the Meeting side of the hands-free pill's switch. Nothing watches for calls on its own. The exception is a hands-free session that turns out to be a call: it's also [saved as a meeting](#use). See [After a meeting](#after-a-meeting) for getting to the transcript.
 
 ### Change a shortcut
 
@@ -27,11 +29,12 @@ Edit `~/.config/butter/recorder.toml`, then run `butter-cli rec reload`. No rest
 hotkey = "fn+shift"                 # push-to-talk (default "ctrl+alt+space")
 hands_free_hotkey = "fn+shift+tab"  # default "ctrl+alt+shift+space"
 cancel_hotkey = "esc"               # cancels hands-free; "" turns it off
+screenshot_hotkey = "fn+shift+s"    # default "ctrl+alt+s"
 paste_last_hotkey = "ctrl+alt+v"
 mode = "push_to_talk"               # or "toggle": press to start, press again to stop
 
 [meeting]
-hotkey = "ctrl+alt+m"
+hotkey = "fn+shift+m"              # default "ctrl+alt+m"
 ```
 
 - A shortcut is any modifiers (`cmd`, `ctrl`, `alt`/`opt`, `shift`, `fn`) plus one key: a letter, a digit, `f1`–`f20`, `space`, `tab`, `return`, `esc`, `delete`, an arrow, `home`/`end`/`pageup`/`pagedown`, or punctuation (`/`, `;`, `` ` `` or `~`, …).
@@ -75,6 +78,8 @@ mic.wav           you            (16 kHz mono)
 system.wav        everyone else  (16 kHz mono)
 transcript.md     merged, speaker-labelled transcript
 transcript.json   segments with speaker + timestamps
+screenshots/      screenshots taken during it, linked from transcript.md
+notes.md          only after ✦ Notes
 summary.md        only if summarize_command is set
 ```
 
@@ -86,6 +91,26 @@ butter-cli rec transcript | claude -p "What did we commit to?"
 butter-cli rec process <id>          # re-transcribe, e.g. after switching engines
 butter-cli rec transcribe memo.m4a   # any audio file AVFoundation can read
 ```
+
+### After a meeting
+
+When you stop a meeting, the pill says "Transcribing meeting · 32 min" until the transcript is done, then "✓ Meeting ready" with:
+
+- **Open**: opens `notes.md` if there is one, else `transcript.md`, in your default Markdown app.
+- **Copy**: copies the same file's text.
+- **✦ Notes**: writes `notes.md` (summary, decisions, action items, key points, open questions) with the [cleanup](#cleanup) harness and `[meeting] notes_model` (default `sonnet`), then opens it. The whole transcript goes to the model. `butter-cli rec notes [<id>]` does the same.
+- **×**: dismisses it. It stays up until then, so you can come back to it after other work.
+
+Meetings are also in the pill's ⟲ history list, mixed in with dictations. Click one to open it, or hover to get Open, Copy and ✦ Notes.
+
+### Screenshots
+
+During hands-free dictation or a meeting, 📷 on the pill (or `screenshot_hotkey`) saves the whole screen under the mouse right away. The pill hides for the shot. A card with a thumbnail confirms it.
+
+- **Dictation:** saved in `~/.butter/dictation/screenshots/` (the newest 100 are kept). The file's path goes into the pasted text where you took it, so an agent like Claude Code reads the image.
+- **Meeting:** saved in the meeting's `screenshots/` folder and linked from `transcript.md` at the time you took it.
+
+The first screenshot asks for Screen Recording access for ButterRec (System Settings › Privacy & Security › Screen & System Audio Recording).
 
 ## Configure
 

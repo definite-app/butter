@@ -1,16 +1,23 @@
 import AppKit
 
 /// Small floating pill: live mic level while dictating, a soft wave while
-/// transcribing, and a timer with stop/cancel buttons for open-ended sessions
-/// (hands-free dictation, meetings). A non-activating panel, so clicking it
-/// never takes focus from the app the text will be pasted into.
+/// transcribing, and a timer with buttons for open-ended sessions (hands-free
+/// dictation, meetings). After a meeting it says when the transcript is ready.
+/// A non-activating panel, so clicking it never takes focus from the app the
+/// text will be pasted into.
 final class HUD {
     enum State {
         case recording(level: () -> Float)
+        /// Hands-free; `sessionMeeting` picks the Dictate or Meeting side of its switch.
         case handsFree(level: () -> Float, since: Date)
         case meeting(level: () -> Float, since: Date)
         case transcribing
-        case cleaning
+        /// A breathing ✦ and a label: "Cleaning up", "Writing notes".
+        case working(String)
+        /// A slow wave and a label, e.g. "Transcribing meeting · 32 min". Stays up.
+        case processing(String)
+        /// A meeting's transcript is ready: Open, Copy, ✦ Notes, ×. Stays until dismissed.
+        case ready(title: String, detail: String)
         case message(String)
         case error
     }
@@ -19,22 +26,44 @@ final class HUD {
     var onCancel: (() -> Void)?
     /// Stop, then clean up the transcript before pasting (hands-free only).
     var onCleanup: (() -> Void)?
+    /// The Dictate | Meeting switch: true = meeting.
+    var onMode: ((Bool) -> Void)?
+    var onScreenshot: (() -> Void)?
+    /// The ready pill's buttons.
+    var onOpen: (() -> Void)?
+    var onCopy: (() -> Void)?
+    var onNotes: (() -> Void)?
+    var onDismiss: (() -> Void)?
     var showCleanup: Bool {
         get { view.showCleanup }
         set { view.showCleanup = newValue }
     }
-    /// Recent dictations for the history list (newest first), and what to do when one is picked.
+    /// Which side of the hands-free switch is on.
+    var sessionMeeting: Bool {
+        get { view.sessionMeeting }
+        set { view.sessionMeeting = newValue; relayout() }
+    }
+    /// Screenshots taken this session (the badge on 📷).
+    var screenshotCount: Int {
+        get { view.screenshotCount }
+        set { view.screenshotCount = newValue; view.needsDisplay = true }
+    }
+    /// Recent dictations and meetings for the history list (newest first).
     var historyProvider: (() -> [HUDHistoryItem])?
+    /// A dictation row was clicked: copy its text.
     var onPickHistory: ((String) -> Void)?
+    /// A meeting row's Open, Copy or Notes.
+    var onMeetingAction: ((URL, HUDMeetingAction) -> Void)?
     var position = "bottom"
 
     private let panel: NSPanel
     private let view = HUDView()
     private var timer: Timer?
     private var hideWork: DispatchWorkItem?
+    private var cardWork: DispatchWorkItem?
 
     init() {
-        panel = NSPanel(contentRect: NSRect(origin: .zero, size: HUDView.size(for: .transcribing)),
+        panel = NSPanel(contentRect: NSRect(origin: .zero, size: NSSize(width: 112, height: 34)),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -45,28 +74,67 @@ final class HUD {
         panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.contentView = view
-        view.onStop = { [weak self] in self?.onStop?() }
-        view.onCancel = { [weak self] in self?.onCancel?() }
-        view.onCleanup = { [weak self] in self?.onCleanup?() }
+        view.onAction = { [weak self] action in self?.perform(action) }
+        view.onMeeting = { [weak self] dir, action in self?.onMeetingAction?(dir, action) }
         view.historyProvider = { [weak self] in self?.historyProvider?() ?? [] }
-        view.onPick = { [weak self] in self?.onPickHistory?($0) }
-        view.onLayoutChange = { [weak self] in
-            guard let self else { return }
-            self.place(self.view.totalSize)
-            self.view.needsDisplay = true
-        }
+        view.onLayoutChange = { [weak self] in self?.relayout() }
     }
 
     var isVisible: Bool { panel.isVisible }
+
+    private func perform(_ action: String) {
+        switch action {
+        case "stop": onStop?()
+        case "cancel": onCancel?()
+        case "cleanup": onCleanup?()
+        case "mode:dictate": onMode?(false)
+        case "mode:meeting": onMode?(true)
+        case "shot": onScreenshot?()
+        case "open": onOpen?()
+        case "copy": onCopy?()
+        case "notes": onNotes?()
+        case "dismiss": onDismiss?()
+        default:
+            if action.hasPrefix("pick:") { onPickHistory?(String(action.dropFirst(5))) }
+        }
+    }
+
+    private func relayout() {
+        guard panel.isVisible else { return }
+        place(view.totalSize)
+        view.needsDisplay = true
+    }
 
     /// Live transcript shown above the pill (below it when position = "top").
     func setCaption(_ text: String?) {
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
         view.caption = trimmed?.isEmpty == false ? trimmed : nil
         view.captionBelow = position == "top"
+        relayout()
+    }
+
+    /// A thumbnail card above the pill for a couple of seconds.
+    func flashScreenshot(_ image: NSImage?, title: String, detail: String) {
+        cardWork?.cancel()
+        view.card = HUDCard(image: image, title: title, detail: detail)
+        relayout()
+        let work = DispatchWorkItem { [weak self] in
+            self?.view.card = nil
+            self?.relayout()
+        }
+        cardWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+    }
+
+    /// Out of the way while a screenshot is taken, without the fade.
+    func suspend() {
         guard panel.isVisible else { return }
-        place(view.totalSize)
-        view.needsDisplay = true
+        panel.alphaValue = 0
+    }
+
+    func resume() {
+        guard panel.isVisible else { return }
+        panel.alphaValue = 1
     }
 
     func show(_ state: State) {
@@ -102,6 +170,7 @@ final class HUD {
                 guard let work = self.hideWork, !work.isCancelled else { return }
                 self.panel.orderOut(nil)
                 self.view.caption = nil
+                self.view.card = nil
                 self.timer?.invalidate()
                 self.timer = nil
                 self.hideWork = nil
@@ -121,9 +190,20 @@ final class HUD {
     }
 }
 
+enum HUDMeetingAction { case open, copy, notes }
+
 struct HUDHistoryItem {
     let text: String
     let at: Date?
+    /// Set for a meeting: its folder. `detail` is its length, e.g. "32 min".
+    var meeting: URL? = nil
+    var detail: String? = nil
+}
+
+private struct HUDCard {
+    let image: NSImage?
+    let title: String
+    let detail: String
 }
 
 private final class HUDView: NSView {
@@ -131,52 +211,86 @@ private final class HUDView: NSView {
     private static let surface = NSColor(srgbRed: 0.11, green: 0.106, blue: 0.098, alpha: 0.94)
     private static let errorColor = NSColor(srgbRed: 0.898, green: 0.451, blue: 0.373, alpha: 1)
     private static let text = NSColor(white: 0.9, alpha: 1)
+    private static let soft = NSColor(white: 0.78, alpha: 1)
     private static let muted = NSColor(white: 0.62, alpha: 1)
     private static let height: CGFloat = 34
     private static let barCount = 9
     private static let compactBars = 5
-
-    static func size(for state: HUD.State, cleanup: Bool = false) -> NSSize {
-        switch state {
-        case .handsFree: return NSSize(width: cleanup ? 256 : 226, height: height)
-        case .meeting: return NSSize(width: 170, height: height)
-        case .cleaning: return NSSize(width: 150, height: height)
-        case .message: return NSSize(width: 210, height: height)
-        default: return NSSize(width: 112, height: height)
-        }
-    }
+    private static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    private static let switchFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
 
     private static let captionWidth: CGFloat = 460
+    private static let cardWidth: CGFloat = 300
     private static let captionGap: CGFloat = 8
     private static let captionFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
 
     private static let rowHeight: CGFloat = 30
     private static let historyLimit = 6
 
-    var onStop: (() -> Void)?
-    var onCancel: (() -> Void)?
-    var onCleanup: (() -> Void)?
+    var onAction: ((String) -> Void)?
     var showCleanup = true
+    var sessionMeeting = false
+    var screenshotCount = 0
     var historyProvider: (() -> [HUDHistoryItem])?
-    var onPick: ((String) -> Void)?
     var onLayoutChange: (() -> Void)?
     /// Non-nil while the history list is open; it takes the caption's place.
     private var history: [HUDHistoryItem]?
-    private var historyButtonRect = NSRect.zero
-    private var rowRects: [NSRect] = []
-    /// The row just clicked; it shows "Copied" in place of its time for a moment.
-    private var copiedRow: Int?
+    /// What was just copied ("copy", "row3"); it reads "Copied" for a moment.
+    private var copied: String?
     var caption: String?
+    var card: HUDCard?
     var captionBelow = false
     private var state: HUD.State = .transcribing
     private var start = Date()
     private var levels = [CGFloat](repeating: 0, count: HUDView.barCount)
     private var hovered: String?
-    private var stopRect = NSRect.zero
-    private var cancelRect = NSRect.zero
-    private var cleanupRect = NSRect.zero
+    /// Clickable areas from the last draw, in view coordinates.
+    private var hits: [(rect: NSRect, id: String)] = []
 
-    private var pillSize: NSSize { Self.size(for: state, cleanup: showCleanup) }
+    private func width(_ s: String, _ font: NSFont = HUDView.labelFont) -> CGFloat {
+        ceil(NSAttributedString(string: s, attributes: [.font: font]).size().width)
+    }
+
+    /// The Dictate | Meeting switch.
+    private var switchSegments: [(id: String, label: String, width: CGFloat)] {
+        [("mode:dictate", "Dictate", width("Dictate", Self.switchFont) + 18),
+         ("mode:meeting", "Meeting", width("Meeting", Self.switchFont) + 18)]
+    }
+
+    private var switchWidth: CGFloat { switchSegments.reduce(6) { $0 + $1.width } }
+
+    /// Text buttons on the ready pill.
+    private let readyButtons: [(id: String, label: String)] = [("open", "Open"), ("copy", "Copy"), ("notes", "Notes")]
+
+    private func readyButtonWidth(_ button: (id: String, label: String)) -> CGFloat {
+        width(button.label) + (button.id == "notes" ? 34 : 22)
+    }
+
+    private var pillSize: NSSize {
+        let w: CGFloat
+        switch state {
+        case .handsFree:
+            // [ Dictate|Meeting  bars 0:42  ⟲ × 📷 ✦ ■ ] / [ Dictate|Meeting  ● 0:42  📷 × ■ ]
+            let time = width("00:00") + 8
+            let left = 5 + switchWidth + (sessionMeeting ? 14 + 9 + 9 : 12 + 31 + 10) + time
+            let buttons: CGFloat = sessionMeeting ? 3 : (showCleanup ? 5 : 4)
+            w = left + 12 + 26 + (buttons - 1) * 30 + 9
+        case .meeting:
+            w = 200
+        case let .working(label):
+            w = 14 + 8 + width(label) + 48
+        case let .processing(label):
+            w = 19 + 31 + 13 + width(label) + 19
+        case let .ready(title, detail):
+            let buttons = readyButtons.reduce(0) { $0 + readyButtonWidth($1) + 4 }
+            w = 17 + 12 + 8 + width(title) + 7 + width(detail) + 16 + buttons + 24 + 5
+        case let .message(message):
+            w = max(150, width(message) + 12 + 40)
+        default:
+            w = 112
+        }
+        return NSSize(width: ceil(w), height: Self.height)
+    }
 
     /// One or two lines, depending on how much text there is.
     private var captionHeight: CGFloat {
@@ -192,40 +306,41 @@ private final class HUDView: NSView {
         CGFloat(max(1, history?.count ?? 0)) * Self.rowHeight + 12
     }
 
-    /// The box above the pill: the history list when open, else the live caption.
-    private var upperHeight: CGFloat? {
-        if history != nil { return historyHeight }
-        return caption == nil ? nil : captionHeight
+    /// The box above the pill: the history list when open, else a screenshot card, else the live caption.
+    private var upper: (width: CGFloat, height: CGFloat)? {
+        if history != nil { return (Self.captionWidth, historyHeight) }
+        if card != nil { return (Self.cardWidth, 72) }
+        return caption == nil ? nil : (Self.captionWidth, captionHeight)
     }
 
     var totalSize: NSSize {
-        guard let upperHeight else { return pillSize }
-        return NSSize(width: max(pillSize.width, Self.captionWidth), height: pillSize.height + Self.captionGap + upperHeight)
+        guard let upper else { return pillSize }
+        return NSSize(width: max(pillSize.width, upper.width), height: pillSize.height + Self.captionGap + upper.height)
     }
 
     private var upperRect: NSRect {
-        let height = upperHeight ?? 0
-        return NSRect(x: (bounds.width - Self.captionWidth) / 2, y: captionBelow ? 0 : bounds.height - height,
-                      width: Self.captionWidth, height: height)
+        let size = upper ?? (0, 0)
+        return NSRect(x: ((bounds.width - size.width) / 2).rounded(), y: captionBelow ? 0 : bounds.height - size.height,
+                      width: size.width, height: size.height)
     }
 
     /// Where the pill sits inside the view.
     private var pillOrigin: NSPoint {
         let x = ((bounds.width - pillSize.width) / 2).rounded()
-        let y = upperHeight != nil && captionBelow ? bounds.height - pillSize.height : 0
+        let y = upper != nil && captionBelow ? bounds.height - pillSize.height : 0
         return NSPoint(x: x, y: y)
     }
 
     private func toggleHistory() {
         history = history == nil ? Array((historyProvider?() ?? []).prefix(Self.historyLimit)) : nil
         hovered = nil
-        copiedRow = nil
+        copied = nil
         onLayoutChange?()
     }
 
     var hasButtons: Bool {
         switch state {
-        case .handsFree, .meeting: return true
+        case .handsFree, .meeting, .ready: return true
         default: return false
         }
     }
@@ -246,14 +361,14 @@ private final class HUDView: NSView {
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways], owner: self))
     }
 
+    /// The most specific area under the point: a row's own buttons win over the row.
+    private func hit(_ p: NSPoint) -> String? {
+        hits.filter { $0.rect.contains(p) }.max { $0.id.count < $1.id.count }?.id
+    }
+
     override func mouseMoved(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        var next: String?
-        if stopRect.contains(p) { next = "stop" }
-        else if cancelRect.contains(p) { next = "cancel" }
-        else if cleanupRect.contains(p) { next = "cleanup" }
-        else if historyButtonRect.contains(p) { next = "history" }
-        else if let row = rowRects.firstIndex(where: { $0.contains(p) }) { next = "row\(row)" }
+        let next = hit(convert(event.locationInWindow, from: nil))
+        // Hovering a row's button keeps the row hovered too.
         if next != hovered { hovered = next; needsDisplay = true }
     }
 
@@ -262,27 +377,38 @@ private final class HUDView: NSView {
         needsDisplay = true
     }
 
-    override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        if stopRect.contains(p) {
-            onStop?()
-        } else if cancelRect.contains(p) {
-            onCancel?()
-        } else if cleanupRect.contains(p) {
-            onCleanup?()
-        } else if historyButtonRect.contains(p) {
-            toggleHistory()
-        } else if let row = rowRects.firstIndex(where: { $0.contains(p) }), let item = history?[row] {
-            onPick?(item.text)
-            copiedRow = row
-            needsDisplay = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                guard let self, self.copiedRow == row else { return }
-                self.copiedRow = nil
-                self.needsDisplay = true
-            }
+    private func flashCopied(_ id: String) {
+        copied = id
+        needsDisplay = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, self.copied == id else { return }
+            self.copied = nil
+            self.needsDisplay = true
         }
     }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let id = hit(convert(event.locationInWindow, from: nil)) else { return }
+        if id == "history" { toggleHistory(); return }
+        if id.hasPrefix("row") {
+            let parts = id.split(separator: ":")
+            guard let index = Int(parts[0].dropFirst(3)), let item = history?[index] else { return }
+            if let dir = item.meeting {
+                let action: HUDMeetingAction = parts.count > 1 ? (parts[1] == "copy" ? .copy : parts[1] == "notes" ? .notes : .open) : .open
+                if action == .copy { flashCopied("row\(index):copy") }
+                onMeeting?(dir, action)
+            } else {
+                onAction?("pick:" + item.text)
+                flashCopied("row\(index)")
+            }
+            return
+        }
+        if id == "copy" { flashCopied("copy") }
+        onAction?(id)
+    }
+
+    /// A meeting row's Open, Copy or Notes, with its folder.
+    var onMeeting: ((URL, HUDMeetingAction) -> Void)?
 
     func tick() {
         switch state {
@@ -298,20 +424,18 @@ private final class HUDView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        rowRects = []
-        if let history { drawHistory(history) } else if let caption { drawCaption(caption) }
+        hits = []
+        if let history { drawHistory(history) } else if let card { drawCard(card) } else if let caption { drawCaption(caption) }
         let origin = pillOrigin
+        let before = hits.count
         NSGraphicsContext.saveGraphicsState()
         let shift = NSAffineTransform()
         shift.translateX(by: origin.x, yBy: origin.y)
         shift.concat()
         drawPill(NSRect(origin: .zero, size: pillSize))
         NSGraphicsContext.restoreGraphicsState()
-        // Hit rects were computed in pill space.
-        stopRect = stopRect.offsetBy(dx: origin.x, dy: origin.y)
-        cancelRect = cancelRect.offsetBy(dx: origin.x, dy: origin.y)
-        cleanupRect = cleanupRect.offsetBy(dx: origin.x, dy: origin.y)
-        historyButtonRect = historyButtonRect.offsetBy(dx: origin.x, dy: origin.y)
+        // The pill's hit rects were computed in pill space.
+        for i in before..<hits.count { hits[i].rect = hits[i].rect.offsetBy(dx: origin.x, dy: origin.y) }
     }
 
     private func drawBox(_ rect: NSRect) {
@@ -323,7 +447,8 @@ private final class HUDView: NSView {
         box.stroke()
     }
 
-    /// Recent dictations, newest nearest the pill. Click one to copy it.
+    /// Recent dictations and meetings, newest nearest the pill. Click a dictation
+    /// to copy it; a meeting opens, and shows Open, Copy and Notes on hover.
     private func drawHistory(_ items: [HUDHistoryItem]) {
         let rect = upperRect
         drawBox(rect)
@@ -339,24 +464,50 @@ private final class HUDView: NSView {
             let slot = captionBelow ? i : items.count - 1 - i
             let row = NSRect(x: rect.minX + 6, y: rect.minY + 6 + CGFloat(slot) * Self.rowHeight,
                              width: rect.width - 12, height: Self.rowHeight)
-            rowRects.append(row)
-            let isHovered = hovered == "row\(i)"
+            let id = "row\(i)"
+            hits.append((row, id))
+            let isHovered = hovered == id || hovered?.hasPrefix(id + ":") == true
             if isHovered {
                 NSColor(white: 1, alpha: 0.07).setFill()
                 NSBezierPath(roundedRect: row, xRadius: 7, yRadius: 7).fill()
             }
-            let copied = copiedRow == i
-            let time = NSAttributedString(string: copied ? "Copied" : relativeTime(item.at), attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: copied ? .medium : .regular),
-                .foregroundColor: copied ? Self.butter : Self.muted,
-            ])
-            let timeSize = time.size()
-            time.draw(at: NSPoint(x: row.maxX - 10 - timeSize.width, y: row.midY - timeSize.height / 2))
+            var textX = row.minX + 8
+            var right = row.maxX - 10
+            if item.meeting != nil {
+                drawSymbol("person.2", in: NSRect(x: textX, y: row.midY - 8, width: 18, height: 16), size: 11,
+                           color: isHovered ? Self.text : Self.muted)
+                textX += 24
+                if isHovered {
+                    // Open · Copy · ✦ Notes, right to left.
+                    right = row.maxX - 4
+                    for (action, label) in [("notes", "Notes"), ("copy", "Copy"), ("open", "Open")] {
+                        let shown = copied == "\(id):copy" && action == "copy" ? "Copied" : label
+                        let w = width(shown, Self.switchFont) + (action == "notes" ? 30 : 18)
+                        let button = NSRect(x: right - w, y: row.midY - 11, width: w, height: 22)
+                        drawTextButton(shown, in: button, id: "\(id):\(action)", primary: action == "open",
+                                       sparkle: action == "notes", font: Self.switchFont)
+                        right = button.minX - 2
+                    }
+                    right -= 6
+                }
+            }
+            if item.meeting == nil || !isHovered {
+                let copiedNow = copied == id
+                var label = copiedNow ? "Copied" : relativeTime(item.at)
+                if let detail = item.detail, !copiedNow { label = "\(detail) · \(label)" }
+                let time = NSAttributedString(string: label, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: copiedNow ? .medium : .regular),
+                    .foregroundColor: copiedNow ? Self.butter : Self.muted,
+                ])
+                let timeSize = time.size()
+                time.draw(at: NSPoint(x: right - timeSize.width, y: row.midY - timeSize.height / 2))
+                right -= timeSize.width + 12
+            }
             let text = NSAttributedString(string: item.text.replacingOccurrences(of: "\n", with: " "), attributes: [
-                .font: Self.captionFont, .foregroundColor: isHovered ? Self.text : NSColor(white: 0.78, alpha: 1), .paragraphStyle: paragraph,
+                .font: Self.captionFont, .foregroundColor: isHovered ? Self.text : Self.soft, .paragraphStyle: paragraph,
             ])
             let textHeight = text.size().height
-            text.draw(with: NSRect(x: row.minX + 8, y: row.midY - textHeight / 2, width: row.width - 30 - timeSize.width, height: textHeight),
+            text.draw(with: NSRect(x: textX, y: row.midY - textHeight / 2, width: max(0, right - textX), height: textHeight),
                       options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
         }
     }
@@ -404,6 +555,30 @@ private final class HUDView: NSView {
         shown.draw(with: inner, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
+    /// "Screenshot 2 saved" with a thumbnail.
+    private func drawCard(_ card: HUDCard) {
+        let rect = upperRect
+        drawBox(rect)
+        let thumb = NSRect(x: rect.minX + 8, y: rect.midY - 28, width: 88, height: 56)
+        NSGraphicsContext.saveGraphicsState()
+        let clip = NSBezierPath(roundedRect: thumb, xRadius: 6, yRadius: 6)
+        clip.addClip()
+        NSColor(white: 1, alpha: 0.06).setFill()
+        clip.fill()
+        if let image = card.image, image.size.width > 0, image.size.height > 0 {
+            // Aspect fill.
+            let scale = max(thumb.width / image.size.width, thumb.height / image.size.height)
+            let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+            image.draw(in: NSRect(x: thumb.midX - size.width / 2, y: thumb.midY - size.height / 2, width: size.width, height: size.height))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let title = NSAttributedString(string: card.title, attributes: [.font: Self.labelFont, .foregroundColor: Self.text])
+        let detail = NSAttributedString(string: card.detail, attributes: [.font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: Self.muted])
+        let x = thumb.maxX + 10
+        title.draw(at: NSPoint(x: x, y: rect.midY + 1))
+        detail.draw(at: NSPoint(x: x, y: rect.midY - detail.size().height - 1))
+    }
+
     private var pill = NSRect.zero
 
     private func drawPill(_ bounds: NSRect) {
@@ -414,10 +589,6 @@ private final class HUDView: NSView {
         NSColor(white: 1, alpha: 0.08).setStroke()
         pill.lineWidth = 1
         pill.stroke()
-        stopRect = .zero
-        cancelRect = .zero
-        cleanupRect = .zero
-        historyButtonRect = .zero
 
         let t = Date().timeIntervalSince(start)
         switch state {
@@ -425,43 +596,75 @@ private final class HUDView: NSView {
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter) { i in levels[i] }
 
         case let .handsFree(_, since):
-            // [ bars  0:42  ⟲  ×  ✦  ■ ]  (✦ = stop and clean up)
-            drawBars(count: Self.compactBars, centerX: 36, color: Self.butter) { i in levels[Self.barCount - Self.compactBars + i] }
-            drawText(clock(since), at: 64, color: Self.text)
-            let extra: CGFloat = showCleanup ? 30 : 0
-            historyButtonRect = NSRect(x: bounds.maxX - 96 - extra, y: bounds.midY - 12, width: 24, height: 24)
-            cancelRect = NSRect(x: bounds.maxX - 66 - extra, y: bounds.midY - 12, width: 24, height: 24)
-            if showCleanup { cleanupRect = NSRect(x: bounds.maxX - 66, y: bounds.midY - 12, width: 24, height: 24) }
-            stopRect = NSRect(x: bounds.maxX - 36, y: bounds.midY - 13, width: 26, height: 26)
-            drawHistoryButton(historyButtonRect)
-            drawCancel(cancelRect)
-            if showCleanup { drawCleanupButton(cleanupRect) }
-            drawStop(stopRect)
+            // [ Dictate|Meeting  bars 0:42  ⟲ × 📷 ✦ ■ ]  (✦ = stop and clean up)
+            var x = drawSwitch(at: 5)
+            if sessionMeeting {
+                drawLevelDot(centerX: x + 14 + 4.5)
+                x += 14 + 9 + 9
+            } else {
+                x += 12
+                drawBars(count: Self.compactBars, centerX: x + 15.5, color: Self.butter) { i in levels[Self.barCount - Self.compactBars + i] }
+                x += 31 + 10
+            }
+            drawText(clock(since), at: x, color: Self.text)
+            var right = bounds.maxX - 9 - 26
+            drawStop(NSRect(x: right, y: bounds.midY - 13, width: 26, height: 26))
+            var icons: [String] = sessionMeeting ? ["shot", "cancel"] : ["history", "cancel", "shot"]
+            if !sessionMeeting && showCleanup { icons.append("cleanup") }
+            for id in icons.reversed() {
+                right -= 30
+                let rect = NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24)
+                switch id {
+                case "history": drawHistoryButton(rect)
+                case "cancel": drawCancel(rect)
+                case "shot": drawScreenshotButton(rect)
+                default: drawCleanupButton(rect)
+                }
+            }
 
         case let .meeting(_, since):
-            // [ ● 12:03  ■ ]  — the dot breathes with your mic level
-            let level = levels.last ?? 0
-            let r = 3.5 + 1.5 * level
-            Self.butter.withAlphaComponent(0.55 + 0.45 * level).setFill()
-            NSBezierPath(ovalIn: NSRect(x: 22 - r, y: bounds.midY - r, width: r * 2, height: r * 2)).fill()
+            // [ ● 12:03  📷 ■ ]  — the dot breathes with your mic level
+            drawLevelDot(centerX: 22)
             drawText(clock(since), at: 36, color: Self.text)
-            stopRect = NSRect(x: bounds.maxX - 36, y: bounds.midY - 13, width: 26, height: 26)
-            drawStop(stopRect)
+            drawStop(NSRect(x: bounds.maxX - 35, y: bounds.midY - 13, width: 26, height: 26))
+            drawScreenshotButton(NSRect(x: bounds.maxX - 65, y: bounds.midY - 12, width: 24, height: 24))
 
         case .transcribing:
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter.withAlphaComponent(0.55)) { i in
                 CGFloat(0.16 + 0.22 * (1 + sin(t * 7 - Double(i) * 0.7)) / 2)
             }
 
-        case .cleaning:
+        case let .working(text):
             // [ ✦ Cleaning up ]  — the sparkle breathes while the model works
-            let label = attributedString("Cleaning up", color: Self.text)
+            let label = attributedString(text, color: Self.text)
             let total = 14 + 8 + label.size().width
             let x = bounds.midX - total / 2
             let alpha = 0.55 + 0.45 * (1 + sin(t * 4)) / 2
             drawSymbol("sparkles", in: NSRect(x: x, y: bounds.midY - 7, width: 14, height: 14), size: 12,
                        color: Self.butter.withAlphaComponent(alpha))
             label.draw(at: NSPoint(x: x + 22, y: bounds.midY - label.size().height / 2))
+
+        case let .processing(text):
+            // [ ∿ Transcribing meeting · 32 min ]
+            drawBars(count: Self.compactBars, centerX: 19 + 15.5, color: Self.butter.withAlphaComponent(0.55)) { i in
+                CGFloat(0.16 + 0.22 * (1 + sin(t * 5 - Double(i) * 0.8)) / 2)
+            }
+            drawText(text, at: 19 + 31 + 13, color: Self.text)
+
+        case let .ready(title, detail):
+            // [ ✓ Meeting ready 32 min  Open Copy ✦Notes × ]
+            drawSymbol("checkmark", in: NSRect(x: 17, y: bounds.midY - 6, width: 12, height: 12), size: 11, color: Self.butter)
+            drawText(title, at: 37, color: Self.text)
+            drawText(detail, at: 37 + width(title) + 7, color: Self.muted)
+            var right = bounds.maxX - 5 - 24
+            drawCancel(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24), id: "dismiss")
+            for button in readyButtons.reversed() {
+                let label = copied == "copy" && button.id == "copy" ? "Copied" : button.label
+                let w = readyButtonWidth((button.id, label))
+                right -= w + 4
+                drawTextButton(label, in: NSRect(x: right, y: bounds.midY - 12, width: w, height: 24), id: button.id,
+                               primary: button.id == "open", sparkle: button.id == "notes", font: Self.labelFont)
+            }
 
         case .error:
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.errorColor) { _ in 0.1 }
@@ -475,16 +678,69 @@ private final class HUDView: NSView {
         }
     }
 
+    /// The Dictate | Meeting switch; returns its right edge.
+    private func drawSwitch(at x: CGFloat) -> CGFloat {
+        let track = NSRect(x: x, y: pill.midY - 12, width: switchWidth, height: 24)
+        NSColor(white: 1, alpha: 0.06).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 12, yRadius: 12).fill()
+        var sx = track.minX + 2
+        for segment in switchSegments {
+            let rect = NSRect(x: sx, y: track.minY + 2, width: segment.width, height: 20)
+            let active = (segment.id == "mode:meeting") == sessionMeeting
+            if active {
+                Self.butter.withAlphaComponent(0.16).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10).fill()
+            } else {
+                hits.append((rect, segment.id))
+                if hovered == segment.id {
+                    NSColor(white: 1, alpha: 0.08).setFill()
+                    NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10).fill()
+                }
+            }
+            let color = active ? Self.butter : hovered == segment.id ? Self.text : Self.muted
+            let label = NSAttributedString(string: segment.label, attributes: [.font: Self.switchFont, .foregroundColor: color])
+            let size = label.size()
+            label.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+            sx += segment.width + 2
+        }
+        return track.maxX
+    }
+
+    private func drawLevelDot(centerX: CGFloat) {
+        let level = levels.last ?? 0
+        let r = 3.5 + 1.5 * level
+        Self.butter.withAlphaComponent(0.55 + 0.45 * level).setFill()
+        NSBezierPath(ovalIn: NSRect(x: centerX - r, y: pill.midY - r, width: r * 2, height: r * 2)).fill()
+    }
+
+    private func drawTextButton(_ text: String, in rect: NSRect, id: String, primary: Bool, sparkle: Bool, font: NSFont) {
+        hits.append((rect, id))
+        let hover = hovered == id
+        if primary {
+            Self.butter.withAlphaComponent(hover ? 0.28 : 0.16).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
+        } else if hover {
+            NSColor(white: 1, alpha: 0.1).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
+        }
+        let color = primary || text == "Copied" ? Self.butter : hover ? Self.text : Self.soft
+        let label = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color])
+        let size = label.size()
+        var x = rect.midX - size.width / 2
+        if sparkle {
+            x += 7
+            drawSymbol("sparkles", in: NSRect(x: x - 16, y: rect.midY - 6, width: 12, height: 12), size: 10.5, color: Self.butter)
+        }
+        label.draw(at: NSPoint(x: x, y: rect.midY - size.height / 2))
+    }
+
     private func clock(_ since: Date) -> String {
         let s = Int(Date().timeIntervalSince(since))
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
     }
 
     private func attributedString(_ string: String, color: NSColor) -> NSAttributedString {
-        NSAttributedString(string: string, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: color,
-        ])
+        NSAttributedString(string: string, attributes: [.font: Self.labelFont, .foregroundColor: color])
     }
 
     private func drawText(_ string: String, at x: CGFloat, color: NSColor) {
@@ -493,6 +749,7 @@ private final class HUDView: NSView {
     }
 
     private func drawStop(_ rect: NSRect) {
+        hits.append((rect, "stop"))
         (hovered == "stop" ? Self.butter : Self.butter.withAlphaComponent(0.16)).setFill()
         NSBezierPath(ovalIn: rect).fill()
         (hovered == "stop" ? Self.surface : Self.butter).setFill()
@@ -501,27 +758,45 @@ private final class HUDView: NSView {
     }
 
     private func drawHistoryButton(_ rect: NSRect) {
+        hits.append((rect, "history"))
         let open = history != nil
         if open || hovered == "history" {
             (open ? Self.butter.withAlphaComponent(0.16) : NSColor(white: 1, alpha: 0.1)).setFill()
             NSBezierPath(ovalIn: rect).fill()
         }
         let color = open ? Self.butter : hovered == "history" ? Self.text : Self.muted
-        let config = NSImage.SymbolConfiguration(pointSize: 11.5, weight: .medium)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-        guard let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "History")?
-            .withSymbolConfiguration(config) else { return }
-        let size = image.size
-        image.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height))
+        drawSymbol("clock.arrow.circlepath", in: rect, size: 11.5, color: color)
     }
 
     private func drawCleanupButton(_ rect: NSRect) {
+        hits.append((rect, "cleanup"))
         let hover = hovered == "cleanup"
         if hover {
             Self.butter.withAlphaComponent(0.16).setFill()
             NSBezierPath(ovalIn: rect).fill()
         }
         drawSymbol("sparkles", in: rect, size: 11.5, color: hover ? Self.butter : Self.butter.withAlphaComponent(0.75))
+    }
+
+    /// 📷, with a count once screenshots have been taken.
+    private func drawScreenshotButton(_ rect: NSRect) {
+        hits.append((rect, "shot"))
+        let hover = hovered == "shot"
+        if hover {
+            NSColor(white: 1, alpha: 0.1).setFill()
+            NSBezierPath(ovalIn: rect).fill()
+        }
+        let taken = screenshotCount > 0
+        drawSymbol("camera", in: rect, size: 11, color: taken ? Self.butter : hover ? Self.text : Self.muted)
+        guard taken else { return }
+        let count = NSAttributedString(string: "\(screenshotCount)", attributes: [
+            .font: NSFont.systemFont(ofSize: 9, weight: .bold), .foregroundColor: Self.surface.withAlphaComponent(1),
+        ])
+        let size = count.size()
+        let badge = NSRect(x: rect.maxX - 11, y: rect.maxY - 11, width: max(12, size.width + 6), height: 12)
+        Self.butter.setFill()
+        NSBezierPath(roundedRect: badge, xRadius: 6, yRadius: 6).fill()
+        count.draw(at: NSPoint(x: badge.midX - size.width / 2, y: badge.midY - size.height / 2))
     }
 
     private func drawSymbol(_ name: String, in rect: NSRect, size: CGFloat, color: NSColor) {
@@ -532,8 +807,9 @@ private final class HUDView: NSView {
         image.draw(in: NSRect(x: rect.midX - s.width / 2, y: rect.midY - s.height / 2, width: s.width, height: s.height))
     }
 
-    private func drawCancel(_ rect: NSRect) {
-        if hovered == "cancel" {
+    private func drawCancel(_ rect: NSRect, id: String = "cancel") {
+        hits.append((rect, id))
+        if hovered == id {
             NSColor(white: 1, alpha: 0.1).setFill()
             NSBezierPath(ovalIn: rect).fill()
         }
@@ -545,7 +821,7 @@ private final class HUDView: NSView {
         path.line(to: NSPoint(x: rect.midX + d, y: rect.midY - d))
         path.lineWidth = 1.6
         path.lineCapStyle = .round
-        (hovered == "cancel" ? Self.text : Self.muted).setStroke()
+        (hovered == id ? Self.text : Self.muted).setStroke()
         path.stroke()
     }
 

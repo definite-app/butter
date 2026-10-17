@@ -12,6 +12,13 @@ struct MeetingMeta {
     }
     var startedAt: Date? { parseISO(dict["started_at"] as? String) }
     var duration: Double { (dict["duration"] as? NSNumber)?.doubleValue ?? 0 }
+    /// Screenshots taken during it: a path relative to the folder and seconds from the start.
+    var screenshots: [(file: String, at: Double)] {
+        (dict["screenshots"] as? [[String: Any]] ?? []).compactMap { entry in
+            guard let file = entry["file"] as? String else { return nil }
+            return (file, (entry["at"] as? NSNumber)?.doubleValue ?? 0)
+        }
+    }
 
     static func load(_ dir: URL) -> MeetingMeta? {
         guard let data = try? Data(contentsOf: dir.appendingPathComponent("meeting.json")),
@@ -71,6 +78,49 @@ enum Meetings {
         }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Copies screenshots into the meeting's `screenshots/` folder and lists them
+    /// in meeting.json with their time from the start of the meeting.
+    static func addScreenshots(_ shots: [(url: URL, at: Double)], to dir: URL) {
+        guard !shots.isEmpty else { return }
+        let folder = dir.appendingPathComponent("screenshots")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var entries: [[String: Any]] = []
+        for shot in shots {
+            let target = folder.appendingPathComponent(shot.url.lastPathComponent)
+            if shot.url.deletingLastPathComponent().standardizedFileURL != folder.standardizedFileURL {
+                do {
+                    try FileManager.default.copyItem(at: shot.url, to: target)
+                } catch {
+                    log("meeting: couldn't copy \(shot.url.lastPathComponent): \(error)")
+                    continue
+                }
+            }
+            entries.append(["file": "screenshots/\(target.lastPathComponent)", "at": shot.at])
+        }
+        MeetingMeta.update(dir) { meta in
+            meta.dict["screenshots"] = (meta.dict["screenshots"] as? [[String: Any]] ?? []) + entries
+        }
+    }
+
+    /// A meeting from a hands-free session's mic recording alone (system audio
+    /// wasn't recorded), so switching to Meeting always leaves a meeting.
+    static func saveMicOnly(mic: WavSink, origin: Date, title: String, _ config: Config) -> URL? {
+        do {
+            let dir = try newDirectory(title: title, config)
+            try FileManager.default.copyItem(at: mic.url, to: dir.appendingPathComponent("mic.wav"))
+            let ended = Date()
+            MeetingMeta(dict: [
+                "id": dir.lastPathComponent, "title": title, "started_at": isoString(origin), "ended_at": isoString(ended),
+                "duration": ended.timeIntervalSince(origin), "status": "recorded", "system_audio": false, "source": "hands_free",
+                "mic_offset": mic.firstWriteAt.map { $0.timeIntervalSince(origin) } ?? 0, "warnings": [] as [String],
+            ]).save(dir)
+            return dir
+        } catch {
+            log("meeting: couldn't save the recording: \(error)")
+            return nil
+        }
     }
 }
 
@@ -162,13 +212,14 @@ final class CallCapture {
     }
 
     /// Stops recording. Keeps the folder as a meeting (returned, ready to process)
-    /// when the session ran at least `minSeconds` and the Mac played something.
-    func finish(mic: WavSink, minSeconds: Double) -> URL? {
+    /// when the session ran at least `minSeconds` and the Mac played something,
+    /// or always with `title` (the session was switched to Meeting).
+    func finish(mic: WavSink, minSeconds: Double, title: String? = nil) -> URL? {
         system.stop()
         sink.close()
         let ended = Date()
         let duration = ended.timeIntervalSince(origin)
-        guard duration >= minSeconds, sink.peak >= 0.001 else {
+        guard title != nil || (duration >= minSeconds && sink.peak >= 0.001) else {
             log("hands-free: no call audio kept (\(formatDuration(duration)), peak \(String(format: "%.4f", sink.peak)))")
             discard()
             return nil
@@ -186,6 +237,7 @@ final class CallCapture {
             meta.dict["duration"] = duration
             meta.dict["mic_offset"] = mic.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
             meta.dict["system_offset"] = sink.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
+            if let title { meta.dict["title"] = title }
             meta.status = "recorded"
         }
         log("hands-free: saved the call as meeting \(dir.lastPathComponent) (\(formatDuration(duration)))")
@@ -293,7 +345,19 @@ enum MeetingProcessor {
             if !paragraph.isEmpty { lines.append(paragraph.joined(separator: " ")); lines.append("") }
             paragraph.removeAll()
         }
+        // Screenshots go between what was said before and after them.
+        var shots = meta.screenshots.sorted { $0.at < $1.at }[...]
+        func placeShots(before time: Double) {
+            while let shot = shots.first, shot.at <= time {
+                shots.removeFirst()
+                flush()
+                lines.append("![Screenshot \(formatClock(shot.at))](\(shot.file))")
+                lines.append("")
+                currentSpeaker = nil
+            }
+        }
         for item in segments {
+            placeShots(before: item.segment.start)
             if item.speaker != currentSpeaker {
                 flush()
                 currentSpeaker = item.speaker
@@ -301,7 +365,55 @@ enum MeetingProcessor {
             }
             paragraph.append(item.segment.text)
         }
+        placeShots(before: .infinity)
         flush()
         return lines.joined(separator: "\n")
+    }
+}
+
+/// ✦ Notes: meeting notes from the transcript, written by the [cleanup] harness
+/// with [meeting] notes_model, saved as notes.md beside the transcript.
+enum MeetingNotes {
+    static let defaultPrompt = """
+    Write notes for this meeting from its transcript below. "Me" is the person who recorded it; "Them" is everyone else on the call (the transcript can't tell those people apart).
+
+    Use Markdown with these sections, leaving out any that would be empty:
+    # A short title for the meeting
+    ## Summary (2-4 sentences)
+    ## Decisions
+    ## Action items, as "- [ ] Who: what" (Me, Them, or a name if one was said)
+    ## Key points
+    ## Open questions
+
+    Keep a screenshot link (![...](...)) under the point it illustrates when it matters.
+    Use only what's in the transcript: don't invent names, numbers or dates. Fix words the transcriber clearly misheard.{{vocabulary}}
+    Output only the notes.
+
+    <transcript>
+    {{transcript}}
+    </transcript>
+    """
+
+    static func write(dir: URL, config: Config) throws -> URL {
+        let transcriptURL = dir.appendingPathComponent("transcript.md")
+        guard let transcript = try? String(contentsOf: transcriptURL, encoding: .utf8) else {
+            throw CLIError("\(dir.lastPathComponent) has no transcript yet")
+        }
+        let template = config.notesPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultPrompt : config.notesPrompt
+        let spellings = Cleanup.spellings(config)
+        let prompt = template
+            .replacingOccurrences(of: "{{vocabulary}}", with: spellings.isEmpty ? "" : " Preferred spellings: \(spellings.joined(separator: ", ")).")
+            .replacingOccurrences(of: "{{transcript}}", with: transcript)
+        let started = Date()
+        log("meeting \(dir.lastPathComponent): writing notes with \(config.cleanupHarness) (\(config.notesModel))")
+        var notes = try Cleanup.invoke(prompt, config: config, model: config.notesModel,
+                                       systemPrompt: "You write meeting notes in Markdown. Output only the notes.", baseTimeout: 60)
+        notes = notes.components(separatedBy: "\n").filter { !$0.hasPrefix("```") }.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !notes.isEmpty else { throw CLIError("the notes came back empty") }
+        let url = dir.appendingPathComponent("notes.md")
+        try (notes + "\n").write(to: url, atomically: true, encoding: .utf8)
+        log("meeting \(dir.lastPathComponent): notes written in \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
+        return url
     }
 }
