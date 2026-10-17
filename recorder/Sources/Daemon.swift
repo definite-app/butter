@@ -114,6 +114,13 @@ final class Daemon {
     private var stopOnRelease = false
     /// cancel_hotkey (Esc), registered only while a hands-free session runs.
     private var cancelHotkeyID: UInt32?
+    /// screenshot_hotkey, registered only while a hands-free session or a meeting runs.
+    private var screenshotHotkeyID: UInt32?
+    /// The hands-free session was switched to Meeting: it's saved as a meeting and nothing is pasted.
+    private var dictationAsMeeting = false
+    /// Screenshots taken this session, with seconds since the hotkey.
+    private var sessionShots: [(url: URL, at: Double)] = []
+    private var callCaptureStarting = false
     private var previewTimer: Timer?
     private var previewInFlight = false
     private let hud = HUD()
@@ -121,6 +128,14 @@ final class Daemon {
 
     // Meeting
     private var meeting: MeetingRecording?
+    private var meetingShots = 0
+    /// Meetings that say on the pill when their transcript is ready.
+    private var announced: Set<String> = []
+    /// The meeting being transcribed for the pill ("Transcribing meeting · 32 min").
+    private var processingPill: (id: String, label: String)?
+    /// A finished meeting on the ready pill, until dismissed.
+    private var readyMeeting: URL?
+    private var notesInFlight: Set<String> = []
 
     init() {
         worker = ASRWorker(idleMinutes: config.idleUnloadMinutes)
@@ -136,12 +151,25 @@ final class Daemon {
         hud.onCancel = { [unowned self] in _ = self.cancelDictation() }
         hud.onCleanup = { [unowned self] in _ = self.stopDictation(cleanup: true) }
         hud.showCleanup = config.cleanupButton
-        hud.historyProvider = {
-            DictationHistory.recent(limit: 6).compactMap { entry in
-                (entry["text"] as? String).map { HUDHistoryItem(text: $0, at: parseISO(entry["at"] as? String)) }
+        hud.onMode = { [unowned self] meeting in self.setSessionMeeting(meeting) }
+        hud.onScreenshot = { [unowned self] in self.takeScreenshot() }
+        hud.onOpen = { [unowned self] in
+            guard let dir = self.readyMeeting else { return }
+            self.openMeeting(dir)
+            self.dismissReady()
+        }
+        hud.onCopy = { [unowned self] in if let dir = self.readyMeeting { self.copyMeeting(dir) } }
+        hud.onNotes = { [unowned self] in if let dir = self.readyMeeting { self.writeNotes(dir) } }
+        hud.onDismiss = { [unowned self] in self.dismissReady() }
+        hud.historyProvider = { [unowned self] in self.historyItems() }
+        hud.onPickHistory = { [unowned self] text in self.setClipboard(text) }
+        hud.onMeetingAction = { [unowned self] dir, action in
+            switch action {
+            case .open: self.openMeeting(dir)
+            case .copy: self.copyMeeting(dir)
+            case .notes: self.writeNotes(dir)
             }
         }
-        hud.onPickHistory = { [unowned self] text in self.setClipboard(text) }
         hotkeys.install()
         registerHotkeys()
         requestPermissions()
@@ -158,7 +186,7 @@ final class Daemon {
         dictationSink?.close()
         if let callCapture, let sink = dictationSink {
             // Saved as "recorded"; the next daemon start transcribes it.
-            _ = callCapture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds)
+            _ = callCapture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds, title: dictationAsMeeting ? "Meeting" : nil)
         }
         worker.stop(reason: "shutdown")
         unlink(Paths.socket.path)
@@ -169,6 +197,7 @@ final class Daemon {
     private func registerHotkeys() {
         hotkeys.unregisterAll()
         cancelHotkeyID = nil
+        screenshotHotkeyID = nil
         hotkeyErrors.removeAll()
         let bindings: [(String, String, HotkeyManager.Handler)] = [
             ("dictation", config.dictationHotkey, { [unowned self] event in self.dictationHotkey(event) }),
@@ -184,23 +213,31 @@ final class Daemon {
                 log("hotkey \(name): \(error)")
             }
         }
-        updateCancelHotkey()
+        updateSessionHotkeys()
     }
 
-    /// Esc cancels hands-free, so it's only taken from other apps while a session runs.
-    private func updateCancelHotkey() {
-        let wanted = dictationMic != nil && dictationHandsFree && !config.cancelHotkey.isEmpty
-        if wanted, cancelHotkeyID == nil {
+    /// Esc (cancel) and the screenshot hotkey only matter during a session, so
+    /// they're only taken from other apps while one runs.
+    private func updateSessionHotkeys() {
+        let handsFree = dictationMic != nil && dictationHandsFree
+        sessionHotkey(&cancelHotkeyID, "cancel", config.cancelHotkey, wanted: handsFree) { [unowned self] in
+            if self.dictationHandsFree { _ = self.cancelDictation() }
+        }
+        sessionHotkey(&screenshotHotkeyID, "screenshot", config.screenshotHotkey, wanted: handsFree || meeting != nil) { [unowned self] in
+            self.takeScreenshot()
+        }
+    }
+
+    private func sessionHotkey(_ id: inout UInt32?, _ name: String, _ text: String, wanted: Bool, action: @escaping () -> Void) {
+        if wanted, !text.isEmpty, id == nil {
             do {
-                cancelHotkeyID = try hotkeys.register(try HotkeySpec.parse(config.cancelHotkey)) { [unowned self] event in
-                    if event == .pressed, self.dictationHandsFree { _ = self.cancelDictation() }
-                }
+                id = try hotkeys.register(try HotkeySpec.parse(text)) { event in if event == .pressed { action() } }
             } catch {
-                log("hotkey cancel: \(error)")
+                log("hotkey \(name): \(error)")
             }
-        } else if !wanted, let id = cancelHotkeyID {
-            hotkeys.unregister(id)
-            cancelHotkeyID = nil
+        } else if !wanted, let registered = id {
+            hotkeys.unregister(registered)
+            id = nil
         }
     }
 
@@ -247,10 +284,16 @@ final class Daemon {
             _ = config.dictationMode == "toggle" ? toggleDictation() : startDictation(handsFree: false)
             heldSession = idle && dictationMic != nil ? dictationSession : nil
         case .released:
+            // A quick tap (let go within tap_seconds) keeps recording hands-free.
+            let tapped = heldSession != nil && heldSession == dictationSession && dictationMic != nil && !dictationHandsFree
+                && config.dictationMode != "toggle" && config.tapForHandsFree
+                && Date().timeIntervalSince(dictationPressedAt ?? .distantPast) < config.tapSeconds
             heldSession = nil
             if stopOnRelease {
                 stopOnRelease = false
                 _ = stopDictation()
+            } else if tapped {
+                switchToHandsFree()
             } else if !dictationHandsFree && config.dictationMode != "toggle" {
                 _ = stopDictation()
             }
@@ -278,10 +321,27 @@ final class Daemon {
         guard let mic = dictationMic, !dictationHandsFree else { return }
         let since = dictationPressedAt ?? Date()
         dictationHandsFree = true
-        updateCancelHotkey()
+        updateSessionHotkeys()
         if config.hud { hud.show(.handsFree(level: { mic.level }, since: since)) }
         startCallCapture(origin: since)
         log("dictation: switched to hands-free")
+    }
+
+    /// The pill's Dictate | Meeting switch. Meeting keeps recording (both sides)
+    /// and saves it as a meeting on stop instead of pasting; Dictate goes back.
+    private func setSessionMeeting(_ on: Bool) {
+        guard dictationMic != nil, dictationHandsFree, on != dictationAsMeeting else { return }
+        dictationAsMeeting = on
+        hud.sessionMeeting = on
+        if on {
+            previewTimer?.invalidate()
+            previewTimer = nil
+            hud.setCaption(nil)
+            startCallCapture(origin: dictationPressedAt ?? Date(), force: true)
+        } else if config.livePreview && config.hud {
+            schedulePreview(session: dictationSession)
+        }
+        log("dictation: switched to \(on ? "meeting" : "dictation")")
     }
 
     private func toggleDictation() -> [String: Any] {
@@ -291,6 +351,10 @@ final class Daemon {
     private func startDictation(handsFree: Bool) -> [String: Any] {
         guard dictationMic == nil else { return ["ok": false, "error": "dictation already running"] }
         let pressedAt = Date()
+        dictationAsMeeting = false
+        sessionShots = []
+        hud.sessionMeeting = false
+        hud.screenshotCount = 0
         let mic = MicRecorder()
         // The pill goes up before anything else so the keystroke feels instant.
         if config.hud {
@@ -309,7 +373,7 @@ final class Daemon {
             dictationMic = mic
             dictationSink = sink
             dictationStartedAt = Date()
-            updateCancelHotkey()
+            updateSessionHotkeys()
             // Load the model while the user is still talking.
             worker.preload(engine: config.engine, model: config.model)
             if config.livePreview && config.hud { schedulePreview(session: dictationSession) }
@@ -327,8 +391,11 @@ final class Daemon {
     /// A meeting already records system audio; otherwise catch the other side
     /// in case this hands-free session is really a call. Setting up the tap
     /// takes ~0.3-0.5s, so it happens off the main thread.
-    private func startCallCapture(origin: Date) {
-        guard config.handsFreeCallAudio && meeting == nil && callCapture == nil else { return }
+    /// `force`: the session was switched to Meeting, so record the other side even
+    /// with hands_free_call_audio off.
+    private func startCallCapture(origin: Date, force: Bool = false) {
+        guard config.handsFreeCallAudio || force, meeting == nil, callCapture == nil, !callCaptureStarting else { return }
+        callCaptureStarting = true
         let session = dictationSession, config = self.config
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let t0 = Date()
@@ -341,6 +408,7 @@ final class Daemon {
                 log("hands-free: not recording system audio: \(error)")
             }
             DispatchQueue.main.async {
+                self?.callCaptureStarting = false
                 // Stopped or cancelled while the tap was starting.
                 guard let self, session == self.dictationSession, self.dictationMic != nil else { capture?.discard(); return }
                 self.callCapture = capture
@@ -370,13 +438,36 @@ final class Daemon {
         mic.stop()
         sink.close()
         let held = Date().timeIntervalSince(dictationStartedAt ?? Date())
+        let pressedAt = dictationPressedAt ?? Date()
+        let shots = sessionShots
+        if dictationAsMeeting {
+            // Switched to Meeting: keep both sides as a meeting, whatever its length, and paste nothing.
+            let dir = callCapture?.finish(mic: sink, minSeconds: 0, title: "Meeting")
+                ?? Meetings.saveMicOnly(mic: sink, origin: pressedAt, title: "Meeting", config)
+            callCapture = nil
+            endDictationState()
+            guard let dir else {
+                sound(config.errorSound)
+                showError()
+                return ["ok": false, "error": "couldn't save the meeting"]
+            }
+            sound(config.stopSound)
+            Meetings.addScreenshots(shots, to: dir)
+            announce(dir)
+            return ["ok": true, "meeting": dir.lastPathComponent, "dir": dir.path]
+        }
         var callMeeting: String?
         if let capture = callCapture, let dir = capture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds) {
             callMeeting = dir.lastPathComponent
+            Meetings.addScreenshots(shots, to: dir)
             enqueueProcessing(dir)
         }
         callCapture = nil
         endDictationState()
+        // Screenshot paths go into the text where they were taken (segment times
+        // count from the first audio, not the hotkey).
+        let audioStart = sink.firstWriteAt.map { $0.timeIntervalSince(pressedAt) } ?? 0
+        let inserts = shots.map { (at: max(0, $0.at - audioStart), text: $0.url.path) }
         guard held >= 0.3, sink.seconds > 0.2 else {
             restoreHUD()
             return ["ok": true, "dictation": "discarded (too short)"]
@@ -387,7 +478,9 @@ final class Daemon {
         // Segments carry the timestamps that turn pauses into paragraph breaks.
         worker.transcribe(audio: sink.url, engine: config.engine, model: config.model, language: config.language,
                           prompt: config.prompt, segments: true, vad: false) { [weak self] result in
-            DispatchQueue.main.async { self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup, meeting: callMeeting) }
+            DispatchQueue.main.async {
+                self?.finishDictation(result, audioSeconds: sink.seconds, cleanup: cleanup, meeting: callMeeting, inserts: inserts)
+            }
         }
         return ["ok": true, "dictation": "transcribing", "seconds": sink.seconds, "cleanup": cleanup, "meeting": callMeeting ?? NSNull()]
     }
@@ -398,7 +491,8 @@ final class Daemon {
         dictationStartedAt = nil
         dictationHandsFree = false
         stopOnRelease = false
-        updateCancelHotkey()
+        dictationAsMeeting = false
+        updateSessionHotkeys()
         dictationSession += 1  // invalidates in-flight previews
         previewTimer?.invalidate()
         previewTimer = nil
@@ -415,7 +509,7 @@ final class Daemon {
     }
 
     private func runPreview(session: Int) {
-        guard session == dictationSession, !previewInFlight, let sink = dictationSink, sink.seconds > 0.6 else { return }
+        guard session == dictationSession, !dictationAsMeeting, !previewInFlight, let sink = dictationSink, sink.seconds > 0.6 else { return }
         let url = Paths.dictationDir.appendingPathComponent("preview.wav")
         guard sink.writeTail(seconds: 20, to: url) else { return }
         previewInFlight = true
@@ -431,21 +525,26 @@ final class Daemon {
         }
     }
 
-    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double, cleanup: Bool, meeting: String?) {
+    private func finishDictation(_ result: Result<Transcription, CLIError>, audioSeconds: Double, cleanup: Bool, meeting: String?,
+                                 inserts: [(at: Double, text: String)] = []) {
         switch result {
         case let .failure(error):
             sound(config.errorSound)
             if dictationMic == nil { showError() }
             log("dictation failed: \(error)")
         case let .success(transcription):
-            let text = config.applyReplacements(transcription.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords))
+            // Replacements go on the words before screenshot paths join them.
+            var replaced = transcription
+            replaced.text = config.applyReplacements(transcription.text)
+            replaced.segments = transcription.segments.map { var s = $0; s.text = config.applyReplacements(s.text); return s }
+            let text = replaced.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords, inserts: inserts)
             log("dictation: \(String(format: "%.1f", audioSeconds))s audio -> \(text.count) chars in \(String(format: "%.2f", transcription.elapsed))s")
             guard cleanup, !text.isEmpty else {
                 deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil, meeting: meeting)
                 return
             }
             if config.hud && dictationMic == nil {
-                hud.show(.cleaning)
+                hud.show(.working("Cleaning up"))
                 hud.setCaption(text)
             }
             let config = self.config
@@ -497,7 +596,12 @@ final class Daemon {
         guard config.hud else { return }
         hud.setCaption(nil)
         if let meeting {
+            hud.screenshotCount = meetingShots
             hud.show(.meeting(level: { [weak meeting] in meeting?.micLevel ?? 0 }, since: meeting.startedAt))
+        } else if let processingPill {
+            hud.show(.processing(processingPill.label))
+        } else if let readyMeeting {
+            hud.show(.ready(title: "Meeting ready", detail: Self.minutes(MeetingMeta.load(readyMeeting)?.duration ?? 0)))
         } else {
             hud.hide()
         }
@@ -573,6 +677,8 @@ final class Daemon {
             let recording = try MeetingRecording(dir: dir, title: title ?? "Meeting", systemAudio: config.systemAudio,
                                                  inputDevice: InputDevices.resolve(config.inputDevice))
             meeting = recording
+            meetingShots = 0
+            updateSessionHotkeys()
             sound(config.startSound)
             if dictationMic == nil { restoreHUD() }
             log("meeting started: \(dir.path)")
@@ -589,10 +695,10 @@ final class Daemon {
         guard let recording = meeting else { return ["ok": false, "error": "no meeting is recording"] }
         recording.stop()
         meeting = nil
+        updateSessionHotkeys()
         sound(config.stopSound)
-        if config.hud && dictationMic == nil { hud.show(.message("Meeting saved · transcribing")) }
         log("meeting stopped: \(recording.dir.path) (\(formatDuration(recording.elapsed)))")
-        enqueueProcessing(recording.dir)
+        announce(recording.dir)
         return ["ok": true, "meeting": recording.dir.lastPathComponent, "dir": recording.dir.path,
                 "duration": recording.elapsed, "warnings": recording.warnings]
     }
@@ -610,8 +716,199 @@ final class Daemon {
             } catch {
                 log("meeting \(id) processing failed: \(error)")
             }
-            DispatchQueue.main.async { self.processingIDs.removeAll { $0 == id } }
+            DispatchQueue.main.async {
+                self.processingIDs.removeAll { $0 == id }
+                self.processingFinished(dir)
+            }
         }
+    }
+
+    // MARK: - After a meeting
+
+    /// Transcribes a meeting you stopped and says on the pill when it's ready.
+    private func announce(_ dir: URL) {
+        let id = dir.lastPathComponent
+        announced.insert(id)
+        processingPill = (id, "Transcribing meeting · \(Self.minutes(MeetingMeta.load(dir)?.duration ?? 0))")
+        enqueueProcessing(dir)
+        if dictationMic == nil && meeting == nil { restoreHUD() }
+    }
+
+    private func processingFinished(_ dir: URL) {
+        let id = dir.lastPathComponent
+        guard announced.remove(id) != nil else { return }
+        if processingPill?.id == id { processingPill = nil }
+        let done = MeetingMeta.load(dir)?.status == "done"
+        if done { readyMeeting = dir }
+        guard dictationMic == nil && meeting == nil else { return }
+        if done {
+            restoreHUD()
+        } else if config.hud {
+            hud.show(.message("Couldn't transcribe the meeting"))
+        }
+    }
+
+    private func dismissReady() {
+        readyMeeting = nil
+        if dictationMic == nil && meeting == nil { restoreHUD() }
+    }
+
+    /// notes.md once written, else the transcript (else the folder, mid-transcription).
+    private func meetingDocument(_ dir: URL) -> URL? {
+        ["notes.md", "transcript.md"].map { dir.appendingPathComponent($0) }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func openMeeting(_ dir: URL) {
+        NSWorkspace.shared.open(meetingDocument(dir) ?? dir)
+    }
+
+    private func copyMeeting(_ dir: URL) {
+        guard let url = meetingDocument(dir), let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        setClipboard(text)
+    }
+
+    /// ✦ Notes: writes notes.md with the [cleanup] harness, then opens it.
+    private func writeNotes(_ dir: URL) {
+        let id = dir.lastPathComponent
+        guard !notesInFlight.contains(id) else { return }
+        notesInFlight.insert(id)
+        if config.hud && dictationMic == nil && meeting == nil { hud.show(.working("Writing notes")) }
+        let config = self.config
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try MeetingNotes.write(dir: dir, config: config) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.notesInFlight.remove(id)
+                let idle = self.dictationMic == nil && self.meeting == nil
+                switch result {
+                case let .success(url):
+                    NSWorkspace.shared.open(url)
+                    if idle { self.restoreHUD() }
+                case let .failure(error):
+                    log("meeting \(id): notes failed: \(error)")
+                    self.sound(config.errorSound)
+                    guard idle, config.hud else { return }
+                    self.hud.show(.message("Couldn't write notes"))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                        if self.dictationMic == nil && self.meeting == nil && self.readyMeeting != nil { self.restoreHUD() }
+                    }
+                }
+            }
+        }
+    }
+
+    static func minutes(_ seconds: Double) -> String {
+        seconds < 60 ? "\(Int(seconds))s" : "\(Int((seconds / 60).rounded())) min"
+    }
+
+    /// Dictations and meetings for the pill's history list, newest first.
+    private func historyItems() -> [HUDHistoryItem] {
+        let dictations = DictationHistory.recent(limit: 6).compactMap { entry in
+            (entry["text"] as? String).map { HUDHistoryItem(text: $0, at: parseISO(entry["at"] as? String)) }
+        }
+        let meetings = Meetings.all(config).prefix(6).compactMap { dir -> HUDHistoryItem? in
+            guard let meta = MeetingMeta.load(dir), meta.status != "recording" else { return nil }
+            let detail = meta.status == "done" ? Self.minutes(meta.duration) : meta.status == "error" ? "failed" : "transcribing"
+            return HUDHistoryItem(text: meta.title, at: meta.startedAt, meeting: dir, detail: detail)
+        }
+        return (dictations + meetings).sorted { ($0.at ?? .distantPast) > ($1.at ?? .distantPast) }
+    }
+
+    // MARK: - Screenshots
+
+    /// The whole screen under the mouse, right away. During dictation the path
+    /// goes into the text where it was taken; in a meeting it's linked from the
+    /// transcript at that time.
+    private func takeScreenshot() {
+        let inDictation = dictationMic != nil
+        guard inDictation || meeting != nil else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            sound(config.errorSound)
+            log("screenshot: Screen Recording isn't allowed for ButterRec")
+            if config.hud { hud.flashScreenshot(nil, title: "Screenshots need permission", detail: "Allow ButterRec in Screen Recording") }
+            return
+        }
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "shot-\(stamp.string(from: Date())).png"
+        let folder = inDictation ? Paths.dictationDir.appendingPathComponent("screenshots")
+                                 : meeting!.dir.appendingPathComponent("screenshots")
+        let session = dictationSession
+        let since = inDictation ? (dictationPressedAt ?? Date()) : meeting!.startedAt
+        let at = Date().timeIntervalSince(since)
+        let display = Self.displayUnderMouse()
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var url = folder.appendingPathComponent(name)
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = folder.appendingPathComponent(name.replacingOccurrences(of: ".png", with: "-\(n).png"))
+            n += 1
+        }
+        let target = url
+        // Keep the pill out of the shot.
+        hud.suspend()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = try? runProcess("/usr/sbin/screencapture", ["-x", "-t", "png", "-D", "\(display)", target.path], timeout: 10)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.hud.resume()
+                    guard result?.status == 0, FileManager.default.fileExists(atPath: target.path) else {
+                        self.sound(self.config.errorSound)
+                        log("screenshot failed: \(result.map { String(data: $0.stderr, encoding: .utf8) ?? "" } ?? "couldn't run screencapture")")
+                        return
+                    }
+                    self.recordScreenshot(target, at: at, session: inDictation ? session : nil)
+                }
+            }
+        }
+    }
+
+    private func recordScreenshot(_ url: URL, at: Double, session: Int?) {
+        let count: Int
+        let detail: String
+        if let session {
+            // The session may have ended while the shot was taken; the file stays.
+            guard session == dictationSession, dictationMic != nil else { return }
+            sessionShots.append((url, at))
+            count = sessionShots.count
+            detail = dictationAsMeeting ? "In the meeting at \(formatClock(at))" : "Goes into the text at \(formatClock(at))"
+            Self.prune(url.deletingLastPathComponent(), keep: 100)
+        } else if let meeting {
+            Meetings.addScreenshots([(url, at)], to: meeting.dir)
+            meetingShots += 1
+            count = meetingShots
+            detail = "In the meeting at \(formatClock(at))"
+        } else {
+            return
+        }
+        log("screenshot \(count): \(url.path)")
+        hud.screenshotCount = count
+        if config.hud { hud.flashScreenshot(NSImage(contentsOf: url), title: "Screenshot \(count) saved", detail: detail) }
+    }
+
+    /// screencapture's -D number for the display under the mouse (1 = main).
+    private static func displayUnderMouse() -> Int {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
+              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+              let index = ids.firstIndex(of: id) else { return 1 }
+        return index + 1
+    }
+
+    /// Keeps the newest `keep` files, like Butter's pasted images.
+    private static func prune(_ folder: URL, keep: Int) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]),
+              files.count > keep else { return }
+        let dated = files.map { ($0, (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }
+        for (file, _) in dated.sorted(by: { $0.1 > $1.1 }).dropFirst(keep) { try? fm.removeItem(at: file) }
     }
 
     /// Recordings that were stopped (or cut off by a restart) but never transcribed.
@@ -681,6 +978,14 @@ final class Daemon {
             return stopDictation(cleanup: request["cleanup"] as? Bool ?? false)
         case "dictate.toggle":
             return toggleDictation()
+        case "dictate.mode":
+            guard dictationMic != nil, dictationHandsFree else { return ["ok": false, "error": "no hands-free session is running"] }
+            setSessionMeeting(request["meeting"] as? Bool ?? false)
+            return ["ok": true, "mode": dictationAsMeeting ? "meeting" : "dictate"]
+        case "screenshot":
+            guard dictationMic != nil || meeting != nil else { return ["ok": false, "error": "no session is running"] }
+            takeScreenshot()
+            return ["ok": true]
         default:
             return ["ok": false, "error": "unknown command \(request["cmd"] ?? "")"]
         }

@@ -183,6 +183,9 @@ struct Config {
     var dictationMode: String { string("dictation", "mode", "push_to_talk") }
     var handsFreeHotkey: String { string("dictation", "hands_free_hotkey", "ctrl+alt+shift+space") }
     var pasteLastHotkey: String { string("dictation", "paste_last_hotkey", "ctrl+alt+v") }
+    var screenshotHotkey: String { string("dictation", "screenshot_hotkey", "ctrl+alt+s") }
+    var tapForHandsFree: Bool { bool("dictation", "tap_for_hands_free", true) }
+    var tapSeconds: Double { double("dictation", "tap_seconds", 0.4) }
     var cancelHotkey: String { string("dictation", "cancel_hotkey", "esc") }
     var livePreview: Bool { bool("dictation", "live_preview", true) }
     var previewIntervalMs: Int { int("dictation", "preview_interval_ms", 700) }
@@ -220,6 +223,8 @@ struct Config {
         return string("meeting", "engine", "").isEmpty ? model : ""
     }
     var summarizeCommand: String { string("meeting", "summarize_command", "") }
+    var notesModel: String { string("meeting", "notes_model", "sonnet") }
+    var notesPrompt: String { string("meeting", "notes_prompt", "") }
     var meLabel: String { string("meeting", "me_label", "Me") }
     var themLabel: String { string("meeting", "them_label", "Them") }
 
@@ -296,6 +301,9 @@ struct Config {
     mode = "push_to_talk"        # push_to_talk (hold) | toggle (press to start, press to stop)
     hands_free_hotkey = "ctrl+alt+shift+space"  # records until you press it (or the dictation hotkey) again, or click stop
     cancel_hotkey = "esc"        # cancels a hands-free session; only taken while one is running ("" = off)
+    screenshot_hotkey = "ctrl+alt+s"  # during hands-free or a meeting: screenshot the screen under the mouse
+    tap_for_hands_free = true    # a quick tap of the push-to-talk hotkey starts hands-free instead
+    tap_seconds = 0.4            # ...when let go within this long
     paste_last_hotkey = "ctrl+alt+v"            # paste the last dictation again (e.g. it landed in the wrong window)
     live_preview = true          # show words as you speak (re-transcribes the last ~20s every interval)
     preview_interval_ms = 700
@@ -339,6 +347,10 @@ struct Config {
     # becomes summary.md. Runs in a login shell. For example:
     # summarize_command = "ollama run llama3.2 'Summarize this meeting transcript as notes with decisions and action items:'"
     summarize_command = ""
+    # ✦ Notes on the "Meeting ready" pill (or `butter-rec notes`): meeting notes
+    # written by the [cleanup] harness. The whole transcript goes to the model.
+    notes_model = "sonnet"
+    notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}
 
     [cleanup]
     # Hands-free dictation shows a ✦ button next to stop: it stops, transcribes,

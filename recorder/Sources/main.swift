@@ -15,6 +15,8 @@ Usage:
   butter-rec meeting toggle [--title <name>]
   butter-rec dictate [start|stop|toggle|cancel]
   butter-rec dictate stop --clean    stop, and clean up the text before pasting ([cleanup] in the config)
+  butter-rec dictate meeting|dictation  switch a hands-free session to a meeting (saved, not pasted) or back
+  butter-rec screenshot              take a screenshot into the running dictation or meeting
   butter-rec cleanup [<text>]        clean up text (or stdin) with the [cleanup] harness and print it
   butter-rec list [-n <n>]           recorded meetings, newest first
   butter-rec history [-n <n>] [--search <text>] [--json] [--raw]
@@ -22,6 +24,7 @@ Usage:
   butter-rec last [--copy]           print (or copy) the last dictation
   butter-rec transcript [<id>]       print a meeting transcript (default: latest)
   butter-rec summary [<id>]          print a meeting summary (needs summarize_command)
+  butter-rec notes [<id>]            write notes.md for a meeting with the [cleanup] harness ([meeting] notes_model)
   butter-rec path [<id>]             print a meeting's folder
   butter-rec process [<id>]          re-run transcription (+ summary) for a meeting
   butter-rec transcribe <audio-file> [--engine <e>] [--model <m>]
@@ -203,7 +206,11 @@ func run() throws {
 
     case "dictate":
         let action = args.positional.first ?? "toggle"
-        guard ["start", "stop", "toggle", "cancel"].contains(action) else { throw CLIError("dictate start|stop|toggle|cancel") }
+        if action == "meeting" || action == "dictation" {
+            print(json: try daemonRequest(["cmd": "dictate.mode", "meeting": action == "meeting"]))
+            return
+        }
+        guard ["start", "stop", "toggle", "cancel"].contains(action) else { throw CLIError("dictate start|stop|toggle|cancel|meeting|dictation") }
         var request: [String: Any] = ["cmd": "dictate.\(action)"]
         if args.flags.contains("clean") {
             guard action == "stop" else { throw CLIError("--clean only goes with `dictate stop`") }
@@ -259,6 +266,14 @@ func run() throws {
 
     case "transcript":
         print(try String(contentsOf: try meetingFile(args, "transcript.md"), encoding: .utf8))
+
+    case "screenshot":
+        print(json: try daemonRequest(["cmd": "screenshot"]))
+
+    case "notes":
+        let config = Config.load()
+        let dir = try Meetings.resolve(args.positional.first, config)
+        print(try MeetingNotes.write(dir: dir, config: config).path)
 
     case "summary":
         print(try String(contentsOf: try meetingFile(args, "summary.md"), encoding: .utf8))

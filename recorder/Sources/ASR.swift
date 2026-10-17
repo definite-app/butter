@@ -16,16 +16,28 @@ struct Transcription {
     /// The text with a paragraph break wherever the speaker paused for at least
     /// `pause` seconds, and at the next sentence once a paragraph passes
     /// `maxWords`. Without segments (or with pause <= 0) it's the plain text.
-    func paragraphs(pause: Double, maxWords: Int) -> String {
+    /// `inserts` (screenshot paths) become paragraphs of their own at their time.
+    func paragraphs(pause: Double, maxWords: Int, inserts: [(at: Double, text: String)] = []) -> String {
         let segments = self.segments.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard pause > 0, segments.count > 1 else { return text }
+        var pending = inserts.sorted { $0.at < $1.at }[...]
+        guard !(pause <= 0 && pending.isEmpty), segments.count > 1 || !pending.isEmpty else { return text }
+        guard !segments.isEmpty else { return ([text] + pending.map(\.text)).filter { !$0.isEmpty }.joined(separator: "\n\n") }
         var paragraphs: [String] = []
         var current: [String] = []
         var words = 0
         var lastEnd: Double?
         for segment in segments {
             let text = segment.text.trimmingCharacters(in: .whitespaces)
-            if let lastEnd, !current.isEmpty, segment.start - lastEnd >= pause || (maxWords > 0 && words >= maxWords) {
+            if let insert = pending.first, insert.at <= segment.start {
+                if !current.isEmpty { paragraphs.append(current.joined(separator: " ")) }
+                current = []
+                words = 0
+                while let insert = pending.first, insert.at <= segment.start {
+                    paragraphs.append(insert.text)
+                    pending.removeFirst()
+                }
+            }
+            if let lastEnd, !current.isEmpty, pause > 0 && segment.start - lastEnd >= pause || (maxWords > 0 && words >= maxWords) {
                 paragraphs.append(current.joined(separator: " "))
                 current = []
                 words = 0
@@ -35,6 +47,7 @@ struct Transcription {
             lastEnd = segment.end
         }
         if !current.isEmpty { paragraphs.append(current.joined(separator: " ")) }
+        paragraphs += pending.map(\.text)
         return paragraphs.joined(separator: "\n\n")
     }
 }
