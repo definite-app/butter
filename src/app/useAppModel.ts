@@ -499,6 +499,9 @@ export function useAppModel() {
   // Footer profile dropdown, by browser session id.
   const [browserProfileMenuFor, setBrowserProfileMenuFor] = createSignal<string | null>(null);
   const [showBrowserProfiles, setShowBrowserProfiles] = createSignal(false);
+  // Permissions view (Cmd+K "Permissions"; once at launch after a re-sign).
+  const [showPermissions, setShowPermissions] = createSignal(false);
+  const [permissionsAutoShowPending, setPermissionsAutoShowPending] = createSignal(false);
   // Dimmed pictures of browser panes, shown while a palette hides them.
   const [browserPreviews, setBrowserPreviews] = createSignal<Record<string, string>>({});
   // Inbox Keys' commands on the active Gmail page, for Cmd+K.
@@ -2129,6 +2132,12 @@ export function useAppModel() {
         label: "Browser Profiles",
         description: "Profiles, the sites they keep data for, and what uses them",
         action: () => openBrowserProfiles(),
+      },
+      {
+        id: "permissions",
+        label: "Permissions",
+        description: "Screen Recording, Microphone, Full Disk Access and other macOS permissions",
+        action: () => openPermissions(),
       },
       {
         id: "open-browser-config",
@@ -6312,6 +6321,7 @@ export function useAppModel() {
       imageEditorOpen() ||
       showPresetEditor() ||
       showBrowserProfiles() ||
+      showPermissions() ||
       browserProfileMenuFor() !== null
   );
 
@@ -6426,6 +6436,19 @@ export function useAppModel() {
     setShowCommandPalette(false);
     void refreshBrowserConfig();
   };
+
+  const openPermissions = () => {
+    // Open before closing the palette, so pages stay hidden in between.
+    setShowPermissions(true);
+    setShowCommandPalette(false);
+  };
+
+  // The launch check asked for the view; wait until the reopen picker is done.
+  createEffect(() => {
+    if (!permissionsAutoShowPending() || restorePromptOpen()) return;
+    setPermissionsAutoShowPending(false);
+    openPermissions();
+  });
 
   /** Clears cookies, storage and cache, and that profile's URL history. */
   const clearBrowserProfile = async (profileId: string) => {
@@ -7539,6 +7562,14 @@ export function useAppModel() {
       }
     }
 
+    // First launch, or the app's signature changed with a permission missing:
+    // show the Permissions view once.
+    void invoke<boolean>("permissions_launch_check")
+      .then((show) => {
+        if (show) setPermissionsAutoShowPending(true);
+      })
+      .catch((err) => console.error("[permissions] launch check failed:", err));
+
     // Local CLI requests reuse the ordinary tab/PTY creation path. The backend
     // confirms success to the caller only after this request's PTY exists.
     let cliPollBusy = false;
@@ -7970,6 +8001,9 @@ export function useAppModel() {
     showBrowserProfiles,
     setShowBrowserProfiles,
     openBrowserProfiles,
+    showPermissions,
+    setShowPermissions,
+    openPermissions,
     switchBrowserProfile,
     clearBrowserProfile,
     browserProfileSites,

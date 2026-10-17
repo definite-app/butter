@@ -3925,6 +3925,142 @@ body.butter-printing-markdown .butter-print-content hr {
   max-width: none;
 }
 
+/* Permissions view: reuses the Browser Profiles shell (overlay, header,
+   buttons) with flat rows grouped under small headings. */
+.butter-permissions-note {
+  margin: var(--space-3) var(--space-4) 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.butter-permissions-loading {
+  padding: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.butter-permissions-group + .butter-permissions-group {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.butter-permissions-group-title {
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+}
+
+.butter-permissions-group-note {
+  padding: 0 var(--space-3) var(--space-2);
+  color: var(--text-disabled);
+  font-size: var(--text-xs);
+}
+
+.butter-permissions-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  transition: background var(--duration-fast) var(--ease-out);
+}
+
+.butter-permissions-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.butter-permissions-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-disabled);
+}
+
+.butter-permissions-dot.on {
+  background: #9ece6a;
+}
+
+.butter-permissions-dot.off {
+  background: var(--accent-primary);
+}
+
+.butter-permissions-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.butter-permissions-name {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+}
+
+.butter-permissions-reason {
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.butter-permissions-state {
+  flex: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.butter-permissions-action {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  width: 76px;
+}
+
+.butter-permissions-action .butter-profiles-btn {
+  min-width: 76px;
+}
+
+.butter-permissions-footer {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
+}
+
+.butter-permissions-footer > .butter-profiles-btn {
+  align-self: flex-end;
+}
+
+.butter-permissions-signing {
+  color: var(--text-disabled);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.butter-permissions-signing.warn {
+  color: #f3d58a;
+}
+
+.butter-permissions-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.butter-permissions-confirm span {
+  flex: 1;
+}
+
 .command-palette-inline-action {
   border: 0;
   background: transparent;

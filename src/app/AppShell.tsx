@@ -22,6 +22,7 @@ import { ScratchpadModal } from "../features/scratchpad/ScratchpadModal";
 import { ImageEditorModal } from "../features/overlays/ImageEditorModal";
 import { BrowserPane } from "../features/browser/BrowserPane";
 import { BrowserProfiles } from "../features/browser/BrowserProfiles";
+import { Permissions } from "../features/permissions/Permissions";
 
 export function AppShell() {
   const app = useAppContext();
@@ -146,6 +147,7 @@ export function AppShell() {
       <ScratchpadModal />
       <ImageEditorModal />
       <BrowserProfiles />
+      <Permissions />
       <ConfirmModal />
       <Show when={isDevFlavor()}>
         <div class="butter-dev-badge" title="Butter Dev build (isolated data in ~/.butter-dev)">

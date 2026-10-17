@@ -10,6 +10,7 @@ mod config;
 mod database;
 mod http_server;
 mod paths;
+mod permissions;
 mod pty;
 mod recordings;
 mod routine;
@@ -2051,6 +2052,10 @@ pub fn run() {
             recordings::recordings_list_meetings,
             recordings::recordings_list_dictations,
             recordings::recordings_read_meeting,
+            permissions::permissions_status,
+            permissions::permission_request,
+            permissions::permissions_reset_stale,
+            permissions::permissions_launch_check,
             focus_manager_window,
             set_window_width,
             minimize_manager_window,

@@ -18,6 +18,8 @@ To update, run `git pull && scripts/install-app.sh --ci` in the same folder. The
 
 - `--wait`: wait until no Claude session in Butter is mid-turn before quitting
 - `--rollback`: put the previous version back
+
+The script re-signs the app with your code signing certificate before installing, so macOS keeps Screen Recording, Microphone and Full Disk Access grants from one version to the next.
 - No flags (`scripts/install-app.sh`): build locally instead (needs Node and Rust)
 
 ### Without a clone
@@ -51,7 +53,8 @@ open /Applications/Butter.app
 ```
 
 Notes:
-- Each build has a new ad-hoc signature, so macOS may ask again for permissions you granted before.
+- CI builds are ad-hoc signed, so installed by hand each one looks like a new app to macOS and loses the permissions you granted. `scripts/install-app.sh` re-signs them with your "Apple Development" (or Developer ID) certificate so permissions stick; without one it warns. Get a free one in Xcode > Settings > Accounts > Manage Certificates.
+- Cmd+K "Permissions" shows what Butter, its terminals and ButterRec are allowed to do, with a Grant button for each.
 - GitHub keeps build artifacts for 90 days. Always take the newest run.
 - `butter-cli` is installed to `~/.butter/bin` every time Butter launches. There's nothing separate to update.
 
