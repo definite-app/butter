@@ -418,6 +418,47 @@
   background: var(--border-default);
 }
 
+.ot-menu-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px 6px;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.ot-menu-meta span {
+  cursor: default;
+}
+
+.ot-menu .ot-menu-meta-id {
+  width: auto;
+  padding: 0;
+  border-radius: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.ot-menu .ot-menu-meta-id:hover {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.ot-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.ot-link:hover {
+  text-decoration-color: currentColor;
+}
+
 .ot-receipt {
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -542,6 +583,11 @@
   flex-wrap: wrap;
 }
 
+.ot-composer.dragging {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px rgba(245, 215, 110, 0.15);
+}
+
 .ot-attachments {
   /* Above the chip + input row, which stay on one line. */
   order: -1;
@@ -647,6 +693,10 @@
   background: var(--surface-hover);
   border: 1px solid var(--border-default);
   box-shadow: var(--shadow-lg);
+}
+
+.ot-skill-menu {
+  width: 420px;
 }
 
 .ot-preset-heading {

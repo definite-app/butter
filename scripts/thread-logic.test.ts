@@ -10,6 +10,10 @@ import {
   mentionAtCaret,
   stripMention,
 } from "../src/features/thread/mentions.ts";
+import { filterSkills, insertSkill, leadingSkill, skillAtCaret, withLeadingSkill } from "../src/features/thread/skills.ts";
+import type { SkillAction } from "../src/features/thread/skills.ts";
+import { linkify } from "../src/features/thread/links.ts";
+import { timeAgo } from "../src/features/thread/time.ts";
 import { matchesTerms, parseSearchQuery, searchSnippet } from "../src/features/thread/search.ts";
 import { routinePreamble, routineWhen } from "../src/features/thread/routines.ts";
 import type { RoutineRecord } from "../src/features/thread/routines.ts";
@@ -132,4 +136,91 @@ test("routine preamble points the woken agent at the earlier session", () => {
   const fromShell = routinePreamble({ ...routine, agent_session_id: null });
   assert.doesNotMatch(fromShell, /transcript/);
   assert.equal(routineWhen(routine.due_at), "Thu, Oct 29, 9:00 AM");
+});
+
+const skill = (invoke: string, name = invoke.replace(/^[/$](.*:)?/, "")): SkillAction => ({
+  name,
+  invoke,
+  description: "",
+  kind: "skill",
+  harness: invoke.startsWith("$") ? "codex" : "claude",
+});
+
+test("skillAtCaret finds /query and $query at a word start", () => {
+  assert.deepEqual(skillAtCaret("/butt", 5), { start: 0, end: 5, query: "butt" });
+  assert.deepEqual(skillAtCaret("@claude /", 9), { start: 8, end: 9, query: "" });
+  assert.deepEqual(skillAtCaret("$fix-it", 7), { start: 0, end: 7, query: "fix-it" });
+  assert.deepEqual(skillAtCaret("/plugin:na", 10), { start: 0, end: 10, query: "plugin:na" });
+  assert.equal(skillAtCaret("see /Users/mike", 15), null);
+  assert.equal(skillAtCaret("and/or", 6), null);
+  assert.equal(skillAtCaret("no token", 8), null);
+});
+
+test("filterSkills ranks prefix matches before substring matches", () => {
+  const actions = [skill("/dream"), skill("/butter-cli"), skill("/plugin:butter-x", "butter-x"), skill("/x-butter")];
+  assert.deepEqual(
+    filterSkills(actions, "butter").map((a) => a.invoke),
+    ["/butter-cli", "/plugin:butter-x", "/x-butter"]
+  );
+  assert.deepEqual(filterSkills(actions, "plugin:").map((a) => a.invoke), ["/plugin:butter-x"]);
+  assert.equal(filterSkills(actions, "").length, 4);
+});
+
+test("insertSkill replaces the token and adds a space", () => {
+  assert.deepEqual(insertSkill("/butt", { start: 0, end: 5, query: "butt" }, "/butter-cli"), {
+    text: "/butter-cli ",
+    caret: 12,
+  });
+  assert.deepEqual(insertSkill("/bu do it", { start: 0, end: 3, query: "bu" }, "/butter-cli"), {
+    text: "/butter-cli do it",
+    caret: 12,
+  });
+});
+
+test("leadingSkill only lifts skills the agent has, spelled its way", () => {
+  const claude = new Set(["/butter-cli", "/plugin:review"]);
+  const codex = new Set(["$butter-cli", "/prompts:plan"]);
+  assert.deepEqual(leadingSkill("/butter-cli schedule it", claude), { skill: "/butter-cli", rest: "schedule it" });
+  assert.deepEqual(leadingSkill("/butter-cli schedule it", codex), { skill: "$butter-cli", rest: "schedule it" });
+  assert.deepEqual(leadingSkill("$butter-cli", claude), { skill: "/butter-cli", rest: "" });
+  assert.deepEqual(leadingSkill("/plugin:review now", claude), { skill: "/plugin:review", rest: "now" });
+  assert.equal(leadingSkill("/plugin:review now", codex), null);
+  assert.equal(leadingSkill("/tmp is full", claude), null);
+  assert.equal(leadingSkill("please /butter-cli", claude), null);
+});
+
+test("withLeadingSkill puts the skill in front of the wrapped message", () => {
+  const known = new Set(["/butter-cli"]);
+  const wrap = (text: string) => (text ? `<m>${text}</m>` : "");
+  assert.equal(withLeadingSkill("/butter-cli remind me", known, wrap), "/butter-cli <m>remind me</m>");
+  assert.equal(withLeadingSkill("/butter-cli", known, wrap), "/butter-cli");
+  assert.equal(withLeadingSkill("hello", known, wrap), "<m>hello</m>");
+  assert.equal(withLeadingSkill("/tmp is full", known, wrap), "<m>/tmp is full</m>");
+});
+
+test("timeAgo counts up to days, then shows the date", () => {
+  const now = new Date(2026, 9, 16, 15, 0, 0).getTime();
+  assert.equal(timeAgo(now - 2_000, now), "just now");
+  assert.equal(timeAgo(now - 42_000, now), "42 seconds ago");
+  assert.equal(timeAgo(now - 60_000, now), "1 minute ago");
+  assert.equal(timeAgo(now - 3 * 3_600_000, now), "3 hours ago");
+  assert.equal(timeAgo(now - 86_400_000, now), "1 day ago");
+  assert.equal(timeAgo(new Date(2026, 8, 1).getTime(), now), "Sep 1");
+  assert.equal(timeAgo(new Date(2025, 8, 1).getTime(), now), "Sep 1, 2025");
+});
+
+test("linkify splits out URLs and leaves trailing punctuation as text", () => {
+  assert.deepEqual(linkify("no links"), [{ text: "no links" }]);
+  assert.deepEqual(linkify("Source: https://www.bbb.org/us/pa/x-0241."), [
+    { text: "Source: " },
+    { text: "https://www.bbb.org/us/pa/x-0241", url: "https://www.bbb.org/us/pa/x-0241" },
+    { text: "." },
+  ]);
+  assert.deepEqual(linkify("(see https://a.com/b)"), [
+    { text: "(see " },
+    { text: "https://a.com/b", url: "https://a.com/b" },
+    { text: ")" },
+  ]);
+  assert.deepEqual(linkify("https://en.wikipedia.org/wiki/Foo_(bar)")[0].url, "https://en.wikipedia.org/wiki/Foo_(bar)");
+  assert.deepEqual(linkify("http:// nope"), [{ text: "http:// nope" }]);
 });

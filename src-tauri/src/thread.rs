@@ -325,6 +325,37 @@ pub fn thread_save_clipboard_image() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Copy an image dropped on the 1thread composer into the pending folder, like
+/// a pasted one, and return the copy's path. The original is left alone.
+#[tauri::command]
+pub fn thread_attach_dropped_image(path: String) -> Result<String, String> {
+    let source = std::path::Path::new(&path);
+    if !source.is_absolute() {
+        return Err(format!("Image path must be absolute: {path}"));
+    }
+    let meta = std::fs::metadata(source).map_err(|e| format!("Image not found: {path} ({e})"))?;
+    if !meta.is_file() {
+        return Err(format!("Not a file: {path}"));
+    }
+    if meta.len() > AGENT_IMAGE_MAX_BYTES {
+        return Err(format!("Image is larger than 25 MB: {path}"));
+    }
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !AGENT_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Only png, jpg, gif and webp images can be attached: {path}"));
+    }
+    let dir = pending_attachments_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create attachments dir: {e}"))?;
+    prune_pending_attachments(&dir);
+    let target = dir.join(format!("image-{}.{ext}", uuid::Uuid::new_v4().simple()));
+    std::fs::copy(source, &target).map_err(|e| format!("Failed to copy image: {e}"))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
 /// Drop pasted images that were never sent.
 fn prune_pending_attachments(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };

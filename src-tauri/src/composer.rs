@@ -670,7 +670,9 @@ pub fn composer_list_actions(cwd: Option<String>, harness: String) -> Vec<Compos
     let Some(harness) = Harness::parse(&harness) else {
         return Vec::new();
     };
-    let cwd = cwd.filter(|c| !c.trim().is_empty()).map(PathBuf::from);
+    let cwd = cwd
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| PathBuf::from(crate::expand_path(c.trim())));
     let home = dirs::home_dir();
     let sources = sources_for(harness, cwd.as_deref(), home.as_deref());
     let print = fingerprint(&sources);
