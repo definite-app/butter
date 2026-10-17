@@ -294,7 +294,7 @@ func run() throws {
                                               model: args.options["model"] ?? config.model, language: config.language,
                                               prompt: config.prompt, segments: true, vad: true)
             worker.stop(reason: "done")
-            print(t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords))
+            print(config.applyReplacements(t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)))
         }
 
     case "devices":

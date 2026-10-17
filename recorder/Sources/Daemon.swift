@@ -107,6 +107,11 @@ final class Daemon {
     /// System audio alongside a hands-free session, kept as a meeting if it was a call.
     private var callCapture: CallCapture?
     private var dictationSession = 0
+    /// The dictation this press of the dictation hotkey started, while it's held.
+    private var heldSession: Int?
+    /// The dictation hotkey went down during hands-free: stop when it's let go
+    /// (unless it turns out to be part of the hands-free hotkey).
+    private var stopOnRelease = false
     private var previewTimer: Timer?
     private var previewInFlight = false
     private let hud = HUD()
@@ -162,11 +167,11 @@ final class Daemon {
     private func registerHotkeys() {
         hotkeys.unregisterAll()
         hotkeyErrors.removeAll()
-        let bindings: [(String, String, (Bool) -> Void)] = [
-            ("dictation", config.dictationHotkey, { [unowned self] pressed in self.dictationHotkey(pressed) }),
-            ("hands-free", config.handsFreeHotkey, { [unowned self] pressed in self.handsFreeHotkey(pressed) }),
-            ("paste-last", config.pasteLastHotkey, { [unowned self] pressed in if pressed { _ = self.pasteLast() } }),
-            ("meeting", config.meetingHotkey, { [unowned self] pressed in if pressed { _ = self.toggleMeeting(title: nil) } }),
+        let bindings: [(String, String, HotkeyManager.Handler)] = [
+            ("dictation", config.dictationHotkey, { [unowned self] event in self.dictationHotkey(event) }),
+            ("hands-free", config.handsFreeHotkey, { [unowned self] event in if event == .pressed { self.handsFreeHotkey() } }),
+            ("paste-last", config.pasteLastHotkey, { [unowned self] event in if event == .pressed { _ = self.pasteLast() } }),
+            ("meeting", config.meetingHotkey, { [unowned self] event in if event == .pressed { _ = self.toggleMeeting(title: nil) } }),
         ]
         for (name, text, handler) in bindings where !text.isEmpty {
             do {
@@ -208,22 +213,53 @@ final class Daemon {
 
     // MARK: - Dictation
 
-    private func dictationHotkey(_ pressed: Bool) {
-        if dictationHandsFree {
-            // The push-to-talk key also ends a hands-free session.
-            if pressed { _ = stopDictation() }
-        } else if config.dictationMode == "toggle" {
-            if pressed { _ = toggleDictation() }
-        } else if pressed {
-            _ = startDictation(handsFree: false)
-        } else {
-            _ = stopDictation()
+    private func dictationHotkey(_ event: HotkeyEvent) {
+        switch event {
+        case .pressed:
+            if dictationHandsFree {
+                // The push-to-talk key also ends a hands-free session, once it's
+                // let go: with fn+shift and fn+shift+tab, fn+shift comes first.
+                stopOnRelease = true
+                return
+            }
+            let idle = dictationMic == nil
+            _ = config.dictationMode == "toggle" ? toggleDictation() : startDictation(handsFree: false)
+            heldSession = idle && dictationMic != nil ? dictationSession : nil
+        case .released:
+            heldSession = nil
+            if stopOnRelease {
+                stopOnRelease = false
+                _ = stopDictation()
+            } else if !dictationHandsFree && config.dictationMode != "toggle" {
+                _ = stopDictation()
+            }
+        case .interrupted:
+            // The modifiers were the start of another shortcut (fn+shift+arrow):
+            // drop the dictation they started.
+            stopOnRelease = false
+            if let session = heldSession, session == dictationSession, dictationMic != nil { _ = cancelDictation() }
+            heldSession = nil
         }
     }
 
-    private func handsFreeHotkey(_ pressed: Bool) {
-        guard pressed else { return }
+    private func handsFreeHotkey() {
+        stopOnRelease = false
+        if let session = heldSession, session == dictationSession, dictationMic != nil {
+            // Pressed while holding the dictation hotkey: keep going hands-free.
+            heldSession = nil
+            switchToHandsFree()
+            return
+        }
         _ = dictationMic == nil ? startDictation(handsFree: true) : stopDictation()
+    }
+
+    private func switchToHandsFree() {
+        guard let mic = dictationMic, !dictationHandsFree else { return }
+        let since = dictationPressedAt ?? Date()
+        dictationHandsFree = true
+        if config.hud { hud.show(.handsFree(level: { mic.level }, since: since)) }
+        startCallCapture(origin: since)
+        log("dictation: switched to hands-free")
     }
 
     private func toggleDictation() -> [String: Any] {
@@ -255,34 +291,37 @@ final class Daemon {
             worker.preload(engine: config.engine, model: config.model)
             if config.livePreview && config.hud { schedulePreview(session: dictationSession) }
             sound(config.startSound)
-            // A meeting already records system audio; otherwise catch the other
-            // side in case this hands-free session is really a call.
-            // Setting up the tap takes ~0.3-0.5s, so it happens off the main thread.
-            if handsFree && config.handsFreeCallAudio && meeting == nil {
-                let session = dictationSession, config = self.config
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let t0 = Date()
-                    let capture: CallCapture?
-                    do {
-                        capture = try CallCapture(origin: pressedAt, config: config)
-                        log("hands-free: system audio started in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
-                    } catch {
-                        capture = nil
-                        log("hands-free: not recording system audio: \(error)")
-                    }
-                    DispatchQueue.main.async {
-                        // Stopped or cancelled while the tap was starting.
-                        guard let self, session == self.dictationSession else { capture?.discard(); return }
-                        self.callCapture = capture
-                    }
-                }
-            }
+            if handsFree { startCallCapture(origin: pressedAt) }
             return ["ok": true, "dictation": "recording", "hands_free": handsFree]
         } catch {
             sound(config.errorSound)
             showError()
             log("dictation start failed: \(error)")
             return ["ok": false, "error": "\(error)"]
+        }
+    }
+
+    /// A meeting already records system audio; otherwise catch the other side
+    /// in case this hands-free session is really a call. Setting up the tap
+    /// takes ~0.3-0.5s, so it happens off the main thread.
+    private func startCallCapture(origin: Date) {
+        guard config.handsFreeCallAudio && meeting == nil && callCapture == nil else { return }
+        let session = dictationSession, config = self.config
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let t0 = Date()
+            let capture: CallCapture?
+            do {
+                capture = try CallCapture(origin: origin, config: config)
+                log("hands-free: system audio started in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+            } catch {
+                capture = nil
+                log("hands-free: not recording system audio: \(error)")
+            }
+            DispatchQueue.main.async {
+                // Stopped or cancelled while the tap was starting.
+                guard let self, session == self.dictationSession, self.dictationMic != nil else { capture?.discard(); return }
+                self.callCapture = capture
+            }
         }
     }
 
@@ -335,6 +374,7 @@ final class Daemon {
         dictationSink = nil
         dictationStartedAt = nil
         dictationHandsFree = false
+        stopOnRelease = false
         dictationSession += 1  // invalidates in-flight previews
         previewTimer?.invalidate()
         previewTimer = nil
@@ -362,7 +402,7 @@ final class Daemon {
                 guard let self else { return }
                 self.previewInFlight = false
                 guard session == self.dictationSession, case let .success(t) = result else { return }
-                self.hud.setCaption(t.text)
+                self.hud.setCaption(self.config.applyReplacements(t.text))
             }
         }
     }
@@ -374,7 +414,7 @@ final class Daemon {
             if dictationMic == nil { showError() }
             log("dictation failed: \(error)")
         case let .success(transcription):
-            let text = transcription.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)
+            let text = config.applyReplacements(transcription.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords))
             log("dictation: \(String(format: "%.1f", audioSeconds))s audio -> \(text.count) chars in \(String(format: "%.2f", transcription.elapsed))s")
             guard cleanup, !text.isEmpty else {
                 deliver(text, transcription: transcription, audioSeconds: audioSeconds, cleanup: nil, meeting: meeting)
@@ -579,7 +619,7 @@ final class Daemon {
                 let t = try worker.transcribeSync(audio: URL(fileURLWithPath: audio), engine: request["engine"] as? String ?? config.engine,
                                                   model: request["model"] as? String ?? config.model, language: config.language,
                                                   prompt: config.prompt, segments: true, vad: request["vad"] as? Bool ?? true)
-                return ["ok": true, "text": t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords),
+                return ["ok": true, "text": config.applyReplacements(t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)),
                         "engine": t.engine, "model": t.model, "elapsed": t.elapsed]
             } catch {
                 return ["ok": false, "error": "\(error)"]
