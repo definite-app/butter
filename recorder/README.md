@@ -2,6 +2,45 @@
 
 Local dictation and meeting recording for Butter. Like Handy, it has push-to-talk dictation that pastes text where your cursor is. Like Granola, it records meetings with your mic and system audio on separate tracks and writes a speaker-labelled transcript. Unlike either, there's no app window. You control it with hotkeys, a TOML file and `butter-cli rec`. Audio and transcription stay on your Mac.
 
+## Shortcuts
+
+| | Default shortcut | CLI |
+|---|---|---|
+| Dictate (push-to-talk) | hold `ctrl+opt+space`, release to paste | |
+| Dictate (hands-free) | `ctrl+opt+shift+space` to start | `butter-cli rec dictate start` |
+| ↳ stop and paste | the same shortcut again, the push-to-talk shortcut, or ■ | `butter-cli rec dictate stop` |
+| ↳ stop, [clean up](#cleanup), paste | ✦ | `butter-cli rec dictate stop --clean` |
+| ↳ cancel (nothing pasted) | `esc` or × | `butter-cli rec dictate cancel` |
+| Paste the last dictation again | `ctrl+opt+v` | `butter-cli rec last [--copy]` |
+| Meeting | `ctrl+opt+m` to start, again to stop | `butter-cli rec meeting start --title "Acme sync"` / `meeting stop --wait` |
+
+Holding the push-to-talk shortcut and then pressing the hands-free one switches the recording you're in to hands-free. `esc` is only taken from other apps while a hands-free session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
+
+Meetings start only when you start them, with the shortcut or the CLI. Nothing watches for calls on its own. The exception is a hands-free session that turns out to be a call: it's also [saved as a meeting](#use).
+
+### Change a shortcut
+
+Edit `~/.config/butter/recorder.toml`, then run `butter-cli rec reload`. No restart is needed.
+
+```toml
+[dictation]
+hotkey = "fn+shift"                 # push-to-talk (default "ctrl+alt+space")
+hands_free_hotkey = "fn+shift+tab"  # default "ctrl+alt+shift+space"
+cancel_hotkey = "esc"               # cancels hands-free; "" turns it off
+paste_last_hotkey = "ctrl+alt+v"
+mode = "push_to_talk"               # or "toggle": press to start, press again to stop
+
+[meeting]
+hotkey = "ctrl+alt+m"
+```
+
+- A shortcut is any modifiers (`cmd`, `ctrl`, `alt`/`opt`, `shift`, `fn`) plus one key: a letter, a digit, `f1`–`f20`, `space`, `tab`, `return`, `esc`, `delete`, an arrow, `home`/`end`/`pageup`/`pagedown`, or punctuation (`/`, `;`, `` ` `` or `~`, …).
+- It can also be modifiers alone: `fn`, or two or more, such as `"fn+shift"`. These fire after the modifiers have been held for 0.15s with no other key pressed, so fn+shift+arrow still selects text. If you press a key after a dictation has started, it's cancelled.
+- fn and modifier-only shortcuts need Accessibility access, which paste already uses.
+- Caps Lock can't be part of a shortcut.
+- If the 🌐 key opens the emoji picker or switches input source, set System Settings › Keyboard › "Press 🌐 key to" to "Do Nothing".
+- A shortcut another app already owns fails to register; `butter-cli rec reload` lists it.
+
 ## Install
 
 ```sh
@@ -19,13 +58,6 @@ The first time you use each feature, macOS asks **ButterRec** for access:
 Speech recognition runs in `asr/worker.py`, a uv script that keeps the model warm between dictations. On first use it downloads the model to a local cache. After that, nothing leaves the machine.
 
 ## Use
-
-| | Hotkey (default) | CLI |
-|---|---|---|
-| Dictate (push-to-talk) | hold `ctrl+opt+space`, release to paste | |
-| Dictate (hands-free) | `ctrl+opt+shift+space` to start; same key, the push-to-talk key, or ■ to stop; ✦ to stop and clean up | `butter-cli rec dictate start` / `stop [--clean]` / `cancel` |
-| Paste last dictation again | `ctrl+opt+v` | `butter-cli rec last [--copy]` |
-| Meeting | `ctrl+opt+m` to start/stop | `butter-cli rec meeting start --title "Acme sync"` / `meeting stop --wait` |
 
 A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. Hands-free sessions also get ✦, which stops and [cleans up](#cleanup) the text before pasting. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app.
 
@@ -57,7 +89,7 @@ butter-cli rec transcribe memo.m4a   # any audio file AVFoundation can read
 
 ## Configure
 
-Edit `~/.config/butter/recorder.toml`, then run `butter-cli rec reload`. The file documents every key. The main ones:
+Edit `~/.config/butter/recorder.toml`, then run `butter-cli rec reload`. The file documents every key. For shortcuts, see [Change a shortcut](#change-a-shortcut). The other main settings:
 
 ```toml
 [asr]
@@ -65,29 +97,14 @@ engine = "parakeet"        # parakeet | canary | whisper
 model = ""                 # empty = engine default
 
 [dictation]
-hotkey = "ctrl+alt+space"
-mode = "push_to_talk"      # or "toggle"
 output = "paste"           # paste | clipboard | none
 
 [meeting]
-hotkey = "ctrl+alt+m"
 system_audio = true
 summarize_command = "ollama run llama3.2 'Summarize this meeting as notes with action items:'"
 ```
 
 `summarize_command` runs in a login shell with the transcript on stdin, and its stdout is saved as `summary.md`. Point it at a local model to keep everything on your machine.
-
-### Hotkeys
-
-A hotkey is any modifiers plus one key: `"cmd+shift+d"`, `"f13"`, `"fn+shift+tab"`. It can also be modifiers alone, either `fn` or two or more, such as `"fn+shift"`. This setup keeps everything on the left side of the keyboard:
-
-```toml
-[dictation]
-hotkey = "fn+shift"              # hold to talk
-hands_free_hotkey = "fn+shift+tab"
-```
-
-A modifier-only hotkey fires after its modifiers have been held for 0.15s with no other key pressed, so fn+shift+arrow still selects text. If you press a key after it has started, the dictation is cancelled. One exception: holding the dictation hotkey and then pressing the hands-free one switches the recording you're in to hands-free. fn and modifier-only hotkeys need Accessibility access, which paste already uses. Caps Lock can't be part of a hotkey. If the 🌐 key opens the emoji picker or switches input source, set System Settings › Keyboard › "Press 🌐 key to" to "Do Nothing".
 
 ### Replacements
 
