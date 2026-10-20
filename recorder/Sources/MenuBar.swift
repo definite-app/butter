@@ -394,7 +394,10 @@ struct MenuPanelContent {
         }
         for (i, entry) in s.dictations.enumerated() {
             guard let text = entry["text"] as? String, let at = parseISO(entry["at"] as? String) else { continue }
-            let seconds = Int(((entry["seconds"] as? NSNumber)?.doubleValue ?? 0).rounded())
+            let length = (entry["seconds"] as? NSNumber)?.doubleValue ?? 0
+            // Throwaways ("Okay.", "Mm-hmm.") would crowd out the rest.
+            if length < 2 || text.split(whereSeparator: { $0.isWhitespace }).count <= 2 { continue }
+            let seconds = Int(length.rounded())
             let first = text.components(separatedBy: "\n").first { !$0.trimmed.isEmpty } ?? text
             rows.append(RecentRow(id: "dictation\(i)", at: at, title: first, detail: "Dictation · \(seconds / 60):\(String(format: "%02d", seconds % 60)) · \(Self.when(at, clockTime, s.now))",
                                   dir: nil, text: text, hasNotes: false, hasTranscript: false))
@@ -562,7 +565,7 @@ private struct PillButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                if dot { Circle().fill(Palette.red).frame(width: 7, height: 7) }
+                if dot { Circle().fill(Palette.butter).frame(width: 7, height: 7) }
                 if let icon { Image(systemName: icon).font(.system(size: 10, weight: .semibold)) }
                 Text(label).font(.system(size: 12, weight: .medium))
             }

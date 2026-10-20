@@ -1315,7 +1315,7 @@ final class Daemon {
         s.processing = !processingIDs.isEmpty
         if full {
             s.meetings = Meetings.all(config).prefix(40).compactMap { dir in MeetingMeta.load(dir).map { (dir, $0) } }
-            s.dictations = DictationHistory.recent(limit: 5)
+            s.dictations = DictationHistory.recent(limit: 20)
         }
         return s
     }
