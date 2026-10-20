@@ -193,6 +193,10 @@ struct Config {
     var paragraphMaxWords: Int { int("dictation", "paragraph_max_words", 120) }
     var handsFreeCallAudio: Bool { bool("dictation", "hands_free_call_audio", true) }
     var handsFreeCallMinSeconds: Double { double("dictation", "hands_free_call_min_seconds", 60) }
+    /// Which side of the Dictate | Meeting switch a hands-free session starts on.
+    var handsFreeMode: String { string("dictation", "hands_free_mode", "meeting") }
+    var keepAudioDays: Double { double("dictation", "keep_audio_days", 30) }
+    var captureClipboard: Bool { bool("dictation", "capture_clipboard", true) }
 
     // [ui]
     var hud: Bool { bool("ui", "hud", true) }
@@ -211,6 +215,8 @@ struct Config {
     // [meeting]
     var meetingHotkey: String { string("meeting", "hotkey", "ctrl+alt+m") }
     var systemAudio: Bool { bool("meeting", "system_audio", true) }
+    var rawSystemAudio: Bool { bool("meeting", "raw_system_audio", true) }
+    var rawAudioDays: Double { double("meeting", "raw_audio_days", 14) }
     var meetingDirectory: URL { Paths.expand(string("meeting", "directory", "~/.butter/recordings")) }
     var meetingEngine: String {
         let e = string("meeting", "engine", "")
@@ -304,6 +310,7 @@ struct Config {
     screenshot_hotkey = "ctrl+alt+s"  # during hands-free or a meeting: screenshot the screen under the mouse
     tap_for_hands_free = true    # a quick tap of the push-to-talk hotkey starts hands-free instead
     tap_seconds = 0.4            # ...when let go within this long
+    hands_free_mode = "meeting"  # meeting | dictate: the side of the pill's Dictate | Meeting switch hands-free starts on
     paste_last_hotkey = "ctrl+alt+v"            # paste the last dictation again (e.g. it landed in the wrong window)
     live_preview = true          # show words as you speak (re-transcribes the last ~20s every interval)
     preview_interval_ms = 700
@@ -315,6 +322,14 @@ struct Config {
     # saved as a meeting too (butter-rec list / transcript).
     hands_free_call_audio = true
     hands_free_call_min_seconds = 60
+    # Every session's audio (your mic, and what the Mac played during hands-free)
+    # is kept in ~/.butter/dictation/audio for this many days (0 = not kept).
+    # Meetings keep theirs in the meeting folder.
+    keep_audio_days = 30
+    # What you copy during a hands-free session or a meeting goes into the text
+    # (or the meeting transcript) where you copied it; copied images are saved
+    # like screenshots. Copies from password managers are skipped.
+    capture_clipboard = true
     output = "paste"       # paste | clipboard | none
     restore_clipboard = true     # put the previous clipboard back after pasting
     sounds = true                # start/stop sounds (also used for meetings)
@@ -338,6 +353,11 @@ struct Config {
     [meeting]
     hotkey = "ctrl+alt+m"        # toggles a meeting recording
     system_audio = true          # record what you hear (other participants) as well as your mic
+    # Also keep what the Mac played exactly as it arrived (its own sample rate and
+    # channels, ~350-700 MB an hour) as system-raw*.wav, for re-transcribing.
+    # Deleted after raw_audio_days (0 = never). system.wav is always kept.
+    raw_system_audio = true
+    raw_audio_days = 14
     directory = "~/.butter/recordings"
     engine = ""                  # empty = use [asr]
     model = ""
@@ -364,6 +384,7 @@ struct Config {
     model = "haiku"              # claude --model (haiku | sonnet | opus | a full model id)
     effort = ""                  # claude --effort, e.g. "low"; empty = the model's default
     command = ""                 # e.g. "ollama run qwen3:4b" to stay fully local
+    claude_path = ""             # where claude is, if it isn't found (e.g. "~/.claude/local/claude")
     timeout_seconds = 20
     vocabulary = []              # preferred spellings, e.g. ["Salesforce", "ClickHouse", "Postgres"]
     instructions = ""            # extra rules appended to the prompt, e.g. "Use British spelling."

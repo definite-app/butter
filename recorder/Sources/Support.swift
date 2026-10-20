@@ -14,6 +14,7 @@ enum Paths {
     static var socket: URL { butterHome.appendingPathComponent("rec.sock") }
     static var logFile: URL { butterHome.appendingPathComponent("logs/rec.log") }
     static var dictationDir: URL { butterHome.appendingPathComponent("dictation") }
+    static var dictationAudioDir: URL { dictationDir.appendingPathComponent("audio") }
     static var appBundle: URL { butterHome.appendingPathComponent("ButterRec.app") }
     static var executable: URL { appBundle.appendingPathComponent("Contents/MacOS/butter-rec") }
     static var launchAgent: URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }

@@ -27,6 +27,9 @@ Usage:
   butter-rec notes [<id>]            write notes.md for a meeting with the [cleanup] harness ([meeting] notes_model)
   butter-rec path [<id>]             print a meeting's folder
   butter-rec process [<id>]          re-run transcription (+ summary) for a meeting
+  butter-rec repair [<id>] [--factor <n>]
+                                     fix system audio recorded too fast (AirPods in call mode, before the
+                                     sample-rate fix), keeping the original as system.orig.wav, then re-process
   butter-rec transcribe <audio-file> [--engine <e>] [--model <m>]
   butter-rec devices                 list microphones (for [audio] input_device)
   butter-rec config                  print the config path (creating it if missing)
@@ -157,7 +160,7 @@ func run() throws {
     let argv = CommandLine.arguments
     guard argv.count > 1 else { print(usage); return }
     let command = argv[1]
-    let args = try Args(argv.dropFirst(2), valued: ["title", "engine", "model", "limit", "search"])
+    let args = try Args(argv.dropFirst(2), valued: ["title", "engine", "model", "limit", "search", "factor"])
 
     switch command {
     case "help", "-h", "--help":
@@ -286,6 +289,22 @@ func run() throws {
         let dir = try Meetings.resolve(args.positional.first, config)
         if sendToDaemon(["cmd": "meeting.process", "dir": dir.path]) != nil {
             print("Queued \(dir.lastPathComponent) in the daemon; check `butter-rec list`.")
+        } else {
+            try MeetingProcessor.process(dir: dir, config: config, worker: ASRWorker(idleMinutes: 0))
+            print(dir.appendingPathComponent("transcript.md").path)
+        }
+
+    case "repair":
+        let config = Config.load()
+        let dir = try Meetings.resolve(args.positional.first, config)
+        let wanted = try args.options["factor"].map { value -> Int in
+            guard let n = Int(value) else { throw CLIError("--factor needs a whole number") }
+            return n
+        }
+        let factor = try MeetingProcessor.repairSystemSpeed(dir: dir, factor: wanted)
+        print("Slowed \(dir.lastPathComponent)'s system audio down \(factor)x (the original is system.orig.wav).")
+        if sendToDaemon(["cmd": "meeting.process", "dir": dir.path]) != nil {
+            print("Re-transcribing in the daemon; check `butter-rec list`.")
         } else {
             try MeetingProcessor.process(dir: dir, config: config, worker: ASRWorker(idleMinutes: 0))
             print(dir.appendingPathComponent("transcript.md").path)
