@@ -232,9 +232,13 @@ struct Config {
     var summarizeCommand: String { string("meeting", "summarize_command", "") }
     var notesModel: String { string("meeting", "notes_model", "sonnet") }
     var notesPrompt: String { string("meeting", "notes_prompt", "") }
-    /// "claude" | "off": how the daemon fills ~/.butter/calendar/upcoming.json.
-    var calendarRefresh: String { string("meeting", "calendar_refresh", "claude") }
-    var calendarRefreshMinutes: Double { double("meeting", "calendar_refresh_minutes", 60) }
+    /// auto | gws | claude | command | off: how the daemon fills ~/.butter/calendar/upcoming.json.
+    var calendarRefresh: String { string("meeting", "calendar_refresh", "auto") }
+    /// Unset: 10 for gws and commands, 60 for claude (CalendarRefresh.interval).
+    var calendarRefreshMinutes: Double? { (raw["meeting"]?["calendar_refresh_minutes"] as? NSNumber)?.doubleValue }
+    var calendarCommand: String { string("meeting", "calendar_command", "") }
+    var gwsPath: String { string("meeting", "gws_path", "") }
+    var gwsCalendars: [String] { strings("meeting", "gws_calendars") }
     var calendarHours: String { string("meeting", "calendar_hours", "7-19") }
     var calendarNudgeMinutes: Double { double("meeting", "calendar_nudge_minutes", 2) }
     var calendarModel: String { string("meeting", "calendar_model", "haiku") }
@@ -423,11 +427,18 @@ struct Config {
     notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}, {{attendees}}
     # Calendar: ~/.butter/calendar/upcoming.json lists upcoming events. Fill it
     # with `butter-rec calendar import` (any JSON list of events), or let the
-    # daemon ask headless Claude Code, which reads it through your calendar MCP
-    # server (e.g. the claude.ai Google Calendar connector). A meeting started
-    # during an event (or 10 min before) takes its title and attendees.
-    calendar_refresh = "claude"  # claude | off
-    calendar_refresh_minutes = 60
+    # daemon refresh it:
+    #   gws      the Google Workspace CLI (`gws calendar events list`)
+    #   claude   headless Claude Code through your calendar MCP server
+    #            (e.g. the claude.ai Google Calendar connector)
+    #   command  calendar_command below, printing events as JSON
+    #   auto     gws if it's installed and works, else claude
+    # A meeting started during an event (or 10 min before) takes its title and attendees.
+    calendar_refresh = "auto"    # auto | gws | claude | command | off
+    # calendar_refresh_minutes = 10  # default: 10 for gws and command, 60 for claude
+    gws_path = ""                # where gws is, if it isn't found
+    gws_calendars = ["primary"]  # calendar ids for gws
+    calendar_command = ""        # e.g. "my-cal --from {time_min} --to {time_max} --json" (UTC RFC 3339)
     calendar_hours = "7-19"      # only refresh between these local hours (and once when the daemon starts)
     calendar_nudge_minutes = 2   # the pill offers to record this long before a call (0 = no nudges)
     calendar_model = "haiku"     # claude --model for the refresh

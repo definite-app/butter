@@ -269,11 +269,15 @@ enum CalendarStore {
     }
 }
 
-/// Fills upcoming.json by asking headless Claude Code for the next 24 hours,
-/// through whichever calendar MCP server the user has (the claude.ai Google
-/// Calendar connector, or a local one). Only that server's tools are allowed;
-/// other servers aren't even connected, and built-in tools, hooks and skills
-/// are off. A reply that isn't backed by a calendar tool call is rejected.
+/// Fills upcoming.json with the next 24 hours from `calendar_refresh`:
+/// - gws: the Google Workspace CLI (`gws calendar events list`), fast and exact.
+/// - claude: headless Claude Code through whichever calendar MCP server the
+///   user has (the claude.ai Google Calendar connector, or a local one). Only
+///   that server's tools are allowed; other servers aren't even connected, and
+///   built-in tools, hooks and skills are off. A reply that isn't backed by a
+///   calendar tool call is rejected.
+/// - command: any shell command printing events as JSON.
+/// - auto: gws when it's installed and works, else claude.
 enum CalendarRefresh {
     struct Status {
         var attemptAt: Date?
@@ -347,6 +351,123 @@ enum CalendarRefresh {
     }
 
     private static func fetch(config: Config) throws -> (CalendarStore.Normalized, String) {
+        switch config.calendarRefresh {
+        case "gws": return try fetchGWS(config: config)
+        case "claude": return try fetchClaude(config: config)
+        case "command": return try fetchCommand(config: config)
+        case "auto":
+            guard gwsExecutable(config) != nil else { return try fetchClaude(config: config) }
+            do {
+                return try fetchGWS(config: config)
+            } catch let gwsError {
+                log("calendar: gws failed (\(gwsError)); trying claude")
+                do {
+                    return try fetchClaude(config: config)
+                } catch {
+                    throw CLIError("gws: \(gwsError); claude: \(error)")
+                }
+            }
+        case "off":
+            throw CLIError("calendar_refresh is off; set it to auto, gws, claude or command")
+        default:
+            throw CLIError("unknown calendar_refresh \"\(config.calendarRefresh)\" (auto | gws | claude | command | off)")
+        }
+    }
+
+    /// Minutes between refreshes: calendar_refresh_minutes if set, else 10 for
+    /// gws and commands (cheap) and 60 for claude. In auto, whichever answered last.
+    static func interval(_ config: Config, _ status: Status) -> Double {
+        if let minutes = config.calendarRefreshMinutes { return max(5, minutes) }
+        switch config.calendarRefresh {
+        case "gws", "command": return 10
+        case "claude": return 60
+        default:
+            if let source = status.source { return source.hasPrefix("claude") || status.error != nil ? 60 : 10 }
+            return gwsExecutable(config) != nil ? 10 : 60
+        }
+    }
+
+    /// The window asked for, in UTC RFC 3339: now to 24 hours from now.
+    private static func window() -> (min: String, max: String) {
+        let f = ISO8601DateFormatter()
+        let now = Date()
+        return (f.string(from: now), f.string(from: now.addingTimeInterval(86400)))
+    }
+
+    /// [meeting] gws_path, else `gws` on the usual paths or through the login shell.
+    static func gwsExecutable(_ config: Config) -> String? {
+        let configured = config.gwsPath.trimmed
+        if !configured.isEmpty { return which(configured) }
+        return which("gws") ?? Cleanup.loginShellLookup("gws")
+    }
+
+    /// `gws calendar events list` for each of gws_calendars. It prints Google's
+    /// own API shape, which import already reads; a zero exit with JSON is trusted.
+    private static func fetchGWS(config: Config) throws -> (CalendarStore.Normalized, String) {
+        guard let gws = gwsExecutable(config) else { throw CLIError("gws isn't installed or not found; set [meeting] gws_path") }
+        try FileManager.default.createDirectory(at: Paths.calendarDir, withIntermediateDirectories: true)
+        let environment: [String: String?] = Cleanup.loginEnvironment().mapValues { $0 }
+        let (min, max) = window()
+        let calendars = config.gwsCalendars.isEmpty ? ["primary"] : config.gwsCalendars
+        var items: [Any] = []
+        for id in calendars {
+            let params: [String: Any] = ["calendarId": id, "timeMin": min, "timeMax": max, "singleEvents": true,
+                                         "orderBy": "startTime", "maxResults": 250]
+            let result = try runProcess(gws, ["calendar", "events", "list", "--params", jsonString(params)], timeout: 30,
+                                        environment: environment, directory: Paths.calendarDir)
+            // A keychain prompt nobody answers looks like this.
+            if result.timedOut { throw CLIError("gws timed out after 30s (waiting on a keychain prompt?)") }
+            guard result.status == 0 else {
+                // stderr always says "Using keyring backend: …"; the rest is the error.
+                let stderr = (String(data: result.stderr, encoding: .utf8) ?? "").components(separatedBy: "\n")
+                    .filter { !$0.hasPrefix("Using keyring backend") }.joined(separator: " ").trimmed
+                let stdout = (String(data: result.stdout, encoding: .utf8) ?? "").trimmed
+                throw CLIError("gws exited \(result.status) for \(id): \(String((stderr.isEmpty ? stdout : stderr).prefix(300)))")
+            }
+            let object = try CalendarStore.parseJSON(result.stdout)
+            guard let list = (object as? [String: Any])?["items"] as? [Any] else {
+                throw CLIError("gws returned no event list for \(id): \(String(String(data: result.stdout, encoding: .utf8)?.prefix(160) ?? ""))")
+            }
+            // The calendar's own name, for the events' `calendar`.
+            let name = (object as? [String: Any])?["summary"] as? String
+            items += list.map { item -> Any in
+                guard var event = item as? [String: Any], event["calendar"] == nil, let name else { return item }
+                event["calendar"] = name
+                return event
+            }
+        }
+        return try save(["events": items], source: "gws (\(calendars.joined(separator: ", ")))")
+    }
+
+    /// calendar_command in a login shell, with {time_min} and {time_max} filled in;
+    /// its stdout goes through the same checks as import.
+    private static func fetchCommand(config: Config) throws -> (CalendarStore.Normalized, String) {
+        let command = config.calendarCommand.trimmed
+        guard !command.isEmpty else { throw CLIError("calendar_refresh = \"command\" needs [meeting] calendar_command") }
+        try FileManager.default.createDirectory(at: Paths.calendarDir, withIntermediateDirectories: true)
+        let (min, max) = window()
+        let filled = command.replacingOccurrences(of: "{time_min}", with: min).replacingOccurrences(of: "{time_max}", with: max)
+        let result = try runProcess("/bin/zsh", ["-lc", filled], timeout: config.calendarTimeout, directory: Paths.calendarDir)
+        if result.timedOut { throw CLIError("calendar_command timed out after \(Int(config.calendarTimeout))s") }
+        guard result.status == 0 else {
+            let stderr = String(data: result.stderr, encoding: .utf8)?.trimmed ?? ""
+            throw CLIError("calendar_command exited \(result.status): \(String(stderr.prefix(300)))")
+        }
+        return try save(CalendarStore.parseJSON(result.stdout), source: "command")
+    }
+
+    /// Validates and writes what a source returned. An explicit empty list is a
+    /// free day; events that were all unusable (or an error) keep the old file.
+    private static func save(_ object: Any, source: String) throws -> (CalendarStore.Normalized, String) {
+        let normalized = try CalendarStore.normalize(object)
+        if normalized.total > 0 && normalized.events.isEmpty {
+            throw CLIError("none of the \(normalized.total) events from \(source) were usable (\(normalized.droppedSummary))")
+        }
+        try CalendarStore.write(normalized.events, source: source)
+        return (normalized, source)
+    }
+
+    private static func fetchClaude(config: Config) throws -> (CalendarStore.Normalized, String) {
         guard let claude = Cleanup.claudeExecutable(config) else {
             throw CLIError("claude isn't installed or not found; set [cleanup] claude_path")
         }
@@ -417,13 +538,7 @@ enum CalendarRefresh {
         guard transcript.calendarCalls > 0 else {
             throw CLIError("claude answered without a successful calendar tool call; not trusting it")
         }
-        let normalized = try CalendarStore.normalize(object)
-        let source = "claude (\(calendars.joined(separator: ", ")))"
-        if normalized.total > 0 && normalized.events.isEmpty {
-            throw CLIError("none of the \(normalized.total) events claude returned were usable (\(normalized.droppedSummary))")
-        }
-        try CalendarStore.write(normalized.events, source: source)
-        return (normalized, source)
+        return try save(object, source: "claude (\(calendars.joined(separator: ", ")))")
     }
 
     /// Server names from `claude mcp list` ("claude.ai Google Calendar: https://… - ✔ Connected").

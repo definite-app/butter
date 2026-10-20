@@ -19,7 +19,9 @@ struct MenuBarState {
     var events: [CalendarEvent] = []
     var stale = true
     var updatedAt: Date?
-    var refreshMode = "claude"
+    /// Where upcoming.json came from: "gws (primary)", "claude (…)", "import (…)".
+    var source = ""
+    var refreshMode = "auto"
     var refreshing = false
     /// The last refresh's error, when it failed.
     var refreshError: String?
@@ -335,7 +337,7 @@ struct MenuPanelContent {
         let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday) ?? s.now
         let endOfTomorrow = calendar.date(byAdding: .day, value: 2, to: startOfToday) ?? s.now
 
-        if s.refreshMode == "claude", let error = s.refreshError { problem = Self.plainWords(error) }
+        if s.refreshMode != "off", let error = s.refreshError { problem = Self.plainWords(error) }
         if recording == nil, let next = s.nextCall(grace: 600), next.start < endOfTomorrow {
             self.next = next
             let soon = next.start.timeIntervalSince(s.now) <= max(s.nudgeMinutes, 5) * 60
@@ -403,8 +405,10 @@ struct MenuPanelContent {
             calendarAge = "Refreshing…"
         } else if let updated = s.updatedAt {
             let minutes = Int(s.now.timeIntervalSince(updated) / 60)
-            calendarAge = "Calendar " + (minutes < 1 ? "just now" : minutes < 60 ? "\(minutes) min ago"
-                : minutes < 48 * 60 ? "\(minutes / 60) h ago" : "\(minutes / 1440) days ago")
+            // "gws (primary)" -> "(gws)".
+            let from = s.source.components(separatedBy: " (").first ?? ""
+            calendarAge = "Calendar " + (from.isEmpty ? "" : "(\(from)) ") + (minutes < 1 ? "just now" : minutes < 60 ? "\(minutes)m ago"
+                : minutes < 48 * 60 ? "\(minutes / 60)h ago" : "\(minutes / 1440)d ago")
         } else {
             calendarAge = s.refreshMode == "off" ? "Calendar off" : "No calendar yet"
         }
@@ -440,6 +444,13 @@ struct MenuPanelContent {
 
     /// The refresh error as a sentence a person can act on.
     static func plainWords(_ error: String) -> String {
+        // auto: gws failed, then claude did too. gws's reason is the useful one.
+        if error.hasPrefix("gws: "), let gws = error.components(separatedBy: "; claude: ").first {
+            return plainWords(String(gws.dropFirst(5)))
+        }
+        if error.contains("keychain") { return "The gws CLI couldn't get its Google token from the keychain in time." }
+        if error.hasPrefix("gws exited") { return "The gws CLI couldn't read your calendar. Run `gws calendar events list` in a terminal to see why." }
+        if error.contains("calendar_command") { return "Your calendar_command failed: " + (error.components(separatedBy: ": ").dropFirst().joined(separator: ": ")) }
         if error.contains("needs-auth") {
             return "Claude Code's Google Calendar connector isn't signed in. Run /mcp in Claude Code to sign in."
         }
@@ -564,6 +575,7 @@ private struct PillButton: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .fixedSize()
         .onHover { hovered = $0 }
     }
 }
@@ -754,14 +766,13 @@ private struct Footer: View {
     let act: (MenuBarAction) -> Void
 
     var body: some View {
-        HStack(spacing: 4) {
-            PillButton(label: "Start meeting", style: .plain, padding: 7) { act(.startMeeting) }
-            PillButton(label: "Dictate", style: .plain, padding: 7) { act(.dictate) }
-            Spacer(minLength: 4)
-            Text(age).font(.system(size: 11)).foregroundColor(Palette.secondary).lineLimit(1).fixedSize()
+        HStack(spacing: 2) {
+            PillButton(label: "Start meeting", style: .plain, padding: 6) { act(.startMeeting) }
+            PillButton(label: "Dictate", style: .plain, padding: 6) { act(.dictate) }
+            Spacer(minLength: 2)
+            Text(age).font(.system(size: 10.5)).foregroundColor(Palette.secondary).lineLimit(1).truncationMode(.head)
             IconButton(symbol: refreshing ? "hourglass" : "arrow.clockwise", help: "Refresh the calendar") { act(.refresh) }
             IconButton(symbol: "gearshape", help: "Open recorder.toml") { act(.settings) }
         }
-        .padding(.horizontal, 2)
     }
 }

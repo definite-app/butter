@@ -133,7 +133,7 @@ Copies from password managers (marked concealed or transient on the clipboard) a
 
 ## Calendar
 
-butter-rec reads your upcoming events from one file, `~/.butter/calendar/upcoming.json`. It never talks to Google or any other calendar service itself. Anything can fill the file. By default the daemon asks headless Claude Code to read your calendar through your calendar MCP server.
+butter-rec reads your upcoming events from one file, `~/.butter/calendar/upcoming.json`. It never talks to Google or any other calendar service itself. Anything can fill the file. By default the daemon [refreshes it](#refreshing-it) with the `gws` CLI if you have it, or else asks headless Claude Code to read your calendar through your calendar MCP server.
 
 With events in the file:
 
@@ -152,7 +152,7 @@ butter-cli rec calendar refresh              # ask claude now (in the daemon if 
 ```json
 {
   "updated_at": "2026-10-20T09:00:00-04:00",
-  "source": "claude (claude.ai Google Calendar)",
+  "source": "gws (primary)",
   "events": [
     {
       "id": "abc123",
@@ -177,26 +177,43 @@ Write it with `calendar import`, not by hand. Import checks the events, normaliz
 
 Import drops events with no usable start or end, events that end before they start, timed events over 24 hours, cancelled events and events you declined. Then it prints how many it kept and dropped. All-day events are kept with `"all_day": true`. If there were events and none were usable, or the input isn't JSON, or it's `{"error": ...}`, the old file stays and the command fails. An explicit empty list (`[]`) means a free day.
 
-### Refresh with Claude Code
+### Refreshing it
 
-With `calendar_refresh = "claude"`, the daemon runs `claude -p` once when it starts and every hour between 7:00 and 19:00. It asks for your events in the next 24 hours as JSON and puts the reply through the same checks as import.
+The daemon refreshes the file once when it starts, then on a timer between 7:00 and 19:00 (`calendar_hours`). Each refresh fetches the next 24 hours and runs the result through the same checks as import. `calendar_refresh` picks the source:
+
+| | Source | Every |
+|---|---|---|
+| `auto` (default) | `gws` if it's installed and works, otherwise Claude Code | 10 min with gws, 60 with claude |
+| `gws` | the Google Workspace CLI: `gws calendar events list` on each of `gws_calendars` | 10 min |
+| `claude` | headless Claude Code through your calendar MCP server | 60 min |
+| `command` | `calendar_command`, a shell command that prints events as JSON | 10 min |
+| `off` | nothing; fill the file with `butter-cli rec calendar import` | |
+
+`calendar_refresh_minutes` overrides the interval. If a refresh fails, the old file stays, `rec.log` says why, and `butter-cli rec status` shows it under `calendar.last_error` (in `auto`, both gws's and claude's reasons). The menu bar shows the same reason.
+
+**gws** prints Google's own API format, which import reads as is. A zero exit with JSON counts, and `{"items": []}` is a free day. The daemon finds `gws` the way it finds `claude` (the usual paths, then your login shell), or uses `gws_path`. It runs gws with your login shell's environment. gws reads its Google token from the keychain. If macOS were to ask for keychain access with nobody there to answer, the call times out after 30 seconds with "waiting on a keychain prompt?".
+
+**command** runs in a login shell. `{time_min}` and `{time_max}` are replaced with the window in UTC RFC 3339, for example `calendar_command = "my-cal --from {time_min} --to {time_max} --json"`. Its stdout can be any shape import accepts.
+
+**claude** runs `claude -p` and asks for your events as JSON.
 
 - It uses the MCP servers from your Claude Code user settings, including claude.ai connectors such as Google Calendar. The tools differ between people, so it runs `claude mcp list` and picks the servers with "calendar" in their name, or `calendar_mcp_servers` if you set it.
-- Only those servers' tools are allowed (`--allowedTools mcp__<server>`, `--permission-mode dontAsk`). Your other MCP servers aren't connected (`deniedMcpServers`), built-in tools are off (`--tools ""`), and so are hooks (`disableAllHooks`) and skills. Sessions aren't saved.
-- A reply only counts if a calendar tool call succeeded. Prose, an `{"error": ...}`, or events with no calendar call behind them count as a failed refresh. When a refresh fails, the old file stays, `rec.log` says why, and `butter-cli rec status` shows it under `calendar.last_error`. claude's raw output from the last refresh is in `~/.butter/calendar/last-refresh.jsonl`.
+- Only those servers' tools are allowed (`--allowedTools mcp__<server>`, `--permission-mode dontAsk`). Your other MCP servers aren't connected (`deniedMcpServers`), built-in tools are off (`--tools ""`), and so are hooks (`disableAllHooks`) and skills. Sessions aren't saved. `MCP_CONNECTION_NONBLOCKING=false` makes claude wait for claude.ai connectors instead of starting without them.
+- A reply only counts if a calendar tool call succeeded. Prose, an `{"error": ...}`, or events with no calendar call behind them count as a failed refresh. claude's raw output from the last refresh is in `~/.butter/calendar/last-refresh.jsonl`.
 - If the connector isn't signed in, you'll see `claude has no calendar tools (claude.ai Google Calendar: needs-auth)`. Run `/mcp` in Claude Code to sign in.
-
-To fill the file some other way, such as an agent on another machine or a script, set `calendar_refresh = "off"` and run `butter-cli rec calendar import`.
 
 ```toml
 [meeting]
-calendar_refresh = "claude"        # claude | off
-calendar_refresh_minutes = 60
+calendar_refresh = "auto"          # auto | gws | claude | command | off
+# calendar_refresh_minutes = 10    # default: 10 for gws and command, 60 for claude
 calendar_hours = "7-19"            # local hours to refresh in (plus once when the daemon starts)
 calendar_nudge_minutes = 2         # 0 = no nudges
+gws_path = ""                      # where gws is, if it isn't found
+gws_calendars = ["primary"]        # calendar ids for gws
+calendar_command = ""              # for calendar_refresh = "command"
 calendar_model = "haiku"           # claude --model for the refresh
 calendar_mcp_servers = []          # e.g. ["claude.ai Google Calendar"]; [] = any with "calendar" in the name
-calendar_timeout_seconds = 180
+calendar_timeout_seconds = 180     # claude and calendar_command
 ```
 
 ### Menu bar
@@ -208,8 +225,8 @@ Click it for a panel:
 - **Next:** the next call, with its time, app and attendees. **Record** starts a meeting named after it, and **Join** opens the link. While you're recording, this becomes the recording, with Stop, Screenshot and Show pill.
 - **Today** and **Tomorrow:** your events. A past call shows "✓ 14 min" if it was recorded (click it to open the transcript), or "Not recorded".
 - **Recent:** the last few meetings and dictations. Hover a meeting for its transcript, ✦ notes (writes them if there aren't any yet), copy and Finder. Hover a dictation for Copy and Paste again. **All recordings…** opens the meetings folder.
-- **Footer:** Start meeting, Dictate, when the calendar was last updated, refresh, and ⚙ (opens `recorder.toml`).
-- When the claude refresh fails, a card at the top says why in plain words, with Try again, How to connect, and Turn off (sets `calendar_refresh = "off"` in `recorder.toml`, keeping your comments).
+- **Footer:** Start meeting, Dictate, where the calendar came from and when ("Calendar (gws) 3m ago"), refresh, and ⚙ (opens `recorder.toml`).
+- When the calendar refresh fails, a card at the top says why in plain words, with Try again, How to connect, and Turn off (sets `calendar_refresh = "off"` in `recorder.toml`, keeping your comments).
 
 Esc or a click anywhere else closes it. `[ui] menu_bar = false` removes it.
 

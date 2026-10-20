@@ -1151,7 +1151,7 @@ final class Daemon {
         calendarTimer = timer
         // Once when the daemon starts, whatever the hour, unless one just ran (a restart).
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
-            guard let self, self.config.calendarRefresh == "claude", !self.calendarRefreshing,
+            guard let self, self.config.calendarRefresh != "off", !self.calendarRefreshing,
                   Date().timeIntervalSince(self.calendarStatus.attemptAt ?? .distantPast) > 300 else { return }
             self.refreshCalendarInBackground()
         }
@@ -1167,8 +1167,8 @@ final class Daemon {
     private func calendarTick() {
         if CalendarStore.modified != calendarModified { reloadCalendar() }
         updateNudge()
-        let due = Date().timeIntervalSince(calendarStatus.attemptAt ?? .distantPast) >= max(5, config.calendarRefreshMinutes) * 60
-        if config.calendarRefresh == "claude", !calendarRefreshing, due, withinHours(config.calendarHours) {
+        let due = Date().timeIntervalSince(calendarStatus.attemptAt ?? .distantPast) >= CalendarRefresh.interval(config, calendarStatus) * 60
+        if config.calendarRefresh != "off", !calendarRefreshing, due, withinHours(config.calendarHours) {
             refreshCalendarInBackground()
         }
     }
@@ -1244,6 +1244,7 @@ final class Daemon {
     private func calendarInfo() -> [String: Any] {
         var info = calendarStatus.dict
         info["refresh"] = config.calendarRefresh
+        info["refresh_minutes"] = CalendarRefresh.interval(config, calendarStatus)
         info["refreshing"] = calendarRefreshing
         info["file"] = Paths.calendarFile.path
         let snapshot = calendarSnapshot
@@ -1298,6 +1299,7 @@ final class Daemon {
             s.events = snapshot.events
             s.stale = snapshot.stale
             s.updatedAt = snapshot.updatedAt
+            s.source = snapshot.source
         }
         s.refreshMode = config.calendarRefresh
         s.refreshing = calendarRefreshing
@@ -1342,7 +1344,7 @@ final class Daemon {
             Config.ensureDefaultFile()
             _ = try? runProcess("/usr/bin/open", ["-t", Paths.configFile.path], timeout: 10)
         case .howToConnect:
-            if let url = URL(string: "https://github.com/definite-app/butter/blob/main/recorder/README.md#refresh-with-claude-code") {
+            if let url = URL(string: "https://github.com/definite-app/butter/blob/main/recorder/README.md#refreshing-it") {
                 NSWorkspace.shared.open(url)
             }
         case .turnOffCalendar:
