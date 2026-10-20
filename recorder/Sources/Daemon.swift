@@ -186,7 +186,10 @@ final class Daemon {
         requestPermissions()
         resumeUnprocessedMeetings()
         let config = self.config
-        DispatchQueue.global(qos: .utility).async { Meetings.pruneRaw(config) }
+        DispatchQueue.global(qos: .utility).async {
+            Meetings.pruneRaw(config)
+            _ = Cleanup.loginEnvironment()  // so the first cleanup doesn't wait for the shell
+        }
         log("daemon started (pid \(getpid())); config \(Paths.configFile.path)")
     }
 
@@ -257,6 +260,7 @@ final class Daemon {
 
     private func reload() {
         config = Config.load()
+        Cleanup.forgetEnvironment()
         worker.idleMinutes = config.idleUnloadMinutes
         hud.showCleanup = config.cleanupButton
         registerHotkeys()

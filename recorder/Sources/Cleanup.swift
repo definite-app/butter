@@ -107,10 +107,16 @@ enum Cleanup {
                         "--setting-sources", "", "--system-prompt", systemPrompt ?? claudeSystemPrompt]
             if !model.isEmpty { args += ["--model", model] }
             if !config.cleanupEffort.isEmpty { args += ["--effort", config.cleanupEffort] }
+            // Settings files are skipped (no hooks, plugins or permissions), but
+            // how claude logs in has to come along: `env` and the auth helpers.
+            let auth = claudeAuth()
+            if !auth.settings.isEmpty { args += ["--settings", jsonString(auth.settings)] }
+            var environment: [String: String?] = auth.environment
             // Run outside any project so no CLAUDE.md is picked up, and don't look
             // like a nested session if the CLI was started from inside Claude Code.
-            result = try runProcess(claude, args, stdin: input, timeout: timeout,
-                                    environment: ["CLAUDECODE": nil, "CLAUDE_CODE_ENTRYPOINT": nil], directory: Paths.dictationDir)
+            environment["CLAUDECODE"] = .some(nil)
+            environment["CLAUDE_CODE_ENTRYPOINT"] = .some(nil)
+            result = try runProcess(claude, args, stdin: input, timeout: timeout, environment: environment, directory: Paths.dictationDir)
         case "command":
             let command = config.cleanupCommand.trimmingCharacters(in: .whitespaces)
             guard !command.isEmpty else { throw CLIError("[cleanup] harness = \"command\" needs a command") }
@@ -128,6 +134,57 @@ enum Cleanup {
     }
 
     private static var foundClaude: String?
+    private static var shellEnvironment: [String: String]?
+    private static let environmentLock = NSLock()
+
+    /// Your login shell's environment. launchd starts the daemon without it, so
+    /// claude misses CLAUDE_CONFIG_DIR, API keys or Bedrock/Vertex settings
+    /// exported in ~/.zshrc and says it isn't logged in. Read once (again after reload).
+    static func loginEnvironment() -> [String: String] {
+        environmentLock.lock()
+        defer { environmentLock.unlock() }
+        if let shellEnvironment { return shellEnvironment }
+        let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
+        let marker = "__BUTTER_REC_ENV__"
+        var env: [String: String] = [:]
+        if let result = try? runProcess(shell, ["-lic", "printf '\\n\(marker)\\n'; /usr/bin/env -0"], timeout: 8), result.status == 0,
+           let range = result.stdout.range(of: Data("\n\(marker)\n".utf8)) {
+            for entry in result.stdout[range.upperBound...].split(separator: 0) {
+                guard let line = String(data: Data(entry), encoding: .utf8), let eq = line.firstIndex(of: "=") else { continue }
+                env[String(line[..<eq])] = String(line[line.index(after: eq)...])
+            }
+        } else {
+            log("cleanup: couldn't read the environment from \(shell)")
+        }
+        for key in ["PWD", "OLDPWD", "SHLVL", "_", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID", "TMPDIR", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] {
+            env[key] = nil
+        }
+        shellEnvironment = env
+        return env
+    }
+
+    /// After a config reload: read the shell environment again next time.
+    static func forgetEnvironment() {
+        environmentLock.lock()
+        shellEnvironment = nil
+        environmentLock.unlock()
+    }
+
+    /// The login environment plus `env` from Claude Code's user settings, and
+    /// that file's auth helpers (apiKeyHelper, ...) to pass with --settings.
+    static func claudeAuth() -> (environment: [String: String?], settings: [String: Any]) {
+        var environment: [String: String?] = loginEnvironment().mapValues { $0 }
+        let dir = (environment["CLAUDE_CONFIG_DIR"] ?? nil).map { Paths.expand($0) } ?? Paths.home.appendingPathComponent(".claude")
+        var settings: [String: Any] = [:]
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("settings.json")),
+           let user = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            for (key, value) in user["env"] as? [String: Any] ?? [:] { environment[key] = "\(value)" }
+            for key in ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "forceLoginMethod"] where user[key] != nil {
+                settings[key] = user[key]
+            }
+        }
+        return (environment, settings)
+    }
 
     /// [cleanup] claude_path, else `claude` in the usual places, else whatever your
     /// login shell runs for `claude` (an alias to ~/.claude/local/claude, say):
