@@ -148,6 +148,20 @@ final class Daemon {
     private var readyMeeting: URL?
     private var notesInFlight: Set<String> = []
 
+    // Calendar
+    private var calendarTimer: Timer?
+    private var calendarModified: Date?
+    private var calendarSnapshot: CalendarStore.Snapshot?
+    private var calendarStatus = CalendarRefresh.Status.load()
+    private var calendarRefreshing = false
+    /// Refreshes run one at a time, from the timer or `butter-rec calendar refresh`.
+    private let calendarQueue = DispatchQueue(label: "app.butter.rec.calendar")
+    /// Events already nudged about (id|start), so each gets one nudge.
+    private var nudged: Set<String> = []
+    /// The event on the nudge pill, until it's recorded, dismissed, or 5 min after it starts.
+    private var nudge: CalendarEvent?
+    private var nudgeDetail = ""
+
     init() {
         worker = ASRWorker(idleMinutes: config.idleUnloadMinutes)
     }
@@ -172,6 +186,15 @@ final class Daemon {
         hud.onCopy = { [unowned self] in if let dir = self.readyMeeting { self.copyMeeting(dir) } }
         hud.onNotes = { [unowned self] in if let dir = self.readyMeeting { self.writeNotes(dir) } }
         hud.onDismiss = { [unowned self] in self.dismissReady() }
+        hud.onRecord = { [unowned self] in
+            guard let event = self.nudge else { return }
+            self.clearNudge()
+            _ = self.startMeeting(title: event.title, event: event)
+        }
+        hud.onNudgeDismiss = { [unowned self] in
+            log("calendar: nudge for \"\(self.nudge?.title ?? "")\" dismissed")
+            self.clearNudge()
+        }
         hud.historyProvider = { [unowned self] in self.historyItems() }
         hud.onPickHistory = { [unowned self] text in self.setClipboard(text) }
         hud.onMeetingAction = { [unowned self] dir, action in
@@ -185,6 +208,7 @@ final class Daemon {
         registerHotkeys()
         requestPermissions()
         resumeUnprocessedMeetings()
+        startCalendar()
         let config = self.config
         DispatchQueue.global(qos: .utility).async {
             Meetings.pruneRaw(config)
@@ -200,9 +224,10 @@ final class Daemon {
         }
         dictationMic?.stop()
         dictationSink?.close()
-        if let callCapture, let sink = dictationSink {
-            // Saved as "recorded"; the next daemon start transcribes it.
-            _ = callCapture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds, title: dictationAsMeeting ? "Meeting" : nil)
+        if let callCapture, let sink = dictationSink,
+           // Saved as "recorded"; the next daemon start transcribes it.
+           let dir = callCapture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds, title: dictationAsMeeting ? "Meeting" : nil) {
+            Meetings.attachCalendarEvent(dir, userTitle: false)
         }
         worker.stop(reason: "shutdown")
         unlink(Paths.socket.path)
@@ -486,6 +511,7 @@ final class Daemon {
                 return ["ok": false, "error": "couldn't save the meeting"]
             }
             sound(config.stopSound)
+            Meetings.attachCalendarEvent(dir, userTitle: false)
             Meetings.addScreenshots(shots, to: dir)
             Meetings.addClips(clips, to: dir)
             announce(dir)
@@ -497,6 +523,7 @@ final class Daemon {
         if let capture = callCapture,
            let dir = capture.finish(mic: sink, minSeconds: config.handsFreeCallMinSeconds, keepSystemAs: audio.system) {
             callMeeting = dir.lastPathComponent
+            Meetings.attachCalendarEvent(dir, userTitle: false)
             Meetings.addScreenshots(shots, to: dir)
             Meetings.addClips(clips, to: dir)
             enqueueProcessing(dir)
@@ -673,6 +700,9 @@ final class Daemon {
         if let meeting {
             hud.screenshotCount = meetingShots
             hud.show(.meeting(level: { [weak meeting] in meeting?.micLevel ?? 0 }, since: meeting.startedAt))
+        } else if let nudge {
+            let title = nudge.title.count > 36 ? String(nudge.title.prefix(35)) + "…" : nudge.title
+            hud.show(.nudge(title: title, detail: nudgeDetail))
         } else if let processingPill {
             hud.show(.processing(processingPill.label))
         } else if let readyMeeting {
@@ -748,19 +778,25 @@ final class Daemon {
         meeting == nil ? startMeeting(title: title) : stopMeeting()
     }
 
-    private func startMeeting(title: String?) -> [String: Any] {
+    /// Without a title, a meeting started during a calendar event (or up to 10
+    /// min before it) is named after it; either way it keeps the event's details.
+    private func startMeeting(title: String?, event: CalendarEvent? = nil) -> [String: Any] {
         if let meeting { return ["ok": false, "error": "already recording \(meeting.dir.lastPathComponent)"] }
+        let event = event ?? CalendarStore.event(at: Date(), in: calendarSnapshot)
+        let title = title.flatMap { $0.trimmed.isEmpty ? nil : $0 } ?? event?.title
         do {
             let dir = try Meetings.newDirectory(title: title, config)
             let recording = try MeetingRecording(dir: dir, title: title ?? "Meeting", config: config,
-                                                 inputDevice: InputDevices.resolve(config.inputDevice))
+                                                 inputDevice: InputDevices.resolve(config.inputDevice), event: event)
             meeting = recording
+            clearNudge(restore: false)
             meetingShots = 0
             updateSessionHotkeys()
             sound(config.startSound)
             if dictationMic == nil { restoreHUD() }
-            log("meeting started: \(dir.path)")
-            return ["ok": true, "meeting": dir.lastPathComponent, "dir": dir.path, "warnings": recording.warnings]
+            log("meeting started: \(dir.path)\(event.map { " (calendar: \($0.title))" } ?? "")")
+            return ["ok": true, "meeting": dir.lastPathComponent, "dir": dir.path, "title": recording.title,
+                    "calendar_event": event?.id ?? NSNull(), "warnings": recording.warnings]
         } catch {
             sound(config.errorSound)
             if dictationMic == nil { showError() }
@@ -1096,11 +1132,160 @@ final class Daemon {
         }
     }
 
+    // MARK: - Calendar
+
+    /// Every 15s: re-read upcoming.json when it changes, nudge before calls, and
+    /// refresh it through claude when that's due (calendar_refresh).
+    private func startCalendar() {
+        reloadCalendar()
+        let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.calendarTick() }
+        RunLoop.main.add(timer, forMode: .common)
+        calendarTimer = timer
+        // Once when the daemon starts, whatever the hour, unless one just ran (a restart).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.config.calendarRefresh == "claude", !self.calendarRefreshing,
+                  Date().timeIntervalSince(self.calendarStatus.attemptAt ?? .distantPast) > 300 else { return }
+            self.refreshCalendarInBackground()
+        }
+        updateNudge()
+    }
+
+    private func reloadCalendar() {
+        calendarModified = CalendarStore.modified
+        calendarSnapshot = CalendarStore.load()
+    }
+
+    private func calendarTick() {
+        if CalendarStore.modified != calendarModified { reloadCalendar() }
+        updateNudge()
+        let due = Date().timeIntervalSince(calendarStatus.attemptAt ?? .distantPast) >= max(5, config.calendarRefreshMinutes) * 60
+        if config.calendarRefresh == "claude", !calendarRefreshing, due, withinHours(config.calendarHours) {
+            refreshCalendarInBackground()
+        }
+    }
+
+    private func refreshCalendarInBackground() {
+        calendarRefreshing = true
+        let config = self.config
+        calendarQueue.async { [weak self] in
+            let status = CalendarRefresh.run(config: config)
+            DispatchQueue.main.async { self?.calendarRefreshed(status) }
+        }
+    }
+
+    /// `butter-rec calendar refresh`, on the socket thread: waits for a refresh
+    /// already running, and uses it if it finished after this was asked.
+    private func refreshCalendarNow() -> [String: Any] {
+        let asked = Date()
+        let config = DispatchQueue.main.sync { self.config }
+        let status: CalendarRefresh.Status = calendarQueue.sync {
+            let last = CalendarRefresh.Status.load()
+            if let finished = last.finishedAt, finished >= asked { return last }
+            DispatchQueue.main.async { self.calendarRefreshing = true }
+            return CalendarRefresh.run(config: config)
+        }
+        DispatchQueue.main.async { self.calendarRefreshed(status) }
+        var reply: [String: Any] = ["ok": status.error == nil, "refresh": status.dict]
+        if let error = status.error { reply["error"] = error }
+        return reply
+    }
+
+    private func calendarRefreshed(_ status: CalendarRefresh.Status) {
+        calendarStatus = status
+        calendarRefreshing = false
+        reloadCalendar()
+        updateNudge()
+    }
+
+    /// "<Title> in 2 min" on the pill before a call (an event with a link or
+    /// attendees), once per event, while nothing is recording. It goes away
+    /// when recorded, dismissed, or 5 minutes after the event starts.
+    private func updateNudge() {
+        let now = Date()
+        if let current = nudge, now >= current.start.addingTimeInterval(300) || meeting != nil || dictationAsMeeting {
+            clearNudge()
+        }
+        let lead = config.calendarNudgeMinutes * 60
+        if nudge == nil, lead > 0, config.hud, dictationMic == nil, meeting == nil, let snapshot = calendarSnapshot, !snapshot.stale,
+           let next = snapshot.events.first(where: {
+               $0.isMeeting && !nudged.contains($0.key) && now >= $0.start.addingTimeInterval(-lead) && now < $0.start.addingTimeInterval(300)
+           }) {
+            nudged.insert(next.key)
+            nudge = next
+            log("calendar: nudging for \"\(next.title)\" (\(next.when))")
+        }
+        guard let nudge else { return }
+        let seconds = nudge.start.timeIntervalSince(now)
+        let detail = seconds > 30 ? "in \(max(1, Int((seconds / 60).rounded()))) min"
+            : seconds > -60 ? "now" : "started \(Int(-seconds / 60)) min ago"
+        guard detail != nudgeDetail else { return }
+        nudgeDetail = detail
+        if dictationMic == nil && meeting == nil { restoreHUD() }
+    }
+
+    private func clearNudge(restore: Bool = true) {
+        guard nudge != nil else { return }
+        nudge = nil
+        nudgeDetail = ""
+        if restore && dictationMic == nil && meeting == nil { restoreHUD() }
+    }
+
+    /// The calendar part of `status` (and `calendar.list`).
+    private func calendarInfo() -> [String: Any] {
+        var info = calendarStatus.dict
+        info["refresh"] = config.calendarRefresh
+        info["refreshing"] = calendarRefreshing
+        info["file"] = Paths.calendarFile.path
+        let snapshot = calendarSnapshot
+        info["updated_at"] = snapshot?.updatedAt.map(isoString) ?? NSNull()
+        info["source"] = snapshot?.source ?? NSNull()
+        info["events"] = snapshot?.events.count ?? 0
+        info["stale"] = snapshot.map { $0.stale } ?? NSNull()
+        let now = Date()
+        if let next = snapshot?.events.first(where: { $0.isMeeting && $0.start > now }) { info["next"] = "\(next.title), \(next.when)" }
+        if let nudge { info["nudge"] = nudge.title }
+        return info
+    }
+
+    /// Upcoming events today and tomorrow, for a menu bar item.
+    private func calendarList() -> [String: Any] {
+        let now = Date()
+        let end = Calendar.current.date(byAdding: .day, value: 2, to: Calendar.current.startOfDay(for: now)) ?? now
+        let events = (calendarSnapshot?.events ?? []).filter { $0.end > now && $0.start < end }.map { event -> [String: Any] in
+            var dict = event.dict
+            dict["nudge"] = event.isMeeting
+            return dict
+        }
+        return ["ok": true, "events": events, "calendar": calendarInfo()]
+    }
+
+    /// Recent meetings, newest first, for a menu bar item.
+    private func meetingsList(limit: Int) -> [String: Any] {
+        let fm = FileManager.default
+        let items = Meetings.all(config).prefix(max(1, limit)).compactMap { dir -> [String: Any]? in
+            guard let meta = MeetingMeta.load(dir) else { return nil }
+            let live = meeting?.dir.standardizedFileURL == dir.standardizedFileURL
+            var item: [String: Any] = [
+                "id": dir.lastPathComponent, "title": live ? meeting?.title ?? meta.title : meta.title,
+                "started_at": meta.dict["started_at"] ?? NSNull(), "duration": live ? meeting?.elapsed ?? 0 : meta.duration,
+                "status": meta.status, "dir": dir.path,
+                "transcript": fm.fileExists(atPath: dir.appendingPathComponent("transcript.md").path),
+                "notes": fm.fileExists(atPath: dir.appendingPathComponent("notes.md").path),
+            ]
+            if let event = meta.calendarEvent { item["calendar_event"] = event }
+            if let error = meta.dict["error"] { item["error"] = error }
+            return item
+        }
+        return ["ok": true, "meetings": items]
+    }
+
     // MARK: - Control requests
 
     /// Called on a socket thread. Long-running transcription stays here so the
     /// main thread (hotkeys, recording state) never blocks; everything else hops to main.
     private func handle(_ request: [String: Any]) -> [String: Any] {
+        // A claude refresh takes a while; it waits here, off the main thread.
+        if request["cmd"] as? String == "calendar.refresh" { return refreshCalendarNow() }
         if request["cmd"] as? String == "transcribe" {
             guard let audio = request["audio"] as? String else { return ["ok": false, "error": "missing audio"] }
             let config = DispatchQueue.main.sync { self.config }
@@ -1154,6 +1339,23 @@ final class Daemon {
             guard dictationMic != nil || meeting != nil else { return ["ok": false, "error": "no session is running"] }
             takeScreenshot()
             return ["ok": true]
+        case "calendar.list":
+            return calendarList()
+        case "calendar.reload":
+            reloadCalendar()
+            updateNudge()
+            return ["ok": true, "events": calendarSnapshot?.events.count ?? 0]
+        case "calendar.dismiss":
+            // The nudge pill's ×.
+            guard let event = nudge else { return ["ok": false, "error": "no nudge is showing"] }
+            log("calendar: nudge for \"\(event.title)\" dismissed")
+            clearNudge()
+            return ["ok": true, "dismissed": event.id]
+        case "meetings.list":
+            return meetingsList(limit: request["limit"] as? Int ?? 20)
+        case "dictations.list":
+            let entries = DictationHistory.recent(limit: request["limit"] as? Int ?? 20, search: request["search"] as? String)
+            return ["ok": true, "dictations": entries]
         default:
             return ["ok": false, "error": "unknown command \(request["cmd"] ?? "")"]
         }
@@ -1180,6 +1382,7 @@ final class Daemon {
                                 "call_audio": callCapture?.dir.lastPathComponent ?? NSNull()] as [String: Any]
         }
         if let lastDictation { out["last_dictation"] = lastDictation }
+        out["calendar"] = calendarInfo()
         return out
     }
 

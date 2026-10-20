@@ -18,7 +18,7 @@ Local dictation and meeting recording for Butter. Like Handy, it has push-to-tal
 
 A quick tap of the push-to-talk shortcut (let go within 0.4s, `tap_seconds`) keeps recording hands-free; `tap_for_hands_free = false` turns that off. Holding it and then pressing the hands-free shortcut also switches the recording you're in to hands-free. Hands-free starts on the Meeting side of the pill's switch, so both sides are saved and nothing is pasted until you flip it to Dictate; `hands_free_mode = "dictate"` starts it on Dictate instead. `esc` and the screenshot shortcut are only taken from other apps while a session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
 
-Meetings start only when you start them: with the meeting shortcut, the CLI, or a hands-free session left on the Meeting side of its switch. Nothing watches for calls on its own. A hands-free session switched to Dictate that turns out to be a call is also [saved as a meeting](#use). See [After a meeting](#after-a-meeting) for getting to the transcript.
+Meetings start only when you start them: with the meeting shortcut, the CLI, a hands-free session left on the Meeting side of its switch, or Record on a [calendar nudge](#calendar). Nothing listens for calls on its own. A hands-free session switched to Dictate that turns out to be a call is also [saved as a meeting](#use). See [After a meeting](#after-a-meeting) for getting to the transcript.
 
 ### Change a shortcut
 
@@ -131,6 +131,83 @@ What you copy during a hands-free session or a meeting is kept with it (`capture
 
 Copies from password managers (marked concealed or transient on the clipboard) are skipped, and ButterRec's own pastes don't count. A card above the pill shows the start of what was kept.
 
+## Calendar
+
+butter-rec reads your upcoming events from one file, `~/.butter/calendar/upcoming.json`. It never talks to Google or any other calendar service itself. Anything can fill the file. By default the daemon asks headless Claude Code to read your calendar through your calendar MCP server.
+
+With events in the file:
+
+- **Nudges.** 2 minutes before a call (`calendar_nudge_minutes`), the pill shows "Acme sync in 2 min" with **Record** and ×. A call is a timed event with a join link or attendees, so "Focus time" and all-day events never nudge. Record starts a meeting named after the event. Each event nudges once. There's no nudge while you're recording, and the nudge goes away 5 minutes after the event starts.
+- **Meeting titles and attendees.** A meeting that starts during an event, or up to 10 minutes before one, takes the event's title (unless you gave it one) and keeps the event in `meeting.json` as `calendar_event`. That works however the meeting started, including hands-free sessions saved as meetings. `transcript.md` lists the attendees, and ✦ Notes gets them so it can use a name instead of "Them" when the transcript makes clear who's speaking.
+- If `updated_at` is more than 24 hours old, the file isn't used for nudges or titles.
+
+```sh
+butter-cli rec calendar                      # what's coming up, where it came from, the last refresh error
+butter-cli rec calendar import events.json   # or `-` for stdin; --source "work laptop"
+butter-cli rec calendar refresh              # ask claude now (in the daemon if it's running)
+```
+
+### The file
+
+```json
+{
+  "updated_at": "2026-10-20T09:00:00-04:00",
+  "source": "claude (claude.ai Google Calendar)",
+  "events": [
+    {
+      "id": "abc123",
+      "title": "Acme sync",
+      "start": "2026-10-20T14:00:00-04:00",
+      "end": "2026-10-20T14:30:00-04:00",
+      "all_day": false,
+      "attendees": [{"name": "Ada Lovelace", "email": "ada@acme.com"}],
+      "join_url": "https://meet.google.com/abc-defg-hij",
+      "calendar": "Work"
+    }
+  ]
+}
+```
+
+Write it with `calendar import`, not by hand. Import checks the events, normalizes them and writes the file atomically, then tells the daemon to reload it. It accepts the shapes agents tend to produce:
+
+- this format, a bare array of events, or `{"events": [...]}`
+- a Google Calendar API list (`items`, `summary`, `start.dateTime` / `start.date` with `timeZone`, `hangoutLink`, `conferenceData` entry points). Your own entry, rooms and people who declined are left out of the attendees.
+- attendees as names, emails or `{name, email}` objects
+- a Meet, Zoom, Teams or Webex link in the location or description when there's no `join_url`
+
+Import drops events with no usable start or end, events that end before they start, timed events over 24 hours, cancelled events and events you declined. Then it prints how many it kept and dropped. All-day events are kept with `"all_day": true`. If there were events and none were usable, or the input isn't JSON, or it's `{"error": ...}`, the old file stays and the command fails. An explicit empty list (`[]`) means a free day.
+
+### Refresh with Claude Code
+
+With `calendar_refresh = "claude"`, the daemon runs `claude -p` once when it starts and every hour between 7:00 and 19:00. It asks for your events in the next 24 hours as JSON and puts the reply through the same checks as import.
+
+- It uses the MCP servers from your Claude Code user settings, including claude.ai connectors such as Google Calendar. The tools differ between people, so it runs `claude mcp list` and picks the servers with "calendar" in their name, or `calendar_mcp_servers` if you set it.
+- Only those servers' tools are allowed (`--allowedTools mcp__<server>`, `--permission-mode dontAsk`). Your other MCP servers aren't connected (`deniedMcpServers`), built-in tools are off (`--tools ""`), and so are hooks (`disableAllHooks`) and skills. Sessions aren't saved.
+- A reply only counts if a calendar tool call succeeded. Prose, an `{"error": ...}`, or events with no calendar call behind them count as a failed refresh. When a refresh fails, the old file stays, `rec.log` says why, and `butter-cli rec status` shows it under `calendar.last_error`. claude's raw output from the last refresh is in `~/.butter/calendar/last-refresh.jsonl`.
+- If the connector isn't signed in, you'll see `claude has no calendar tools (claude.ai Google Calendar: needs-auth)`. Run `/mcp` in Claude Code to sign in.
+
+To fill the file some other way, such as an agent on another machine or a script, set `calendar_refresh = "off"` and run `butter-cli rec calendar import`.
+
+```toml
+[meeting]
+calendar_refresh = "claude"        # claude | off
+calendar_refresh_minutes = 60
+calendar_hours = "7-19"            # local hours to refresh in (plus once when the daemon starts)
+calendar_nudge_minutes = 2         # 0 = no nudges
+calendar_model = "haiku"           # claude --model for the refresh
+calendar_mcp_servers = []          # e.g. ["claude.ai Google Calendar"]; [] = any with "calendar" in the name
+calendar_timeout_seconds = 180
+```
+
+### For other apps
+
+The daemon socket (`~/.butter/rec.sock`, one JSON line in and one out) also answers:
+
+- `{"cmd": "calendar.list"}`: events today and tomorrow that haven't ended, with refresh status
+- `{"cmd": "calendar.refresh"}`, `{"cmd": "calendar.reload"}`, `{"cmd": "calendar.dismiss"}` (the nudge's ×)
+- `{"cmd": "meetings.list", "limit": 20}`: recent meetings with id, title, start, duration, status, folder, whether `transcript.md` and `notes.md` exist, and `calendar_event`
+- `{"cmd": "dictations.list", "limit": 20, "search": "…"}`: recent dictations from history
+
 ## Configure
 
 Edit `~/.config/butter/recorder.toml`, then run `butter-cli rec reload`. The file documents every key. For shortcuts, see [Change a shortcut](#change-a-shortcut). The other main settings:
@@ -199,5 +276,5 @@ Logs go to `~/.butter/logs/rec.log`. Set `BUTTER_REC_CONFIG=/path/to.toml` to ru
 
 - If you're on speakers rather than headphones, your mic also picks up the other side. Overlapping "Me" lines that repeat "Them" lines get dropped, but some echo can still get through.
 - If the default output device changes during a meeting (for example, AirPods connect), system audio may stop. The mic keeps recording.
-- Nobody is identified by name. "Them" covers everyone on the call.
+- Nobody is identified by voice. "Them" covers everyone on the call. Notes can only name someone when a [calendar](#calendar) event lists the attendees and the transcript makes clear who's speaking.
 - Butter's own UI doesn't show anything about recordings yet.

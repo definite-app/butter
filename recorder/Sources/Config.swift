@@ -231,6 +231,15 @@ struct Config {
     var summarizeCommand: String { string("meeting", "summarize_command", "") }
     var notesModel: String { string("meeting", "notes_model", "sonnet") }
     var notesPrompt: String { string("meeting", "notes_prompt", "") }
+    /// "claude" | "off": how the daemon fills ~/.butter/calendar/upcoming.json.
+    var calendarRefresh: String { string("meeting", "calendar_refresh", "claude") }
+    var calendarRefreshMinutes: Double { double("meeting", "calendar_refresh_minutes", 60) }
+    var calendarHours: String { string("meeting", "calendar_hours", "7-19") }
+    var calendarNudgeMinutes: Double { double("meeting", "calendar_nudge_minutes", 2) }
+    var calendarModel: String { string("meeting", "calendar_model", "haiku") }
+    /// MCP servers to read the calendar through; empty = any with "calendar" in its name.
+    var calendarMCPServers: [String] { strings("meeting", "calendar_mcp_servers") }
+    var calendarTimeout: Double { double("meeting", "calendar_timeout_seconds", 180) }
     var meLabel: String { string("meeting", "me_label", "Me") }
     var themLabel: String { string("meeting", "them_label", "Them") }
 
@@ -370,7 +379,19 @@ struct Config {
     # ✦ Notes on the "Meeting ready" pill (or `butter-rec notes`): meeting notes
     # written by the [cleanup] harness. The whole transcript goes to the model.
     notes_model = "sonnet"
-    notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}
+    notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}, {{attendees}}
+    # Calendar: ~/.butter/calendar/upcoming.json lists upcoming events. Fill it
+    # with `butter-rec calendar import` (any JSON list of events), or let the
+    # daemon ask headless Claude Code, which reads it through your calendar MCP
+    # server (e.g. the claude.ai Google Calendar connector). A meeting started
+    # during an event (or 10 min before) takes its title and attendees.
+    calendar_refresh = "claude"  # claude | off
+    calendar_refresh_minutes = 60
+    calendar_hours = "7-19"      # only refresh between these local hours (and once when the daemon starts)
+    calendar_nudge_minutes = 2   # the pill offers to record this long before a call (0 = no nudges)
+    calendar_model = "haiku"     # claude --model for the refresh
+    calendar_mcp_servers = []    # MCP servers to read it through; [] = any with "calendar" in the name
+    calendar_timeout_seconds = 180
 
     [cleanup]
     # Hands-free dictation shows a ✦ button next to stop: it stops, transcribes,

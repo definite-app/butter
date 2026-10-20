@@ -21,6 +21,14 @@ struct MeetingMeta {
             return (file, (entry["at"] as? NSNumber)?.doubleValue ?? 0)
         }
     }
+    /// The calendar event it was recorded during, if any (`calendar_event`).
+    var calendarEvent: [String: Any]? { dict["calendar_event"] as? [String: Any] }
+    /// The event's attendees, as "Ada Lovelace" or "ada@example.com".
+    var attendees: [String] {
+        (calendarEvent?["attendees"] as? [[String: Any]] ?? []).compactMap { a in
+            [a["name"], a["email"]].compactMap { $0 as? String }.first { !$0.isEmpty }
+        }
+    }
     /// Text copied to the clipboard during it, with seconds from the start.
     var clips: [(text: String, at: Double)] {
         (dict["clips"] as? [[String: Any]] ?? []).compactMap { entry in
@@ -87,6 +95,18 @@ enum Meetings {
         }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Links a meeting to the calendar event it started during (or up to 10 min
+    /// before): `calendar_event` in meeting.json, and the event's title unless
+    /// the user gave one.
+    static func attachCalendarEvent(_ dir: URL, userTitle: Bool) {
+        guard let started = MeetingMeta.load(dir)?.startedAt, let event = CalendarStore.event(at: started) else { return }
+        MeetingMeta.update(dir) { meta in
+            meta.dict["calendar_event"] = event.meetingDict
+            if !userTitle { meta.dict["title"] = event.title }
+        }
+        log("meeting \(dir.lastPathComponent): during \"\(event.title)\" (\(event.attendees.count) attendees)")
     }
 
     /// Copies screenshots into the meeting's `screenshots/` folder and lists them
@@ -177,7 +197,7 @@ final class MeetingRecording {
     private var systemSink: WavSink?
     private(set) var warnings: [String] = []
 
-    init(dir: URL, title: String, config: Config, inputDevice: InputDevices.Device?) throws {
+    init(dir: URL, title: String, config: Config, inputDevice: InputDevices.Device?, event: CalendarEvent? = nil) throws {
         self.dir = dir
         self.title = title
         micSink = try WavSink(url: dir.appendingPathComponent("mic.wav"))
@@ -200,6 +220,7 @@ final class MeetingRecording {
             "status": "recording", "system_audio": system != nil, "warnings": warnings,
         ]
         if let system { meta["system_audio_format"] = system.info }
+        if let event { meta["calendar_event"] = event.meetingDict }
         MeetingMeta(dict: meta).save(dir)
     }
 
@@ -483,6 +504,11 @@ enum MeetingProcessor {
         var lines = ["# \(meta.title)", ""]
         if let started = meta.startedAt { lines.append("- **Date:** \(df.string(from: started))") }
         lines.append("- **Duration:** \(formatDuration(meta.duration))")
+        if let event = meta.calendarEvent {
+            let title = event["title"] as? String ?? ""
+            if !title.isEmpty && title != meta.title { lines.append("- **Calendar event:** \(title)") }
+            if !meta.attendees.isEmpty { lines.append("- **Attendees:** \(meta.attendees.joined(separator: ", "))") }
+        }
         lines.append("- **Transcribed with:** \(engine)\(model.isEmpty ? "" : " (\(model))")")
         let warnings = (meta.dict["warnings"] as? [String] ?? []) + (meta.dict["checks"] as? [String] ?? [])
         if !warnings.isEmpty { lines += [""] + warnings.map { "> ⚠️ \($0)" } }
@@ -533,7 +559,7 @@ enum MeetingProcessor {
 /// with [meeting] notes_model, saved as notes.md beside the transcript.
 enum MeetingNotes {
     static let defaultPrompt = """
-    Write notes for this meeting from its transcript below. "Me" is the person who recorded it; "Them" is everyone else on the call (the transcript can't tell those people apart).
+    Write notes for this meeting from its transcript below. "Me" is the person who recorded it; "Them" is everyone else on the call (the transcript can't tell those people apart).{{attendees}}
 
     Use Markdown with these sections, leaving out any that would be empty:
     # A short title for the meeting
@@ -559,8 +585,11 @@ enum MeetingNotes {
         }
         let template = config.notesPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultPrompt : config.notesPrompt
         let spellings = Cleanup.spellings(config)
+        let attendees = MeetingMeta.load(dir)?.attendees ?? []
         let prompt = template
             .replacingOccurrences(of: "{{vocabulary}}", with: spellings.isEmpty ? "" : " Preferred spellings: \(spellings.joined(separator: ", ")).")
+            .replacingOccurrences(of: "{{attendees}}", with: attendees.isEmpty ? "" :
+                " The calendar invite lists \(attendees.joined(separator: ", ")) besides Me. Name the person instead of \"Them\" where the transcript makes clear who it is (they're addressed by name, or only one of them is on the call); otherwise say Them.")
             .replacingOccurrences(of: "{{transcript}}", with: transcript)
         let started = Date()
         log("meeting \(dir.lastPathComponent): writing notes with \(config.cleanupHarness) (\(config.notesModel))")
