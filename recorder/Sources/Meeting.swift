@@ -1,3 +1,5 @@
+import Accelerate
+import AVFoundation
 import Foundation
 
 /// meeting.json in each recording folder. The folder name is the meeting id.
@@ -17,6 +19,13 @@ struct MeetingMeta {
         (dict["screenshots"] as? [[String: Any]] ?? []).compactMap { entry in
             guard let file = entry["file"] as? String else { return nil }
             return (file, (entry["at"] as? NSNumber)?.doubleValue ?? 0)
+        }
+    }
+    /// Text copied to the clipboard during it, with seconds from the start.
+    var clips: [(text: String, at: Double)] {
+        (dict["clips"] as? [[String: Any]] ?? []).compactMap { entry in
+            guard let text = entry["text"] as? String else { return nil }
+            return (text, (entry["at"] as? NSNumber)?.doubleValue ?? 0)
         }
     }
 
@@ -104,6 +113,39 @@ enum Meetings {
         }
     }
 
+    /// Lists copied text in meeting.json with its time from the start of the meeting.
+    static func addClips(_ clips: [(text: String, at: Double)], to dir: URL) {
+        guard !clips.isEmpty else { return }
+        MeetingMeta.update(dir) { meta in
+            meta.dict["clips"] = (meta.dict["clips"] as? [[String: Any]] ?? []) + clips.map { ["text": $0.text, "at": $0.at] }
+        }
+    }
+
+    /// Names for the raw system audio: system-raw.wav, then system-raw-2.wav and
+    /// so on (a new file each time the output's sample rate changes).
+    static func rawNamer(_ dir: URL, _ config: Config) -> (() -> URL?)? {
+        guard config.rawSystemAudio else { return nil }
+        var n = 0
+        return {
+            n += 1
+            return dir.appendingPathComponent(n == 1 ? "system-raw.wav" : "system-raw-\(n).wav")
+        }
+    }
+
+    /// Deletes raw system audio older than raw_audio_days.
+    static func pruneRaw(_ config: Config) {
+        guard config.rawAudioDays > 0 else { return }
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-config.rawAudioDays * 86400)
+        for dir in all(config) {
+            for file in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            where file.lastPathComponent.hasPrefix("system-raw") {
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantFuture
+                if modified < cutoff { try? fm.removeItem(at: file) }
+            }
+        }
+    }
+
     /// A meeting from a hands-free session's mic recording alone (system audio
     /// wasn't recorded), so switching to Meeting always leaves a meeting.
     static func saveMicOnly(mic: WavSink, origin: Date, title: String, _ config: Config) -> URL? {
@@ -135,16 +177,16 @@ final class MeetingRecording {
     private var systemSink: WavSink?
     private(set) var warnings: [String] = []
 
-    init(dir: URL, title: String, systemAudio: Bool, inputDevice: InputDevices.Device?) throws {
+    init(dir: URL, title: String, config: Config, inputDevice: InputDevices.Device?) throws {
         self.dir = dir
         self.title = title
         micSink = try WavSink(url: dir.appendingPathComponent("mic.wav"))
         try mic.start(into: micSink, device: inputDevice)
-        if systemAudio {
+        if config.systemAudio {
             do {
                 let sink = try WavSink(url: dir.appendingPathComponent("system.wav"))
                 let recorder = SystemAudioRecorder()
-                try recorder.start(into: sink)
+                try recorder.start(into: sink, raw: Meetings.rawNamer(dir, config))
                 system = recorder
                 systemSink = sink
             } catch {
@@ -153,10 +195,12 @@ final class MeetingRecording {
                 try? FileManager.default.removeItem(at: dir.appendingPathComponent("system.wav"))
             }
         }
-        MeetingMeta(dict: [
+        var meta: [String: Any] = [
             "id": dir.lastPathComponent, "title": title, "started_at": isoString(startedAt),
             "status": "recording", "system_audio": system != nil, "warnings": warnings,
-        ]).save(dir)
+        ]
+        if let system { meta["system_audio_format"] = system.info }
+        MeetingMeta(dict: meta).save(dir)
     }
 
     var elapsed: Double { Date().timeIntervalSince(startedAt) }
@@ -174,11 +218,13 @@ final class MeetingRecording {
         if let systemSink, systemSink.peak < 0.0005 {
             warnings.append("System audio was silent; if you expected audio, grant System Audio Recording to ButterRec in System Settings › Privacy & Security")
         }
+        let report = system?.report
         MeetingMeta.update(dir) { meta in
             meta.dict["ended_at"] = isoString(ended)
             meta.dict["duration"] = ended.timeIntervalSince(startedAt)
             meta.dict["mic_offset"] = micOffset
             meta.dict["system_offset"] = systemOffset
+            if let report { meta.dict["system_audio_format"] = report }
             meta.dict["warnings"] = warnings
             meta.status = "recorded"
         }
@@ -200,7 +246,7 @@ final class CallCapture {
         dir = try Meetings.newDirectory(title: "Hands-free", config)
         do {
             sink = try WavSink(url: dir.appendingPathComponent("system.wav"))
-            try system.start(into: sink)
+            try system.start(into: sink, raw: Meetings.rawNamer(dir, config))
         } catch {
             try? FileManager.default.removeItem(at: dir)
             throw error
@@ -208,20 +254,23 @@ final class CallCapture {
         MeetingMeta(dict: [
             "id": dir.lastPathComponent, "title": "Hands-free call", "started_at": isoString(origin),
             "status": "recording", "system_audio": true, "source": "hands_free", "warnings": [] as [String],
+            "system_audio_format": system.info,
         ]).save(dir)
     }
 
     /// Stops recording. Keeps the folder as a meeting (returned, ready to process)
     /// when the session ran at least `minSeconds` and the Mac played something,
-    /// or always with `title` (the session was switched to Meeting).
-    func finish(mic: WavSink, minSeconds: Double, title: String? = nil) -> URL? {
+    /// or always with `title` (the session was switched to Meeting). Otherwise
+    /// what the Mac played goes to `keepSystemAs`, if given.
+    func finish(mic: WavSink, minSeconds: Double, title: String? = nil, keepSystemAs: URL? = nil) -> URL? {
         system.stop()
         sink.close()
+        let report = system.report
         let ended = Date()
         let duration = ended.timeIntervalSince(origin)
         guard title != nil || (duration >= minSeconds && sink.peak >= 0.001) else {
-            log("hands-free: no call audio kept (\(formatDuration(duration)), peak \(String(format: "%.4f", sink.peak)))")
-            discard()
+            log("hands-free: not a call (\(formatDuration(duration)), peak \(String(format: "%.4f", sink.peak)))")
+            discard(keepSystemAs: keepSystemAs)
             return nil
         }
         do {
@@ -237,6 +286,7 @@ final class CallCapture {
             meta.dict["duration"] = duration
             meta.dict["mic_offset"] = mic.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
             meta.dict["system_offset"] = sink.firstWriteAt.map { $0.timeIntervalSince(self.origin) } ?? 0
+            meta.dict["system_audio_format"] = report
             if let title { meta.dict["title"] = title }
             meta.status = "recorded"
         }
@@ -244,9 +294,19 @@ final class CallCapture {
         return dir
     }
 
-    func discard() {
+    /// Stops and deletes the folder, first moving the system track to
+    /// `keepSystemAs` if the Mac played anything.
+    func discard(keepSystemAs: URL? = nil) {
         system.stop()
         sink.close()
+        if let target = keepSystemAs, sink.peak >= 0.001 {
+            do {
+                try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: dir.appendingPathComponent("system.wav"), to: target)
+            } catch {
+                log("hands-free: couldn't keep the system audio: \(error)")
+            }
+        }
         try? FileManager.default.removeItem(at: dir)
     }
 }
@@ -260,6 +320,7 @@ enum MeetingProcessor {
         MeetingMeta.update(dir) { $0.status = "transcribing"; $0.dict["error"] = nil }
         do {
             var segments: [(speaker: String, segment: Segment)] = []
+            var spoken: [String: Int] = [:]
             var usedModel = model
             let tracks: [(file: String, speaker: String, offsetKey: String)] = [
                 ("mic.wav", config.meLabel, "mic_offset"),
@@ -273,6 +334,7 @@ enum MeetingProcessor {
                                                        prompt: config.prompt, segments: true, vad: true)
                 usedModel = result.model
                 let offset = (meta.dict[track.offsetKey] as? NSNumber)?.doubleValue ?? 0
+                spoken[track.file] = result.segments.filter { !$0.text.isEmpty }.count
                 for var seg in result.segments where !seg.text.isEmpty {
                     seg.text = config.applyReplacements(seg.text)
                     seg.start += offset
@@ -283,7 +345,10 @@ enum MeetingProcessor {
             segments = dropBleed(segments, me: config.meLabel)
             segments.sort { $0.segment.start < $1.segment.start }
 
-            let markdown = render(meta: meta, segments: segments, engine: engine, model: usedModel)
+            let checks = check(dir: dir, meta: meta, spokenSystem: spoken["system.wav"])
+            for line in checks { log("meeting \(meta.id): \(line)") }
+            MeetingMeta.update(dir) { $0.dict["checks"] = checks }
+            let markdown = render(meta: MeetingMeta.load(dir) ?? meta, segments: segments, engine: engine, model: usedModel)
             try markdown.write(to: dir.appendingPathComponent("transcript.md"), atomically: true, encoding: .utf8)
             let json: [[String: Any]] = segments.map {
                 ["speaker": $0.speaker, "start": $0.segment.start, "end": $0.segment.end, "text": $0.segment.text]
@@ -307,6 +372,88 @@ enum MeetingProcessor {
             MeetingMeta.update(dir) { $0.status = "error"; $0.dict["error"] = "\(error)" }
             throw error
         }
+    }
+
+    /// Problems worth a look: tracks that don't line up (system audio recorded at
+    /// the wrong speed) or system audio with sound but no speech found.
+    static func check(dir: URL, meta: MeetingMeta, spokenSystem: Int?) -> [String] {
+        guard let system = trackStats(dir.appendingPathComponent("system.wav")) else { return [] }
+        var out: [String] = []
+        if let mic = trackStats(dir.appendingPathComponent("mic.wav")) {
+            // Where each track ends on the meeting's timeline.
+            let micEnd = mic.seconds + ((meta.dict["mic_offset"] as? NSNumber)?.doubleValue ?? 0)
+            let systemEnd = system.seconds + ((meta.dict["system_offset"] as? NSNumber)?.doubleValue ?? 0)
+            if abs(micEnd - systemEnd) > max(2, micEnd * 0.05) {
+                let ratio = micEnd / max(systemEnd, 0.1)
+                var line = "The system audio track is \(formatDuration(system.seconds)) but the mic track is \(formatDuration(mic.seconds))."
+                if abs(ratio - ratio.rounded()) < 0.05 * ratio, ratio.rounded() >= 2 {
+                    line += " It looks \(Int(ratio.rounded()))x too fast; `butter-rec repair \(meta.id)` slows it back down."
+                }
+                out.append(line)
+            }
+        }
+        if spokenSystem == 0, system.rms > 0.003 {
+            out.append("No speech was found in the system audio, though it isn't silent.")
+        }
+        return out
+    }
+
+    /// Length and loudness (RMS, 0-1) of a WAV.
+    static func trackStats(_ url: URL) -> (seconds: Double, rms: Float)? {
+        guard let file = try? AVAudioFile(forReading: url), file.length > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 1 << 16) else { return nil }
+        var sum = 0.0, count = 0
+        while (try? file.read(into: buffer)) != nil, buffer.frameLength > 0, let data = buffer.floatChannelData?[0] {
+            var meanSquare: Float = 0
+            vDSP_measqv(data, 1, &meanSquare, vDSP_Length(buffer.frameLength))
+            sum += Double(meanSquare) * Double(buffer.frameLength)
+            count += Int(buffer.frameLength)
+        }
+        return (Double(file.length) / file.processingFormat.sampleRate, count > 0 ? Float((sum / Double(count)).squareRoot()) : 0)
+    }
+
+    /// For system audio recorded before the sample-rate fix through AirPods in
+    /// call mode (24 or 16 kHz, labelled 48 kHz): it's 2x or 3x too fast. Keeps
+    /// the original as system.orig.wav and writes system.wav at the right speed.
+    /// `factor` defaults to how many times longer the mic track is.
+    static func repairSystemSpeed(dir: URL, factor wanted: Int?) throws -> Int {
+        let fm = FileManager.default
+        let system = dir.appendingPathComponent("system.wav"), original = dir.appendingPathComponent("system.orig.wav")
+        let source = fm.fileExists(atPath: original.path) ? original : system
+        guard let stats = trackStats(source) else { throw CLIError("\(dir.lastPathComponent) has no system audio") }
+        let factor: Int
+        if let wanted {
+            factor = wanted
+        } else {
+            guard let mic = trackStats(dir.appendingPathComponent("mic.wav")) else { throw CLIError("no mic track to compare with; pass --factor") }
+            let ratio = mic.seconds / stats.seconds
+            guard ratio.rounded() >= 2, abs(ratio - ratio.rounded()) < 0.05 * ratio else {
+                throw CLIError(String(format: "the mic track is %.2fx as long as the system audio, not a whole multiple; pass --factor if you're sure", ratio))
+            }
+            factor = Int(ratio.rounded())
+        }
+        guard factor >= 2 else { throw CLIError("--factor must be 2 or more") }
+        if source == system { try fm.moveItem(at: system, to: original) }
+        // The samples are right; only their rate was: read them as 16 kHz / factor
+        // and resample to 16 kHz.
+        let file = try AVAudioFile(forReading: original)
+        guard let slow = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: file.processingFormat.sampleRate / Double(factor),
+                                       channels: 1, interleaved: false),
+              let chunk = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 1 << 15) else {
+            throw CLIError("couldn't read \(original.lastPathComponent)")
+        }
+        let sink = try WavSink(url: system)
+        while (try? file.read(into: chunk)) != nil, chunk.frameLength > 0 {
+            guard let relabelled = AVAudioPCMBuffer(pcmFormat: slow, frameCapacity: chunk.frameLength),
+                  let from = chunk.floatChannelData?[0], let to = relabelled.floatChannelData?[0] else { break }
+            relabelled.frameLength = chunk.frameLength
+            to.update(from: from, count: Int(chunk.frameLength))
+            sink.write(relabelled)
+        }
+        sink.close()
+        MeetingMeta.update(dir) { $0.dict["system_repaired"] = ["factor": factor, "at": isoString(Date())] }
+        log("meeting \(dir.lastPathComponent): system audio slowed down \(factor)x (\(formatDuration(stats.seconds)) -> \(formatDuration(sink.seconds)))")
+        return factor
     }
 
     /// Without headphones the mic also hears the other side. Drop "Me" segments
@@ -337,6 +484,8 @@ enum MeetingProcessor {
         if let started = meta.startedAt { lines.append("- **Date:** \(df.string(from: started))") }
         lines.append("- **Duration:** \(formatDuration(meta.duration))")
         lines.append("- **Transcribed with:** \(engine)\(model.isEmpty ? "" : " (\(model))")")
+        let warnings = (meta.dict["warnings"] as? [String] ?? []) + (meta.dict["checks"] as? [String] ?? [])
+        if !warnings.isEmpty { lines += [""] + warnings.map { "> ⚠️ \($0)" } }
         lines += ["", "## Transcript", ""]
         if segments.isEmpty { lines.append("_No speech detected._") }
         var currentSpeaker: String?
@@ -345,19 +494,20 @@ enum MeetingProcessor {
             if !paragraph.isEmpty { lines.append(paragraph.joined(separator: " ")); lines.append("") }
             paragraph.removeAll()
         }
-        // Screenshots go between what was said before and after them.
-        var shots = meta.screenshots.sorted { $0.at < $1.at }[...]
-        func placeShots(before time: Double) {
-            while let shot = shots.first, shot.at <= time {
-                shots.removeFirst()
+        // Screenshots and copied text go between what was said before and after them.
+        let extras = meta.screenshots.map { (at: $0.at, lines: ["![Screenshot \(formatClock($0.at))](\($0.file))"]) }
+            + meta.clips.map { (at: $0.at, lines: ["**Copied** [\(formatClock($0.at))]", "", fenced($0.text)]) }
+        var pending = extras.sorted { $0.at < $1.at }[...]
+        func placeExtras(before time: Double) {
+            while let extra = pending.first, extra.at <= time {
+                pending.removeFirst()
                 flush()
-                lines.append("![Screenshot \(formatClock(shot.at))](\(shot.file))")
-                lines.append("")
+                lines += extra.lines + [""]
                 currentSpeaker = nil
             }
         }
         for item in segments {
-            placeShots(before: item.segment.start)
+            placeExtras(before: item.segment.start)
             if item.speaker != currentSpeaker {
                 flush()
                 currentSpeaker = item.speaker
@@ -365,9 +515,17 @@ enum MeetingProcessor {
             }
             paragraph.append(item.segment.text)
         }
-        placeShots(before: .infinity)
+        placeExtras(before: .infinity)
         flush()
         return lines.joined(separator: "\n")
+    }
+
+    /// A fenced block whose fence is longer than any run of backticks inside.
+    static func fenced(_ text: String) -> String {
+        var longest = 0, run = 0
+        for ch in text { run = ch == "`" ? run + 1 : 0; longest = max(longest, run) }
+        let fence = String(repeating: "`", count: max(3, longest + 1))
+        return "\(fence)\n\(text.trimmingCharacters(in: .newlines))\n\(fence)"
     }
 }
 
@@ -385,7 +543,7 @@ enum MeetingNotes {
     ## Key points
     ## Open questions
 
-    Keep a screenshot link (![...](...)) under the point it illustrates when it matters.
+    Keep a screenshot link (![...](...)) under the point it illustrates when it matters. "Copied" blocks are text Me copied during the meeting; quote them where they matter.
     Use only what's in the transcript: don't invent names, numbers or dates. Fix words the transcriber clearly misheard.{{vocabulary}}
     Output only the notes.
 

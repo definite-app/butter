@@ -7,18 +7,18 @@ Local dictation and meeting recording for Butter. Like Handy, it has push-to-tal
 | | Default shortcut | CLI |
 |---|---|---|
 | Dictate (push-to-talk) | hold `ctrl+opt+space`, release to paste | |
-| Dictate (hands-free) | tap `ctrl+opt+space`, or `ctrl+opt+shift+space` | `butter-cli rec dictate start` |
-| ↳ record as a meeting instead | the pill's Dictate \| Meeting switch | `butter-cli rec dictate meeting` |
+| Hands-free (starts as a meeting) | tap `ctrl+opt+space`, or `ctrl+opt+shift+space` | `butter-cli rec dictate start` (starts on Dictate) |
+| ↳ dictate instead (paste your words) | the pill's Dictate \| Meeting switch | `butter-cli rec dictate dictation` / `dictate meeting` |
 | ↳ screenshot | `ctrl+opt+s` or 📷 (also during a meeting) | `butter-cli rec screenshot` |
-| ↳ stop and paste | the same shortcut again, the push-to-talk shortcut, or ■ | `butter-cli rec dictate stop` |
-| ↳ stop, [clean up](#cleanup), paste | ✦ | `butter-cli rec dictate stop --clean` |
-| ↳ cancel (nothing pasted) | `esc` or × | `butter-cli rec dictate cancel` |
+| ↳ stop (Meeting: save it; Dictate: paste) | the same shortcut again, the push-to-talk shortcut, or ■ | `butter-cli rec dictate stop` |
+| ↳ stop, [clean up](#cleanup), paste | ✦ (Dictate) | `butter-cli rec dictate stop --clean` |
+| ↳ cancel (nothing pasted or saved) | `esc` or × | `butter-cli rec dictate cancel` |
 | Paste the last dictation again | `ctrl+opt+v` | `butter-cli rec last [--copy]` |
 | Meeting | `ctrl+opt+m` to start, again to stop | `butter-cli rec meeting start --title "Acme sync"` / `meeting stop --wait` |
 
-A quick tap of the push-to-talk shortcut (let go within 0.4s, `tap_seconds`) keeps recording hands-free; `tap_for_hands_free = false` turns that off. Holding it and then pressing the hands-free shortcut also switches the recording you're in to hands-free. `esc` and the screenshot shortcut are only taken from other apps while a session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
+A quick tap of the push-to-talk shortcut (let go within 0.4s, `tap_seconds`) keeps recording hands-free; `tap_for_hands_free = false` turns that off. Holding it and then pressing the hands-free shortcut also switches the recording you're in to hands-free. Hands-free starts on the Meeting side of the pill's switch, so both sides are saved and nothing is pasted until you flip it to Dictate; `hands_free_mode = "dictate"` starts it on Dictate instead. `esc` and the screenshot shortcut are only taken from other apps while a session is running. `butter-cli rec status` shows the shortcuts in use and any that failed to register.
 
-Meetings start only when you start them: with the meeting shortcut, the CLI, or the Meeting side of the hands-free pill's switch. Nothing watches for calls on its own. The exception is a hands-free session that turns out to be a call: it's also [saved as a meeting](#use). See [After a meeting](#after-a-meeting) for getting to the transcript.
+Meetings start only when you start them: with the meeting shortcut, the CLI, or a hands-free session left on the Meeting side of its switch. Nothing watches for calls on its own. A hands-free session switched to Dictate that turns out to be a call is also [saved as a meeting](#use). See [After a meeting](#after-a-meeting) for getting to the transcript.
 
 ### Change a shortcut
 
@@ -62,11 +62,13 @@ Speech recognition runs in `asr/worker.py`, a uv script that keeps the model war
 
 ## Use
 
-A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. Hands-free sessions also get ✦, which stops and [cleans up](#cleanup) the text before pasting. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app.
+A small pill appears at the bottom of the screen as soon as you press a hotkey. It shows a live mic meter, and a timer with ■ stop and × cancel for hands-free and meeting sessions. Hands-free sessions also get ✦, which stops and [cleans up](#cleanup) the text before pasting. With `live_preview` on, a caption above the pill shows your words as you speak. The preview re-transcribes the last ~20 seconds every 0.7s, and the text that gets pasted comes from a final pass over the whole clip. The pill never takes focus, so the paste lands in your app. Drag it anywhere by its background and it stays there, on whichever screen you're using; double-click it to put it back.
 
 Long dictations are split into paragraphs. A pause of 2 seconds or more (`paragraph_pause_seconds`) starts a new one. A paragraph that runs past 120 words (`paragraph_max_words`) breaks at the next sentence. `butter-cli rec transcribe` formats files the same way.
 
-Hands-free also records what your Mac plays, in case the session is really a call (the other side in your AirPods, say). Only your words are pasted. If the session ran for at least a minute (`hands_free_call_min_seconds`) and the Mac played something, both sides are also saved as a meeting called "Hands-free call". The pill says "Call saved as a meeting", and `butter-cli rec transcript` shows it labelled Me/Them. Shorter or silent sessions leave nothing behind. Turn this off with `hands_free_call_audio = false`.
+Hands-free always records what your Mac plays as well as your mic. On the Meeting side, both are saved as a meeting when you stop. On the Dictate side, only your words are pasted, but if the session ran for at least a minute (`hands_free_call_min_seconds`) and the Mac played something, both sides are also saved as a meeting called "Hands-free call". The pill says "Call saved as a meeting", and `butter-cli rec transcript` shows it labelled Me/Them. `hands_free_call_audio = false` stops recording the Mac on the Dictate side.
+
+Every session's audio is also kept in `~/.butter/dictation/audio/` for 30 days (`keep_audio_days`, 0 = not kept): `<date>_<time>.wav` for your mic and `<date>_<time>-system.wav` for what the Mac played, including cancelled sessions in case `esc` was a mistake. The `audio` field in `butter-cli rec history --json` points at each dictation's file. Meetings keep theirs in the meeting folder.
 
 By default (`input_device = "auto"`), when your system mic is Bluetooth, such as AirPods, the recorder uses the built-in mic instead. Opening a Bluetooth mic switches the headset into call mode, which takes seconds and makes playback sound worse. Run `butter-cli rec devices` to see which mic it's using.
 
@@ -76,6 +78,9 @@ Each meeting gets a folder in `~/.butter/recordings/<date>_<title>/`:
 meeting.json      status (recording → queued → transcribing → summarizing → done | error), timings
 mic.wav           you            (16 kHz mono)
 system.wav        everyone else  (16 kHz mono)
+system-raw*.wav   everyone else as it arrived (the output's own rate and channels; a new file
+                  when the rate changes), kept 14 days (raw_audio_days); raw_system_audio = false skips it
+system.orig.wav   only after `butter-cli rec repair`
 transcript.md     merged, speaker-labelled transcript
 transcript.json   segments with speaker + timestamps
 screenshots/      screenshots taken during it, linked from transcript.md
@@ -101,6 +106,10 @@ When you stop a meeting, the pill says "Transcribing meeting · 32 min" until th
 - **✦ Notes**: writes `notes.md` (summary, decisions, action items, key points, open questions) with the [cleanup](#cleanup) harness and `[meeting] notes_model` (default `sonnet`), then opens it. The whole transcript goes to the model. `butter-cli rec notes [<id>]` does the same.
 - **×**: dismisses it. It stays up until then, so you can come back to it after other work.
 
+If notes can't be written, the pill says why, e.g. "Notes failed: timed out after 90s", and `rec.log` has the whole error. The daemon starts from launchd, without your shell's PATH or aliases. It looks for `claude` on the usual paths and in `~/.claude/local/`, then asks your login shell. If it still isn't found, set `[cleanup] claude_path`.
+
+`transcript.md` starts with a ⚠️ line when something looks off: the system audio track is much shorter than the mic track, or it has sound but no speech was found. `meeting.json` records the format the Mac delivered (`system_audio_format`: sample rate, channels, the output device clocking it, and any rate changes during the meeting).
+
 Meetings are also in the pill's ⟲ history list, mixed in with dictations. Click one to open it, or hover to get Open, Copy and ✦ Notes.
 
 ### Screenshots
@@ -111,6 +120,16 @@ During hands-free dictation or a meeting, 📷 on the pill (or `screenshot_hotke
 - **Meeting:** saved in the meeting's `screenshots/` folder and linked from `transcript.md` at the time you took it.
 
 The first screenshot asks for Screen Recording access for ButterRec (System Settings › Privacy & Security › Screen & System Audio Recording).
+
+### Copied text
+
+What you copy during a hands-free session or a meeting is kept with it (`capture_clipboard`):
+
+- **Dictation:** the text goes into the pasted text where you copied it. Several lines become a code block, and copied files become their paths.
+- **Meeting:** it's in `transcript.md` as a **Copied** block at that time, and notes can quote it.
+- A copied image (a screenshot copied to the clipboard, say) is saved like a screenshot.
+
+Copies from password managers (marked concealed or transient on the clipboard) are skipped, and ButterRec's own pastes don't count. A card above the pill shows the start of what was kept.
 
 ## Configure
 
@@ -175,6 +194,8 @@ If the model fails, times out (`timeout_seconds`), or returns something that isn
 Logs go to `~/.butter/logs/rec.log`. Set `BUTTER_REC_CONFIG=/path/to.toml` to run a second daemon against a test config.
 
 ## Known gaps
+
+- Recordings made before 2026-10-20 through AirPods on a call have system audio half as long as it should be, at double speed: AirPods drop to 24 kHz when a call opens their mic, and that audio was labelled 48 kHz. The ⚠️ line in `transcript.md` says so. `butter-cli rec repair <id>` slows it back down (keeping the original as `system.orig.wav`) and re-transcribes it. The repaired audio only goes up to 4 kHz, like a phone call. Recordings since then follow the rate.
 
 - If you're on speakers rather than headphones, your mic also picks up the other side. Overlapping "Me" lines that repeat "Them" lines get dropped, but some echo can still get through.
 - If the default output device changes during a meeting (for example, AirPods connect), system audio may stop. The mic keeps recording.

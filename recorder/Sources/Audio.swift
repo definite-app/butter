@@ -295,13 +295,42 @@ final class MicRecorder {
 /// Everything the Mac is playing (the other side of a call), via a Core Audio
 /// process tap (macOS 14.2+). Needs only the "System Audio Recording" permission,
 /// not Screen Recording — the same approach Granola-style recorders use.
+///
+/// The tap's format always says 48 kHz, but the samples arrive at the rate of the
+/// output device clocking the aggregate. AirPods drop to 24 kHz (or 16 kHz) when a
+/// call opens their mic, so the rate is read from the device and followed while
+/// recording; labelling 24 kHz audio as 48 kHz made it half as long and twice as fast.
 final class SystemAudioRecorder {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    private var rateListener: AudioObjectPropertyListenerBlock?
     private let queue = DispatchQueue(label: "app.butter.rec.system-audio", qos: .userInitiated)
+    private var tapFormat = AudioStreamBasicDescription()
+    /// Guards `format`, `raw` and the report: the IO block and the rate listener can run on different threads.
+    private let lock = NSLock()
+    /// The format buffers are read with: the tap's layout at the device's current rate.
+    private var format: AVAudioFormat?
+    private var startedAt = Date()
+    private var rawFile: (() -> URL?)?
+    private var raw: AVAudioFile?
+    /// The tap and the device clocking it, for the log and meeting.json.
+    private(set) var info: [String: Any] = [:]
+    /// Rate changes while recording, with seconds since the start, and the raw files written.
+    private var changes: [[String: Any]] = []
+    private var rawFiles: [[String: Any]] = []
+    /// When the first buffer arrived and how much audio has come since, to fill
+    /// dropouts (the output reconfiguring for a call takes ~1s) with silence so
+    /// the track stays in step with the mic.
+    private var firstBufferAt: Date?
+    private var delivered: Double = 0
+    private var gaps: Double = 0
 
-    func start(into sink: WavSink) throws {
+    /// `raw`: where to save the audio as it arrives (native rate and channels,
+    /// 16-bit), one file per rate; called again whenever the rate changes.
+    func start(into sink: WavSink, raw: (() -> URL?)? = nil) throws {
+        startedAt = Date()
+        rawFile = raw
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
         description.uuid = UUID()
         description.name = "Butter Rec"
@@ -314,23 +343,22 @@ final class SystemAudioRecorder {
         var formatAddress = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyFormat,
                                                        mScope: kAudioObjectPropertyScopeGlobal,
                                                        mElement: kAudioObjectPropertyElementMain)
-        var asbd = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        status = AudioObjectGetPropertyData(tapID, &formatAddress, 0, nil, &size, &asbd)
-        guard status == noErr, let format = AVAudioFormat(streamDescription: &asbd) else {
+        status = AudioObjectGetPropertyData(tapID, &formatAddress, 0, nil, &size, &tapFormat)
+        guard status == noErr, tapFormat.mSampleRate > 0, tapFormat.mChannelsPerFrame > 0 else {
             stop()
             throw CLIError("Couldn't read system audio tap format (status \(status))")
         }
 
-        let outputUID = try Self.defaultOutputDeviceUID()
+        let output = try Self.defaultOutputDevice()
         let aggregate: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Butter Rec Tap",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceMainSubDeviceKey: output.uid,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: output.uid]],
             kAudioAggregateDeviceTapListKey: [[
                 kAudioSubTapDriftCompensationKey: true,
                 kAudioSubTapUIDKey: description.uuid.uuidString,
@@ -342,9 +370,48 @@ final class SystemAudioRecorder {
             throw CLIError("Couldn't create aggregate device for system audio (status \(status))")
         }
 
-        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) { _, inputData, _, _, _ in
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inputData, deallocator: nil) else { return }
+        let rate = Self.nominalRate(aggregateID) ?? tapFormat.mSampleRate
+        format = makeFormat(rate)
+        let float = tapFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        info = ["tap_rate": tapFormat.mSampleRate, "channels": Int(tapFormat.mChannelsPerFrame),
+                "sample": "\(float ? "float" : "int")\(tapFormat.mBitsPerChannel)",
+                "interleaved": tapFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
+                "clock_device": output.name, "clock_rate": rate]
+        log("system audio: tap \(Int(tapFormat.mSampleRate)) Hz \(tapFormat.mChannelsPerFrame)ch \(info["sample"]!), "
+            + "clocked by \(output.name) at \(Int(rate)) Hz")
+        lock.lock()
+        openRaw()
+        lock.unlock()
+
+        var rateAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                                     mScope: kAudioObjectPropertyScopeGlobal,
+                                                     mElement: kAudioObjectPropertyElementMain)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.rateChanged() }
+        if AudioObjectAddPropertyListenerBlock(aggregateID, &rateAddress, queue, listener) == noErr { rateListener = listener }
+
+        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) { [weak self] _, inputData, _, _, _ in
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard let format = self.format,
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inputData, deallocator: nil) else { return }
+            let now = Date()
+            if let first = self.firstBufferAt {
+                let missing = now.timeIntervalSince(first) - Double(buffer.frameLength) / format.sampleRate - self.delivered
+                if missing > 0.25, let gap = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(missing * format.sampleRate)) {
+                    gap.frameLength = gap.frameCapacity  // zeroed
+                    sink.write(gap)
+                    self.delivered += missing
+                    self.gaps += missing
+                }
+            } else {
+                self.firstBufferAt = now
+            }
+            self.delivered += Double(buffer.frameLength) / format.sampleRate
             sink.write(buffer)
+            if let raw = self.raw {
+                do { try raw.write(from: buffer) } catch { self.closeRaw() }
+            }
         }
         guard status == noErr else {
             stop()
@@ -357,11 +424,70 @@ final class SystemAudioRecorder {
         }
     }
 
+    /// The tap's channel layout and sample type at `rate`.
+    private func makeFormat(_ rate: Double) -> AVAudioFormat? {
+        var asbd = tapFormat
+        asbd.mSampleRate = rate
+        return AVAudioFormat(streamDescription: &asbd)
+    }
+
+    /// The clocking device switched rate (AirPods into or out of call mode).
+    private func rateChanged() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let rate = Self.nominalRate(aggregateID), rate > 0, rate != format?.sampleRate else { return }
+        let at = Date().timeIntervalSince(startedAt)
+        log("system audio: the output switched to \(Int(rate)) Hz at \(formatClock(at))")
+        changes.append(["at": at, "rate": rate])
+        format = makeFormat(rate)
+        closeRaw()
+        openRaw()
+    }
+
+    /// With `lock` held.
+    private func openRaw() {
+        guard let format, let url = rawFile?() else { return }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: format.sampleRate, AVNumberOfChannelsKey: format.channelCount,
+            AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+        ]
+        do {
+            raw = try AVAudioFile(forWriting: url, settings: settings, commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+            rawFiles.append(["file": url.lastPathComponent, "rate": format.sampleRate, "channels": Int(format.channelCount),
+                             "at": Date().timeIntervalSince(startedAt)])
+        } catch {
+            log("system audio: couldn't write \(url.lastPathComponent): \(error.localizedDescription)")
+        }
+    }
+
+    private func closeRaw() {
+        if #available(macOS 15.0, *) { raw?.close() }
+        raw = nil
+    }
+
+    /// For meeting.json once stopped: the format, rate changes and raw files.
+    var report: [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        var out = info
+        if !changes.isEmpty { out["changes"] = changes }
+        if !rawFiles.isEmpty { out["raw"] = rawFiles }
+        if gaps > 0 { out["silence_filled"] = gaps }
+        return out
+    }
+
     func stop() {
         if aggregateID != kAudioObjectUnknown {
             if let procID {
                 AudioDeviceStop(aggregateID, procID)
                 AudioDeviceDestroyIOProcID(aggregateID, procID)
+            }
+            if let rateListener {
+                var rateAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                                             mElement: kAudioObjectPropertyElementMain)
+                AudioObjectRemovePropertyListenerBlock(aggregateID, &rateAddress, queue, rateListener)
+                self.rateListener = nil
             }
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -371,9 +497,22 @@ final class SystemAudioRecorder {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
+        lock.lock()
+        closeRaw()
+        lock.unlock()
     }
 
-    private static func defaultOutputDeviceUID() throws -> String {
+    private static func nominalRate(_ device: AudioObjectID) -> Double? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &rate) == noErr, rate > 0 else { return nil }
+        return rate
+    }
+
+    private static func defaultOutputDevice() throws -> (uid: String, name: String) {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
                                                  mScope: kAudioObjectPropertyScopeGlobal,
                                                  mElement: kAudioObjectPropertyElementMain)
@@ -382,11 +521,17 @@ final class SystemAudioRecorder {
         var status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
         guard status == noErr else { throw CLIError("Couldn't find the default output device (status \(status))") }
 
-        address.mSelector = kAudioDevicePropertyDeviceUID
-        var uid: CFString = "" as CFString
-        size = UInt32(MemoryLayout<CFString>.size)
-        status = withUnsafeMutablePointer(to: &uid) { AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0) }
-        guard status == noErr else { throw CLIError("Couldn't read the output device UID (status \(status))") }
-        return uid as String
+        func string(_ selector: AudioObjectPropertySelector) -> String? {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                     mElement: kAudioObjectPropertyElementMain)
+            var value: CFString = "" as CFString
+            var size = UInt32(MemoryLayout<CFString>.size)
+            status = withUnsafeMutablePointer(to: &value) { AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0) }
+            return status == noErr ? value as String : nil
+        }
+        guard let uid = string(kAudioDevicePropertyDeviceUID) else {
+            throw CLIError("Couldn't read the output device UID (status \(status))")
+        }
+        return (uid, string(kAudioObjectPropertyName) ?? uid)
     }
 }

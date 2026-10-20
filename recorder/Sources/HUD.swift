@@ -4,7 +4,8 @@ import AppKit
 /// transcribing, and a timer with buttons for open-ended sessions (hands-free
 /// dictation, meetings). After a meeting it says when the transcript is ready.
 /// A non-activating panel, so clicking it never takes focus from the app the
-/// text will be pasted into.
+/// text will be pasted into. Drag it anywhere; it stays there (double-click to
+/// put it back).
 final class HUD {
     enum State {
         case recording(level: () -> Float)
@@ -61,6 +62,21 @@ final class HUD {
     private var timer: Timer?
     private var hideWork: DispatchWorkItem?
     private var cardWork: DispatchWorkItem?
+    private var dragging = false
+    private static let positionKey = "pillPosition"
+    /// Where the pill was dragged to: its center x and bottom y as fractions of
+    /// the screen's visible frame, so it lands in the same spot on any screen.
+    private var dragged: NSPoint? = {
+        guard let xy = UserDefaults.standard.array(forKey: HUD.positionKey) as? [Double], xy.count == 2 else { return nil }
+        return NSPoint(x: xy[0], y: xy[1])
+    }() {
+        didSet {
+            if let dragged { UserDefaults.standard.set([dragged.x, dragged.y], forKey: Self.positionKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.positionKey) }
+        }
+    }
+    /// The caption, cards and history go under the pill when it's near the top.
+    private var upperBelow: Bool { dragged.map { $0.y > 0.5 } ?? (position == "top") }
 
     init() {
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: NSSize(width: 112, height: 34)),
@@ -78,6 +94,7 @@ final class HUD {
         view.onMeeting = { [weak self] dir, action in self?.onMeetingAction?(dir, action) }
         view.historyProvider = { [weak self] in self?.historyProvider?() ?? [] }
         view.onLayoutChange = { [weak self] in self?.relayout() }
+        view.onDrag = { [weak self] event in self?.drag(event) }
     }
 
     var isVisible: Bool { panel.isVisible }
@@ -109,14 +126,14 @@ final class HUD {
     func setCaption(_ text: String?) {
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
         view.caption = trimmed?.isEmpty == false ? trimmed : nil
-        view.captionBelow = position == "top"
         relayout()
     }
 
-    /// A thumbnail card above the pill for a couple of seconds.
-    func flashScreenshot(_ image: NSImage?, title: String, detail: String) {
+    /// A thumbnail card above the pill for a couple of seconds: an image, or the
+    /// start of some copied text.
+    func flashCard(_ image: NSImage?, snippet: String? = nil, title: String, detail: String) {
         cardWork?.cancel()
-        view.card = HUDCard(image: image, title: title, detail: detail)
+        view.card = HUDCard(image: image, snippet: snippet, title: title, detail: detail)
         relayout()
         let work = DispatchWorkItem { [weak self] in
             self?.view.card = nil
@@ -137,11 +154,11 @@ final class HUD {
         panel.alphaValue = 1
     }
 
-    func show(_ state: State) {
+    /// `for`: how long a message stays up (default 1.6s).
+    func show(_ state: State, for seconds: TimeInterval? = nil) {
         hideWork?.cancel()
         hideWork = nil
         view.setState(state)
-        view.captionBelow = position == "top"
         panel.ignoresMouseEvents = !view.hasButtons
         place(view.totalSize)
         if !panel.isVisible || panel.alphaValue < 1 {
@@ -155,7 +172,7 @@ final class HUD {
             self.timer = timer
         }
         switch state {
-        case .message: hide(after: 1.6)
+        case .message: hide(after: seconds ?? 1.6)
         case .error: hide(after: 1.0)
         default: break
         }
@@ -180,13 +197,53 @@ final class HUD {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Centered on the screen with the mouse, near the bottom (or top).
+    /// Where it was dragged to, else centered near the bottom (or top), on the
+    /// screen with the mouse when it appears. It stays on that screen while up.
     private func place(_ size: NSSize) {
+        guard !dragging else { return }
+        view.captionBelow = upperBelow
         let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        let screen = (panel.isVisible ? panel.screen : nil) ?? NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let frame = screen?.visibleFrame else { return }
-        let y = position == "top" ? frame.maxY - size.height - 48 : frame.minY + 56
-        panel.setFrame(NSRect(x: (frame.midX - size.width / 2).rounded(), y: y, width: size.width, height: size.height), display: true)
+        var rect = NSRect(x: (frame.midX - size.width / 2).rounded(), y: 0, width: size.width, height: size.height)
+        if let dragged {
+            // The pill's bottom edge sits at the remembered spot, whatever is above or below it.
+            let pillBottom = view.captionBelow ? size.height - view.pillHeight : 0
+            rect.origin.x = (frame.minX + dragged.x * frame.width - size.width / 2).rounded()
+            rect.origin.y = (frame.minY + dragged.y * frame.height - pillBottom).rounded()
+            rect.origin.x = min(max(rect.minX, frame.minX), frame.maxX - size.width)
+            rect.origin.y = min(max(rect.minY, frame.minY), frame.maxY - size.height)
+        } else {
+            rect.origin.y = position == "top" ? frame.maxY - size.height - 48 : frame.minY + 56
+        }
+        panel.setFrame(rect, display: true)
+    }
+
+    /// Moves the panel with the mouse until it's let go, then remembers where
+    /// the pill is. A double-click puts it back in its usual place.
+    private func drag(_ event: NSEvent) {
+        if event.clickCount == 2 {
+            dragged = nil
+            relayout()
+            return
+        }
+        let start = NSEvent.mouseLocation
+        let origin = panel.frame.origin
+        var moved = false
+        dragging = true
+        while let next = panel.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let now = NSEvent.mouseLocation
+            if abs(now.x - start.x) + abs(now.y - start.y) > 2 { moved = true }
+            if moved { panel.setFrameOrigin(NSPoint(x: origin.x + now.x - start.x, y: origin.y + now.y - start.y)) }
+            if next.type == .leftMouseUp { break }
+        }
+        dragging = false
+        guard moved, let frame = panel.screen?.visibleFrame, frame.width > 0, frame.height > 0 else { return }
+        let pill = view.pillFrame.offsetBy(dx: panel.frame.minX, dy: panel.frame.minY)
+        dragged = NSPoint(x: min(1, max(0, (pill.midX - frame.minX) / frame.width)),
+                          y: min(1, max(0, (pill.minY - frame.minY) / frame.height)))
+        // Crossing the middle of the screen moves the caption to the other side.
+        relayout()
     }
 }
 
@@ -202,6 +259,7 @@ struct HUDHistoryItem {
 
 private struct HUDCard {
     let image: NSImage?
+    var snippet: String? = nil
     let title: String
     let detail: String
 }
@@ -233,6 +291,8 @@ private final class HUDView: NSView {
     var screenshotCount = 0
     var historyProvider: (() -> [HUDHistoryItem])?
     var onLayoutChange: (() -> Void)?
+    /// A press outside the buttons: move the pill.
+    var onDrag: ((NSEvent) -> Void)?
     /// Non-nil while the history list is open; it takes the caption's place.
     private var history: [HUDHistoryItem]?
     /// What was just copied ("copy", "row3"); it reads "Copied" for a moment.
@@ -324,6 +384,9 @@ private final class HUDView: NSView {
                       width: size.width, height: size.height)
     }
 
+    var pillHeight: CGFloat { Self.height }
+    var pillFrame: NSRect { NSRect(origin: pillOrigin, size: pillSize) }
+
     /// Where the pill sits inside the view.
     private var pillOrigin: NSPoint {
         let x = ((bounds.width - pillSize.width) / 2).rounded()
@@ -388,7 +451,10 @@ private final class HUDView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard let id = hit(convert(event.locationInWindow, from: nil)) else { return }
+        guard let id = hit(convert(event.locationInWindow, from: nil)) else {
+            onDrag?(event)
+            return
+        }
         if id == "history" { toggleHistory(); return }
         if id.hasPrefix("row") {
             let parts = id.split(separator: ":")
@@ -570,13 +636,25 @@ private final class HUDView: NSView {
             let scale = max(thumb.width / image.size.width, thumb.height / image.size.height)
             let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
             image.draw(in: NSRect(x: thumb.midX - size.width / 2, y: thumb.midY - size.height / 2, width: size.width, height: size.height))
+        } else if let snippet = card.snippet {
+            // The start of the copied text, like a tiny page.
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byCharWrapping
+            NSAttributedString(string: String(snippet.prefix(160)), attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 7.5, weight: .regular), .foregroundColor: Self.soft, .paragraphStyle: paragraph,
+            ]).draw(with: thumb.insetBy(dx: 6, dy: 5), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
         }
         NSGraphicsContext.restoreGraphicsState()
-        let title = NSAttributedString(string: card.title, attributes: [.font: Self.labelFont, .foregroundColor: Self.text])
-        let detail = NSAttributedString(string: card.detail, attributes: [.font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: Self.muted])
+        let truncating = NSMutableParagraphStyle()
+        truncating.lineBreakMode = .byTruncatingTail
+        let title = NSAttributedString(string: card.title, attributes: [.font: Self.labelFont, .foregroundColor: Self.text, .paragraphStyle: truncating])
+        let detail = NSAttributedString(string: card.detail, attributes: [.font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: Self.muted,
+                                                                          .paragraphStyle: truncating])
         let x = thumb.maxX + 10
-        title.draw(at: NSPoint(x: x, y: rect.midY + 1))
-        detail.draw(at: NSPoint(x: x, y: rect.midY - detail.size().height - 1))
+        let textWidth = rect.maxX - 10 - x
+        title.draw(with: NSRect(x: x, y: rect.midY + 1, width: textWidth, height: title.size().height), options: [.usesLineFragmentOrigin])
+        detail.draw(with: NSRect(x: x, y: rect.midY - detail.size().height - 1, width: textWidth, height: detail.size().height),
+                    options: [.usesLineFragmentOrigin])
     }
 
     private var pill = NSRect.zero
