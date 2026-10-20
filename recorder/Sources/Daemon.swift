@@ -135,6 +135,7 @@ final class Daemon {
     private var previewTimer: Timer?
     private var previewInFlight = false
     private let hud = HUD()
+    private let menuBar = MenuBar()
     private var lastDictation: String?
 
     // Meeting
@@ -204,11 +205,14 @@ final class Daemon {
             case .notes: self.writeNotes(dir)
             }
         }
+        menuBar.stateProvider = { [unowned self] full in self.menuBarState(full: full) }
+        menuBar.onAction = { [unowned self] action in self.menuBarAction(action) }
         hotkeys.install()
         registerHotkeys()
         requestPermissions()
         resumeUnprocessedMeetings()
         startCalendar()
+        menuBar.setEnabled(config.menuBar)
         let config = self.config
         DispatchQueue.global(qos: .utility).async {
             Meetings.pruneRaw(config)
@@ -289,6 +293,7 @@ final class Daemon {
         worker.idleMinutes = config.idleUnloadMinutes
         hud.showCleanup = config.cleanupButton
         registerHotkeys()
+        menuBar.setEnabled(config.menuBar)
         log("config reloaded")
     }
 
@@ -373,6 +378,7 @@ final class Daemon {
             hud.setCaption(nil)
         }
         updateSessionHotkeys()
+        menuBar.update()
         if config.hud { hud.show(.handsFree(level: { mic.level }, since: since)) }
         startCallCapture(origin: since, force: meeting)
         log("dictation: switched to hands-free\(meeting ? " (meeting)" : "")")
@@ -433,6 +439,7 @@ final class Daemon {
             if config.livePreview && config.hud && !asMeeting { schedulePreview(session: dictationSession) }
             sound(config.startSound)
             if handsFree { startCallCapture(origin: pressedAt, force: asMeeting) }
+            menuBar.update()
             return ["ok": true, "dictation": "recording", "hands_free": handsFree, "mode": asMeeting ? "meeting" : "dictate"]
         } catch {
             sound(config.errorSound)
@@ -695,6 +702,7 @@ final class Daemon {
 
     /// After dictation: back to the meeting pill if one is recording, else hide.
     private func restoreHUD() {
+        menuBar.update()
         guard config.hud else { return }
         hud.setCaption(nil)
         if let meeting {
@@ -1153,6 +1161,7 @@ final class Daemon {
     private func reloadCalendar() {
         calendarModified = CalendarStore.modified
         calendarSnapshot = CalendarStore.load()
+        menuBar.update()
     }
 
     private func calendarTick() {
@@ -1166,6 +1175,7 @@ final class Daemon {
 
     private func refreshCalendarInBackground() {
         calendarRefreshing = true
+        menuBar.update()
         let config = self.config
         calendarQueue.async { [weak self] in
             let status = CalendarRefresh.run(config: config)
@@ -1279,6 +1289,103 @@ final class Daemon {
         return ["ok": true, "meetings": items]
     }
 
+    // MARK: - Menu bar
+
+    /// What the menu bar shows; `full` adds recent meetings and dictations for the panel.
+    private func menuBarState(full: Bool) -> MenuBarState {
+        var s = MenuBarState()
+        if let snapshot = calendarSnapshot {
+            s.events = snapshot.events
+            s.stale = snapshot.stale
+            s.updatedAt = snapshot.updatedAt
+        }
+        s.refreshMode = config.calendarRefresh
+        s.refreshing = calendarRefreshing
+        s.refreshError = calendarStatus.error
+        s.nudgeMinutes = config.calendarNudgeMinutes
+        if let meeting {
+            s.recording = .init(title: meeting.title, since: meeting.startedAt, bothSides: meeting.bothSides, ends: meeting.event?.end)
+        } else if dictationMic != nil, dictationHandsFree {
+            let since = dictationPressedAt ?? Date()
+            s.recording = .init(title: dictationAsMeeting ? "Meeting" : "Hands-free dictation", since: since,
+                                bothSides: callCapture != nil, ends: CalendarStore.event(at: since, in: calendarSnapshot)?.end)
+        }
+        s.processing = !processingIDs.isEmpty
+        if full {
+            s.meetings = Meetings.all(config).prefix(40).compactMap { dir in MeetingMeta.load(dir).map { (dir, $0) } }
+            s.dictations = DictationHistory.recent(limit: 5)
+        }
+        return s
+    }
+
+    private func menuBarAction(_ action: MenuBarAction) {
+        switch action {
+        case let .record(event):
+            clearNudge(restore: false)
+            _ = startMeeting(title: event.title, event: event)
+        case let .join(url):
+            NSWorkspace.shared.open(url)
+        case .stop:
+            if dictationMic != nil { _ = stopDictation() } else if meeting != nil { _ = stopMeeting() }
+        case .screenshot:
+            // After the panel is gone, so it's not in the shot.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.takeScreenshot() }
+        case .showPill:
+            showPill()
+        case .startMeeting:
+            _ = startMeeting(title: nil)
+        case .dictate:
+            _ = startDictation(handsFree: true)
+        case .refresh:
+            if !calendarRefreshing { refreshCalendarInBackground() }
+        case .settings:
+            Config.ensureDefaultFile()
+            _ = try? runProcess("/usr/bin/open", ["-t", Paths.configFile.path], timeout: 10)
+        case .howToConnect:
+            if let url = URL(string: "https://github.com/definite-app/butter/blob/main/recorder/README.md#refresh-with-claude-code") {
+                NSWorkspace.shared.open(url)
+            }
+        case .turnOffCalendar:
+            do {
+                try Config.set("meeting", "calendar_refresh", "\"off\"")
+                reload()
+                log("calendar: refresh turned off from the menu bar")
+            } catch {
+                log("calendar: couldn't turn the refresh off: \(error)")
+            }
+        case .allRecordings:
+            try? FileManager.default.createDirectory(at: config.meetingDirectory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(config.meetingDirectory)
+        case let .openTranscript(dir):
+            let transcript = dir.appendingPathComponent("transcript.md")
+            NSWorkspace.shared.open(FileManager.default.fileExists(atPath: transcript.path) ? transcript : dir)
+        case let .openNotes(dir):
+            let notes = dir.appendingPathComponent("notes.md")
+            if FileManager.default.fileExists(atPath: notes.path) { NSWorkspace.shared.open(notes) } else { writeNotes(dir) }
+        case let .copyTranscript(dir):
+            if let text = try? String(contentsOf: dir.appendingPathComponent("transcript.md"), encoding: .utf8) { setClipboard(text) }
+        case let .reveal(dir):
+            NSWorkspace.shared.activateFileViewerSelecting([dir])
+        case let .openMeeting(dir):
+            openMeeting(dir)
+        case let .copyText(text):
+            setClipboard(text)
+        case let .pasteAgain(text):
+            // Once the panel has let go of the keyboard.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.paste(text) }
+        }
+    }
+
+    /// Brings the session pill back (even with [ui] hud off), where it usually sits.
+    private func showPill() {
+        if let meeting {
+            hud.screenshotCount = meetingShots
+            hud.show(.meeting(level: { [weak meeting] in meeting?.micLevel ?? 0 }, since: meeting.startedAt))
+        } else if let mic = dictationMic, dictationHandsFree {
+            hud.show(.handsFree(level: { mic.level }, since: dictationPressedAt ?? Date()))
+        }
+    }
+
     // MARK: - Control requests
 
     /// Called on a socket thread. Long-running transcription stays here so the
@@ -1345,6 +1452,11 @@ final class Daemon {
             reloadCalendar()
             updateNudge()
             return ["ok": true, "events": calendarSnapshot?.events.count ?? 0]
+        case "menu.open":
+            // For testing and scripts: open (or close) the menu bar panel.
+            guard config.menuBar else { return ["ok": false, "error": "menu_bar is off"] }
+            request["close"] as? Bool == true ? menuBar.close() : menuBar.open()
+            return ["ok": true, "open": menuBar.isOpen]
         case "calendar.dismiss":
             // The nudge pill's ×.
             guard let event = nudge else { return ["ok": false, "error": "no nudge is showing"] }

@@ -199,12 +199,26 @@ calendar_mcp_servers = []          # e.g. ["claude.ai Google Calendar"]; [] = an
 calendar_timeout_seconds = 180
 ```
 
+### Menu bar
+
+ButterRec puts a small pill icon in the menu bar. Next to it is the next call later today ("Acme sync · in 2h 5m"). It turns yellow when the call is about to start ("in 2 min"). While you record, it shows the timer, and while a meeting is being transcribed it says "Transcribing…". With no call in the next 12 hours, or when the menu bar is too full, only the icon shows.
+
+Click it for a panel:
+
+- **Next:** the next call, with its time, app and attendees. **Record** starts a meeting named after it, and **Join** opens the link. While you're recording, this becomes the recording, with Stop, Screenshot and Show pill.
+- **Today** and **Tomorrow:** your events. A past call shows "✓ 14 min" if it was recorded (click it to open the transcript), or "Not recorded".
+- **Recent:** the last few meetings and dictations. Hover a meeting for its transcript, ✦ notes (writes them if there aren't any yet), copy and Finder. Hover a dictation for Copy and Paste again. **All recordings…** opens the meetings folder.
+- **Footer:** Start meeting, Dictate, when the calendar was last updated, refresh, and ⚙ (opens `recorder.toml`).
+- When the claude refresh fails, a card at the top says why in plain words, with Try again, How to connect, and Turn off (sets `calendar_refresh = "off"` in `recorder.toml`, keeping your comments).
+
+Esc or a click anywhere else closes it. `[ui] menu_bar = false` removes it.
+
 ### For other apps
 
 The daemon socket (`~/.butter/rec.sock`, one JSON line in and one out) also answers:
 
 - `{"cmd": "calendar.list"}`: events today and tomorrow that haven't ended, with refresh status
-- `{"cmd": "calendar.refresh"}`, `{"cmd": "calendar.reload"}`, `{"cmd": "calendar.dismiss"}` (the nudge's ×)
+- `{"cmd": "calendar.refresh"}`, `{"cmd": "calendar.reload"}`, `{"cmd": "calendar.dismiss"}` (the nudge's ×), `{"cmd": "menu.open"}` (`"close": true` closes it)
 - `{"cmd": "meetings.list", "limit": 20}`: recent meetings with id, title, start, duration, status, folder, whether `transcript.md` and `notes.md` exist, and `calendar_event`
 - `{"cmd": "dictations.list", "limit": 20, "search": "…"}`: recent dictations from history
 
@@ -277,4 +291,4 @@ Logs go to `~/.butter/logs/rec.log`. Set `BUTTER_REC_CONFIG=/path/to.toml` to ru
 - If you're on speakers rather than headphones, your mic also picks up the other side. Overlapping "Me" lines that repeat "Them" lines get dropped, but some echo can still get through.
 - If the default output device changes during a meeting (for example, AirPods connect), system audio may stop. The mic keeps recording.
 - Nobody is identified by voice. "Them" covers everyone on the call. Notes can only name someone when a [calendar](#calendar) event lists the attendees and the transcript makes clear who's speaking.
-- Butter's own UI doesn't show anything about recordings yet.
+- Butter's own UI doesn't show anything about recordings yet; the [menu bar](#menu-bar) item is ButterRec's.

@@ -65,7 +65,7 @@ enum MiniTOML {
         return (key, body)
     }
 
-    private static func stripComment(_ line: String) -> String {
+    static func stripComment(_ line: String) -> String {
         var quote: Character?
         var escaped = false
         for (i, ch) in line.enumerated() {
@@ -201,6 +201,7 @@ struct Config {
     // [ui]
     var hud: Bool { bool("ui", "hud", true) }
     var hudPosition: String { string("ui", "position", "bottom") }
+    var menuBar: Bool { bool("ui", "menu_bar", true) }
     var dictationOutput: String { string("dictation", "output", "paste") }
     var restoreClipboard: Bool { bool("dictation", "restore_clipboard", true) }
     var sounds: Bool { bool("dictation", "sounds", true) }
@@ -288,6 +289,45 @@ struct Config {
         return Config(raw: MiniTOML.parse(text))
     }
 
+    /// Sets `key = value` (value as TOML, e.g. "\"off\"") in recorder.toml,
+    /// keeping everything else, comments included: the key's line is rewritten
+    /// in place (with its trailing comment), or added to the end of its section.
+    static func set(_ section: String, _ key: String, _ value: String) throws {
+        ensureDefaultFile()
+        let text = (try? String(contentsOf: Paths.configFile, encoding: .utf8)) ?? ""
+        var lines = text.components(separatedBy: "\n")
+        var current = ""
+        var lastInSection: Int?
+        var inMultiLine = false
+        for i in lines.indices {
+            let line = lines[i]
+            if line.components(separatedBy: "\"\"\"").count % 2 == 0 { inMultiLine.toggle(); continue }
+            if inMultiLine { continue }
+            let bare = MiniTOML.stripComment(line).trimmingCharacters(in: .whitespaces)
+            if bare.hasPrefix("[") && bare.hasSuffix("]") {
+                current = String(bare.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                if current == section { lastInSection = i }
+                continue
+            }
+            guard current == section else { continue }
+            if !bare.isEmpty { lastInSection = i }
+            guard let eq = bare.firstIndex(of: "="), bare[..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+            let indent = String(line.prefix { $0 == " " || $0 == "\t" })
+            let comment = String(line.dropFirst(MiniTOML.stripComment(line).count))
+            let assignment = "\(indent)\(key) = \(value)"
+            lines[i] = comment.isEmpty ? assignment : assignment.padding(toLength: max(assignment.count + 1, 29), withPad: " ", startingAt: 0) + comment
+            try lines.joined(separator: "\n").write(to: Paths.configFile, atomically: true, encoding: .utf8)
+            return
+        }
+        if let after = lastInSection {
+            lines.insert("\(key) = \(value)", at: after + 1)
+        } else {
+            while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
+            lines += ["", "[\(section)]", "\(key) = \(value)", ""]
+        }
+        try lines.joined(separator: "\n").write(to: Paths.configFile, atomically: true, encoding: .utf8)
+    }
+
     static func ensureDefaultFile() {
         let fm = FileManager.default
         guard !fm.fileExists(atPath: Paths.configFile.path) else { return }
@@ -350,6 +390,7 @@ struct Config {
     [ui]
     hud = true                   # floating pill while dictating / recording a meeting
     position = "bottom"          # bottom | top
+    menu_bar = true              # menu bar item: next call, recording timer, today, recent recordings
 
     [audio]
     # Microphone to record from: "auto" uses the system default unless it's

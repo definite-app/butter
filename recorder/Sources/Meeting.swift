@@ -191,6 +191,8 @@ final class MeetingRecording {
     let dir: URL
     let title: String
     let startedAt = Date()
+    /// The calendar event it's recorded during, if any.
+    let event: CalendarEvent?
     private let mic = MicRecorder()
     private let micSink: WavSink
     private var system: SystemAudioRecorder?
@@ -200,6 +202,7 @@ final class MeetingRecording {
     init(dir: URL, title: String, config: Config, inputDevice: InputDevices.Device?, event: CalendarEvent? = nil) throws {
         self.dir = dir
         self.title = title
+        self.event = event
         micSink = try WavSink(url: dir.appendingPathComponent("mic.wav"))
         try mic.start(into: micSink, device: inputDevice)
         if config.systemAudio {
@@ -225,6 +228,8 @@ final class MeetingRecording {
     }
 
     var elapsed: Double { Date().timeIntervalSince(startedAt) }
+    /// Recording the other side too, not just the mic.
+    var bothSides: Bool { system != nil }
     var micLevel: Float { mic.level }
 
     func stop() {
