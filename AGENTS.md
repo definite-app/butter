@@ -65,6 +65,14 @@ npm run test:composer
 - The view opens by itself once on first launch, and once when the designated requirement differs from the one in `<butter home>/signing.json` while one of Butter's own permissions isn't granted.
 - WebKit keeps a login-keychain item, "butter WebCrypto Master Key", for pages that store crypto keys. Its access list trusts the build that made it, so after a signature change macOS may ask once to let Butter use it; choose Always Allow. Butter itself stores nothing in the keychain.
 
+## Restore after relaunch
+- Terminals come back through the reopen picker (`db_restore_candidates`; open/close is written to the DB as it happens, so a crash keeps the set).
+- File tabs and pinned apps are one JSON value in the DB's `app_state` table, key `workspace_restore_v1` (per flavor: `~/.butter/agent.db`, `~/.butter-dev/agent.db`). It's written 800 ms after any change, and again when the window closes or hides. Pure logic and tests: `src/features/files/restore.ts`, `scripts/restore-logic.test.ts`.
+- **Pinned file tabs** come back on every launch, in order, whatever the picker does.
+- **A terminal's file tabs** (order, the tab on screen, the markdown preview toggle) come back with it from the picker, Recently Closed (Cmd+Shift+T) or "Restore Previous Sessions". The newest 50 closed terminals keep their entry. A terminal not reopened doesn't bring its tabs back.
+- A restored tab whose file is gone or can't be read is dropped without a message. Unsaved edits aren't kept: quitting loses them, as before.
+- **Pinned apps** open at quit come back after the picker closes. The app on screen at quit is shown again (it was only on screen if no terminal was); the others open lazily on first click. Each reopens at its last URL if that's on the app's own origin, else at its `url`. Apps removed from browser.toml are skipped.
+
 ## Composer Dock (Cmd+I)
 - `src/features/composer/` (UI + pure logic in `logic.ts`, tests in `scripts/composer-logic.test.ts`, run `npm run test:composer`); backend in `src-tauri/src/composer.rs`.
 - Drafts are files under the flavor data dir (`~/.butter/drafts`, `~/.butter-dev/drafts`); sent drafts move to `drafts/sent/` and `drafts/history.jsonl`.

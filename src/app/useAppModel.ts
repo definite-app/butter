@@ -27,6 +27,23 @@ import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import { buildThreadResumeCommand, createThreadModel, THREAD_TAG } from "../features/thread/threadModel";
 import {
+  activeTabAfterRemoval,
+  buildRestoreState,
+  emptyRestoreState,
+  parseRestoreState,
+  pinnedTabsToRestore,
+  planAppRestore,
+  serializeRestoreState,
+  sessionTabsToRestore,
+  WORKSPACE_RESTORE_STATE_KEY,
+  type LiveSessionTabs,
+  type LiveWorkspace,
+  type SavedApp,
+  type SavedFileTab,
+  type WorkspaceRestoreState,
+} from "../features/files/restore";
+import {
+  APP_SESSION_PREFIX,
   appSessionId,
   commandNeedsQuery,
   hostOf,
@@ -515,6 +532,19 @@ export function useAppModel() {
   // Per-tab markdown view mode ("source" | "preview"). Stored outside the
   // tab data model since it's UI state, not file content. Missing entry → "source".
   const [markdownViewModeByTab, setMarkdownViewModeByTab] = createSignal<Record<string, "source" | "preview">>({});
+  // What comes back after a relaunch: pinned tabs, each terminal's file tabs,
+  // open pinned apps (features/files/restore.ts). Read once at launch; kept
+  // current by persistWorkspaceRestoreState. Nothing is written until the read
+  // succeeded, so a failed read can't wipe the saved state.
+  let workspaceRestoreState: WorkspaceRestoreState = emptyRestoreState();
+  const [workspaceRestoreLoaded, setWorkspaceRestoreLoaded] = createSignal(false);
+  // Set once the reopen picker is settled; open apps are restored after that
+  // (their webviews draw above the picker).
+  const [appRestoreArmed, setAppRestoreArmed] = createSignal(false);
+  let appsRestored = false;
+  // Apps that were open at quit but not on screen, with the URL to open each
+  // at. They load on first click (openApp), not at launch.
+  const pendingAppRestoreUrls = new Map<string, string>();
   const [_lastOutputAt, setLastOutputAt] = createSignal<Record<string, number>>({});
   const [sessionPreview, setSessionPreview] = createSignal<Record<string, string[]>>({});
   const [sessionInputDraft, setSessionInputDraft] = createSignal<Record<string, string>>({});
@@ -3172,6 +3202,174 @@ export function useAppModel() {
     revokeWorkspaceFileTabResources(tab);
   };
 
+  // The store (pinned or a terminal's) holding the tab now; pinning while the
+  // file loads moves it.
+  const findFileTabOwner = (tabId: string): string | null => {
+    if (findPinnedFileTab(tabId)) return PINNED_WORKSPACE_OWNER_ID;
+    for (const [sessionId, tabs] of Object.entries(fileTabsBySession())) {
+      if (tabs.some((tab) => tab.id === tabId)) return sessionId;
+    }
+    return null;
+  };
+
+  // A restored tab whose file is gone or unreadable goes away without a prompt.
+  const dropUnreadableFileTab = (tabId: string) => {
+    const owner = findFileTabOwner(tabId);
+    if (!owner) return;
+    if (owner === PINNED_WORKSPACE_OWNER_ID) {
+      void unpinFileTab(tabId, { skipDirtyPrompt: true });
+      return;
+    }
+    const tabs = getSessionFileTabs(owner);
+    const tab = tabs.find((entry) => entry.id === tabId);
+    if (!tab) return;
+    const activeTabId = getActiveWorkspaceTabIdForSession(owner);
+    const nextActive = activeTabAfterRemoval(
+      tabs.map((entry) => entry.id),
+      tabId,
+      activeTabId === TERMINAL_WORKSPACE_TAB_ID ? null : activeTabId
+    );
+    if (nextActive !== activeTabId) {
+      setActiveWorkspaceTabForSession(owner, nextActive ?? TERMINAL_WORKSPACE_TAB_ID);
+    }
+    setSessionFileTabs(owner, (current) => current.filter((entry) => entry.id !== tabId));
+    revokeWorkspaceFileTabResources(tab);
+  };
+
+  // Reads a tab's file into it. On failure the tab shows the error ("show",
+  // a file opened by hand) or is removed ("drop", a tab restored at launch).
+  const loadWorkspaceFileTabContent = async (tab: WorkspaceFileTab, onError: "show" | "drop") => {
+    const updateTab = (updater: (current: WorkspaceFileTab) => WorkspaceFileTab | null): boolean => {
+      const owner = findFileTabOwner(tab.id);
+      if (!owner) return false;
+      let attached = false;
+      updateFileTabsForOwner(owner, (tabs) =>
+        tabs.map((current) => {
+          if (current.id !== tab.id) return current;
+          const next = updater(current);
+          if (!next) return current;
+          attached = true;
+          return next;
+        })
+      );
+      return attached;
+    };
+    const fail = (err: unknown) => {
+      if (onError === "drop") {
+        console.log(`[restore] dropping unreadable file tab ${tab.path}:`, err);
+        dropUnreadableFileTab(tab.id);
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      updateTab((current) => ({ ...current, loading: false, error: message }));
+    };
+
+    if (tab.kind === "text_file") {
+      try {
+        const content = await invoke<string>("read_file_text", {
+          path: tab.path,
+          maxBytes: BUTTER_TEXT_FILE_LIMIT_BYTES,
+        });
+        updateTab((current) =>
+          current.kind === "text_file"
+            ? { ...current, loading: false, error: null, content, savedContent: content, dirty: false }
+            : null
+        );
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+
+    try {
+      const bytes = await invoke<number[]>("read_file_binary", { path: tab.path });
+      const mimeType = inferImageMimeType(tab.path) || "application/octet-stream";
+      const imageUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mimeType }));
+      const attached = updateTab((current) =>
+        current.kind === "image_file" ? { ...current, loading: false, error: null, imageUrl } : null
+      );
+      if (!attached) {
+        URL.revokeObjectURL(imageUrl);
+      }
+    } catch (err) {
+      fail(err);
+    }
+  };
+
+  // A tab as it is when restored, before its file is read.
+  const makeLoadingFileTab = (saved: SavedFileTab, ownerSessionId: string): WorkspaceFileTab | null => {
+    const kind = getButterWorkspaceFileKind(saved.path);
+    if (!kind) return null;
+    const base = {
+      id: saved.id,
+      ownerSessionId,
+      path: saved.path,
+      displayName: getPathDisplayName(saved.path),
+      loading: true,
+      error: null,
+    };
+    return kind === "text_file"
+      ? { ...base, kind, content: "", savedContent: "", dirty: false }
+      : { ...base, kind, imageUrl: null, dirty: false };
+  };
+
+  const applySavedMarkdownViews = (saved: SavedFileTab[]) => {
+    const previews = saved.filter((tab) => tab.markdownView === "preview");
+    if (previews.length === 0) return;
+    setMarkdownViewModeByTab((prev) => {
+      const next = { ...prev };
+      for (const tab of previews) next[tab.id] = "preview";
+      return next;
+    });
+  };
+
+  // Pinned tabs come back on every launch, whatever the reopen picker does.
+  const restorePinnedFileTabs = () => {
+    const saved = pinnedTabsToRestore(workspaceRestoreState);
+    const tabs = saved
+      .map((entry) => makeLoadingFileTab(entry, PINNED_WORKSPACE_OWNER_ID))
+      .filter((tab): tab is WorkspaceFileTab => tab !== null);
+    if (tabs.length === 0) return;
+    setPinnedFileTabs(tabs);
+    applySavedMarkdownViews(saved);
+    for (const tab of tabs) void loadWorkspaceFileTabContent(tab, "drop");
+  };
+
+  // A terminal reopened from the picker, Recently Closed or "Restore Previous
+  // Sessions" gets back the file tabs it had, and the tab it was showing.
+  const restoreSessionFileTabs = (sessionId: string) => {
+    if (getSessionFileTabs(sessionId).length > 0) return;
+    const openIds: string[] = [];
+    const openPaths: string[] = [];
+    for (const tabs of Object.values(fileTabsBySession())) {
+      for (const tab of tabs) {
+        openIds.push(tab.id);
+      }
+    }
+    const pinned = pinnedFileTabs();
+    for (const tab of pinned) {
+      openIds.push(tab.id);
+      openPaths.push(tab.path);
+    }
+    const restored = sessionTabsToRestore(workspaceRestoreState, sessionId, {
+      ids: openIds,
+      paths: openPaths,
+      pinnedIds: pinned.map((tab) => tab.id),
+    });
+    const tabs = restored.tabs
+      .map((entry) => makeLoadingFileTab(entry, sessionId))
+      .filter((tab): tab is WorkspaceFileTab => tab !== null);
+    if (tabs.length > 0) {
+      setSessionFileTabs(sessionId, () => tabs);
+      applySavedMarkdownViews(restored.tabs);
+    }
+    const activeTabId = restored.activeTabId;
+    if (activeTabId !== null && (tabs.some((tab) => tab.id === activeTabId) || findPinnedFileTab(activeTabId))) {
+      setActiveWorkspaceTabForSession(sessionId, activeTabId);
+    }
+    for (const tab of tabs) void loadWorkspaceFileTabContent(tab, "drop");
+  };
+
   const openFileInButter = async (path: string, sessionId = activeSessionId()) => {
     if (!sessionId) return;
     const kind = getButterWorkspaceFileKind(path);
@@ -3240,70 +3438,7 @@ export function useAppModel() {
     if (activeSessionId() !== sessionId) {
       selectSession(sessionId);
     }
-
-    if (kind === "text_file") {
-      try {
-        const content = await invoke<string>("read_file_text", {
-          path,
-          maxBytes: BUTTER_TEXT_FILE_LIMIT_BYTES,
-        });
-        setSessionFileTabs(sessionId, (tabs) =>
-          tabs.map((tab) =>
-            tab.id === tabId && tab.kind === "text_file"
-              ? {
-                  ...tab,
-                  loading: false,
-                  error: null,
-                  content,
-                  savedContent: content,
-                  dirty: false,
-                }
-              : tab
-          )
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        setSessionFileTabs(sessionId, (tabs) =>
-          tabs.map((tab) =>
-            tab.id === tabId && tab.kind === "text_file"
-              ? { ...tab, loading: false, error: message }
-              : tab
-          )
-        );
-      }
-      return;
-    }
-
-    try {
-      const bytes = await invoke<number[]>("read_file_binary", { path });
-      const mimeType = inferImageMimeType(path) || "application/octet-stream";
-      const imageUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mimeType }));
-      let attached = false;
-      setSessionFileTabs(sessionId, (tabs) =>
-        tabs.map((tab) => {
-          if (tab.id !== tabId || tab.kind !== "image_file") return tab;
-          attached = true;
-          return {
-            ...tab,
-            loading: false,
-            error: null,
-            imageUrl,
-          };
-        })
-      );
-      if (!attached) {
-        URL.revokeObjectURL(imageUrl);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setSessionFileTabs(sessionId, (tabs) =>
-        tabs.map((tab) =>
-          tab.id === tabId && tab.kind === "image_file"
-            ? { ...tab, loading: false, error: message }
-            : tab
-        )
-      );
-    }
+    await loadWorkspaceFileTabContent(newTab, "show");
   };
 
   const copyFileBrowserEntry = async (entry: FileBrowserEntry) => {
@@ -4558,6 +4693,7 @@ export function useAppModel() {
       } else {
         setSessions(existingIndex, session);
       }
+      restoreSessionFileTabs(id);
 
       selectSession(id);
       await refreshRecentlyClosedSessions();
@@ -4620,6 +4756,7 @@ export function useAppModel() {
       newSessions.forEach((dbSession, index) => {
         const session = mapDbSessionToWebSession(dbSession);
         setSessions(startIndex + index, session);
+        restoreSessionFileTabs(dbSession.id);
       });
       // Record them as open in this run so the next launch offers them.
       await invoke("db_resolve_restore", {
@@ -6176,7 +6313,10 @@ export function useAppModel() {
     // Open before the pane mounts: its first bounds update would otherwise
     // create the webview on the default profile.
     if (!browserSessions()[sessionId]?.open) {
-      await openBrowserForSession(sessionId, appEntry.url, appEntry.profile);
+      // An app open at last quit comes back at the page it was on.
+      const restoreUrl = pendingAppRestoreUrls.get(appEntry.id);
+      pendingAppRestoreUrls.delete(appEntry.id);
+      await openBrowserForSession(sessionId, restoreUrl ?? appEntry.url, appEntry.profile);
     }
     setActiveAppId(appEntry.id);
   };
@@ -6187,6 +6327,100 @@ export function useAppModel() {
     const sessionId = activeSessionId();
     if (sessionId) setTimeout(() => focusTerminal(sessionId), 0);
   };
+
+  // ---- Restore after relaunch ----------------------------------------------
+
+  const collectLiveWorkspace = (): LiveWorkspace => {
+    const markdownViews = markdownViewModeByTab();
+    const toSaved = (tab: WorkspaceFileTab): SavedFileTab =>
+      markdownViews[tab.id] === "preview"
+        ? { id: tab.id, path: tab.path, kind: tab.kind, markdownView: "preview" }
+        : { id: tab.id, path: tab.path, kind: tab.kind };
+    const tabsBySession = fileTabsBySession();
+    const activeBySession = activeWorkspaceTabBySession();
+    const sessionIds = sessions.map((session) => session.id);
+    const liveSessions: Record<string, LiveSessionTabs> = {};
+    for (const sessionId of sessionIds) {
+      const activeTabId = activeBySession[sessionId];
+      liveSessions[sessionId] = {
+        tabs: (tabsBySession[sessionId] ?? []).map(toSaved),
+        activeTabId: activeTabId && activeTabId !== TERMINAL_WORKSPACE_TAB_ID ? activeTabId : null,
+      };
+    }
+    const apps: SavedApp[] = [];
+    for (const state of Object.values(browserSessions())) {
+      if (!state.open || !isAppSessionId(state.sessionId)) continue;
+      apps.push({ id: state.sessionId.slice(APP_SESSION_PREFIX.length), url: state.url });
+    }
+    for (const [id, url] of pendingAppRestoreUrls) {
+      if (!apps.some((app) => app.id === id)) apps.push({ id, url });
+    }
+    return {
+      sessionIds,
+      sessions: liveSessions,
+      pinned: pinnedFileTabs().map(toSaved),
+      apps,
+      activeAppId: activeAppId(),
+      appsRestored,
+    };
+  };
+
+  let workspacePersistTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastWorkspaceStateJson: string | null = null;
+
+  // Written to the DB as tabs and apps change (debounced), and again on window
+  // close and when the window hides, so a crash loses at most the last second.
+  const persistWorkspaceRestoreState = async () => {
+    if (workspacePersistTimer) {
+      clearTimeout(workspacePersistTimer);
+      workspacePersistTimer = null;
+    }
+    if (!workspaceRestoreLoaded()) return;
+    const next = buildRestoreState(untrack(collectLiveWorkspace), workspaceRestoreState, Date.now());
+    workspaceRestoreState = next;
+    const json = serializeRestoreState(next);
+    if (json === lastWorkspaceStateJson) return;
+    lastWorkspaceStateJson = json;
+    try {
+      await invoke("db_set_app_state", { key: WORKSPACE_RESTORE_STATE_KEY, value: json });
+    } catch (err) {
+      lastWorkspaceStateJson = null;
+      console.error("[restore] Failed to save open tabs and apps:", err);
+    }
+  };
+
+  const schedulePersistWorkspaceRestoreState = () => {
+    if (workspacePersistTimer) clearTimeout(workspacePersistTimer);
+    workspacePersistTimer = setTimeout(() => void persistWorkspaceRestoreState(), 800);
+  };
+
+  createEffect(() => {
+    if (!workspaceRestoreLoaded()) return;
+    collectLiveWorkspace();
+    schedulePersistWorkspaceRestoreState();
+  });
+
+  // Apps open at quit: the one on screen comes back on screen (it was only on
+  // screen if no terminal was); the rest reopen at their last page on first
+  // click. Apps no longer in browser.toml are skipped.
+  const restoreOpenApps = async () => {
+    await refreshBrowserConfig();
+    const plan = planAppRestore(workspaceRestoreState, browserConfig().apps);
+    for (const app of plan.apps) pendingAppRestoreUrls.set(app.id, app.url);
+    appsRestored = true;
+    schedulePersistWorkspaceRestoreState();
+    if (plan.onScreenAppId && activeAppId() === null && appView() === "terminal") {
+      await openApp(plan.onScreenAppId);
+    }
+  };
+
+  let appRestoreStarted = false;
+  createEffect(() => {
+    if (appRestoreStarted || !workspaceRestoreLoaded() || !appRestoreArmed()) return;
+    if (restoreDecision() === "pending") return;
+    appRestoreStarted = true;
+    void restoreOpenApps();
+  });
 
   const toggleAppFullWindow = () => {
     const next = !appFullWindow();
@@ -6682,6 +6916,7 @@ export function useAppModel() {
       if (!existingIds.has(dbSession.id)) {
         setSessions(sessions.length, mapDbSessionToWebSession(dbSession));
         existingIds.add(dbSession.id);
+        restoreSessionFileTabs(dbSession.id);
       }
       if (firstId === null) firstId = dbSession.id;
       if (sel.restartAgent && dbSession.agent_kind) {
@@ -7432,6 +7667,19 @@ export function useAppModel() {
     } catch (err) {
       console.error("Failed to load config:", err);
     }
+
+    // Pinned file tabs come back now; terminals' tabs come back with their
+    // terminal, and open apps once the reopen picker is settled.
+    try {
+      const raw = await invoke<string | null>("db_get_app_state", { key: WORKSPACE_RESTORE_STATE_KEY });
+      workspaceRestoreState = parseRestoreState(raw);
+      lastWorkspaceStateJson = raw ?? null;
+      restorePinnedFileTabs();
+      setWorkspaceRestoreLoaded(true);
+    } catch (err) {
+      console.error("[restore] Failed to read saved tabs and apps:", err);
+    }
+
     // Migration from localStorage to SQLite (one-time)
     const migrationKey = "db-migration-v1";
     const hasMigrated = localStorage.getItem(migrationKey);
@@ -7561,6 +7809,7 @@ export function useAppModel() {
         setRestorePromptOpen(true);
       }
     }
+    setAppRestoreArmed(true);
 
     // First launch, or the app's signature changed with a permission missing:
     // show the Permissions view once.
@@ -7804,6 +8053,7 @@ export function useAppModel() {
       if (document.visibilityState === "hidden") {
         console.log("[scrollback] Visibility hidden, saving all scrollback");
         void saveAllScrollback();
+        void persistWorkspaceRestoreState();
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -7811,7 +8061,7 @@ export function useAppModel() {
     // Listen for window close to save scrollback
     const unlistenCloseRequest = await getCurrentWindow().onCloseRequested(async (_event) => {
       console.log("[scrollback] Window close requested, saving all scrollback");
-      await saveAllScrollback();
+      await Promise.all([saveAllScrollback(), persistWorkspaceRestoreState()]);
     });
 
     onCleanup(() => {
