@@ -19,6 +19,8 @@ final class HUD {
         case processing(String)
         /// A meeting's transcript is ready: Open, Copy, ✦ Notes, ×. Stays until dismissed.
         case ready(title: String, detail: String)
+        /// A call on the calendar is about to start: "Acme sync  in 2 min", Record, ×.
+        case nudge(title: String, detail: String)
         case message(String)
         case error
     }
@@ -35,6 +37,9 @@ final class HUD {
     var onCopy: (() -> Void)?
     var onNotes: (() -> Void)?
     var onDismiss: (() -> Void)?
+    /// The calendar nudge's buttons.
+    var onRecord: (() -> Void)?
+    var onNudgeDismiss: (() -> Void)?
     var showCleanup: Bool {
         get { view.showCleanup }
         set { view.showCleanup = newValue }
@@ -111,6 +116,8 @@ final class HUD {
         case "copy": onCopy?()
         case "notes": onNotes?()
         case "dismiss": onDismiss?()
+        case "record": onRecord?()
+        case "nudge-dismiss": onNudgeDismiss?()
         default:
             if action.hasPrefix("pick:") { onPickHistory?(String(action.dropFirst(5))) }
         }
@@ -326,6 +333,8 @@ private final class HUDView: NSView {
         width(button.label) + (button.id == "notes" ? 34 : 22)
     }
 
+    private var recordButtonWidth: CGFloat { width("Record") + 34 }
+
     private var pillSize: NSSize {
         let w: CGFloat
         switch state {
@@ -344,6 +353,8 @@ private final class HUDView: NSView {
         case let .ready(title, detail):
             let buttons = readyButtons.reduce(0) { $0 + readyButtonWidth($1) + 4 }
             w = 17 + 12 + 8 + width(title) + 7 + width(detail) + 16 + buttons + 24 + 5
+        case let .nudge(title, detail):
+            w = 17 + 14 + 8 + width(title) + 7 + width(detail) + 16 + recordButtonWidth + 4 + 24 + 5
         case let .message(message):
             w = max(150, width(message) + 12 + 40)
         default:
@@ -403,7 +414,7 @@ private final class HUDView: NSView {
 
     var hasButtons: Bool {
         switch state {
-        case .handsFree, .meeting, .ready: return true
+        case .handsFree, .meeting, .ready, .nudge: return true
         default: return false
         }
     }
@@ -744,6 +755,17 @@ private final class HUDView: NSView {
                                primary: button.id == "open", sparkle: button.id == "notes", font: Self.labelFont)
             }
 
+        case let .nudge(title, detail):
+            // [ ▦ Acme sync in 2 min  ● Record × ]
+            drawSymbol("calendar", in: NSRect(x: 17, y: bounds.midY - 7, width: 14, height: 14), size: 12, color: Self.butter)
+            drawText(title, at: 39, color: Self.text)
+            drawText(detail, at: 39 + width(title) + 7, color: Self.muted)
+            var right = bounds.maxX - 5 - 24
+            drawCancel(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24), id: "nudge-dismiss")
+            right -= recordButtonWidth + 4
+            let button = NSRect(x: right, y: bounds.midY - 12, width: recordButtonWidth, height: 24)
+            drawTextButton("Record", in: button, id: "record", primary: true, sparkle: false, dot: true, font: Self.labelFont)
+
         case .error:
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.errorColor) { _ in 0.1 }
 
@@ -791,7 +813,8 @@ private final class HUDView: NSView {
         NSBezierPath(ovalIn: NSRect(x: centerX - r, y: pill.midY - r, width: r * 2, height: r * 2)).fill()
     }
 
-    private func drawTextButton(_ text: String, in rect: NSRect, id: String, primary: Bool, sparkle: Bool, font: NSFont) {
+    /// `sparkle` (✦ Notes) or `dot` (● Record) goes before the label.
+    private func drawTextButton(_ text: String, in rect: NSRect, id: String, primary: Bool, sparkle: Bool, dot: Bool = false, font: NSFont) {
         hits.append((rect, id))
         let hover = hovered == id
         if primary {
@@ -808,6 +831,10 @@ private final class HUDView: NSView {
         if sparkle {
             x += 7
             drawSymbol("sparkles", in: NSRect(x: x - 16, y: rect.midY - 6, width: 12, height: 12), size: 10.5, color: Self.butter)
+        } else if dot {
+            x += 6
+            Self.errorColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x - 13, y: rect.midY - 3.5, width: 7, height: 7)).fill()
         }
         label.draw(at: NSPoint(x: x, y: rect.midY - size.height / 2))
     }

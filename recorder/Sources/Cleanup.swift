@@ -133,7 +133,9 @@ enum Cleanup {
         return String(data: result.stdout, encoding: .utf8) ?? ""
     }
 
-    private static var foundClaude: String?
+    /// Executables found through the login shell, by name.
+    private static var foundInShell: [String: String] = [:]
+    private static let foundLock = NSLock()
     private static var shellEnvironment: [String: String]?
     private static let environmentLock = NSLock()
 
@@ -193,9 +195,18 @@ enum Cleanup {
         let configured = config.string("cleanup", "claude_path", "").trimmingCharacters(in: .whitespaces)
         if !configured.isEmpty { return which(configured) }
         if let found = which("claude") ?? which("~/.claude/local/claude") { return found }
-        if let foundClaude, FileManager.default.isExecutableFile(atPath: foundClaude) { return foundClaude }
+        return loginShellLookup("claude")
+    }
+
+    /// Whatever your login shell runs for `name` (a path, or an alias to one).
+    /// Remembered once found.
+    static func loginShellLookup(_ name: String) -> String? {
+        foundLock.lock()
+        let known = foundInShell[name]
+        foundLock.unlock()
+        if let known, FileManager.default.isExecutableFile(atPath: known) { return known }
         let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
-        guard let result = try? runProcess(shell, ["-lic", "command -v claude"], timeout: 5), result.status == 0,
+        guard let result = try? runProcess(shell, ["-lic", "command -v \(name)"], timeout: 5), result.status == 0,
               let line = String(data: result.stdout, encoding: .utf8)?.split(separator: "\n").last.map(String.init) else { return nil }
         // "/path/to/claude", or "alias claude='/path/to/claude --flags'".
         var path = line.trimmingCharacters(in: .whitespaces)
@@ -204,8 +215,10 @@ enum Cleanup {
             path = String(path.split(separator: " ").first ?? "")
         }
         guard let resolved = which(path) else { return nil }
-        log("cleanup: found claude at \(resolved) through \(shell)")
-        foundClaude = resolved
+        log("found \(name) at \(resolved) through \(shell)")
+        foundLock.lock()
+        foundInShell[name] = resolved
+        foundLock.unlock()
         return resolved
     }
 
