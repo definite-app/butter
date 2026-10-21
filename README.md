@@ -75,7 +75,7 @@ It needs Xcode's command-line tools (`xcode-select --install`) and [`uv`](https:
 - **Command palette** — `Cmd+K` for commands, `Cmd+Shift+K` to jump to a terminal
 - **Claude Code activity indicators** — live working/idle status in the sidebar via Claude hooks
 - **Codex activity support** — `agent-turn-complete` events from Codex CLI
-- **Session persistence** — SQLite-backed sessions with scrollback; restore on app restart
+- **Session persistence** — SQLite-backed sessions with scrollback; terminals, their open file tabs, pinned file tabs and open pinned apps come back on restart
 - **File browser** — integrated overlay with search (`Cmd+O`)
 - **Clipboard images** — paste screenshots straight into terminals
 - **Scratchpad** — quick notes drawer
