@@ -175,7 +175,7 @@ enum Meetings {
             let ended = Date()
             MeetingMeta(dict: [
                 "id": dir.lastPathComponent, "title": title, "started_at": isoString(origin), "ended_at": isoString(ended),
-                "duration": ended.timeIntervalSince(origin), "status": "recorded", "system_audio": false, "source": "hands_free",
+                "duration": recordedDuration(from: origin, to: ended, [mic]), "status": "recorded", "system_audio": false, "source": "hands_free",
                 "mic_offset": mic.firstWriteAt.map { $0.timeIntervalSince(origin) } ?? 0, "warnings": [] as [String],
             ]).save(dir)
             return dir
@@ -184,6 +184,15 @@ enum Meetings {
             return nil
         }
     }
+}
+
+/// How long a recording is: where its longest track ends. Shorter than the wall
+/// clock when the Mac slept through part of it (no audio arrives while asleep).
+func recordedDuration(from origin: Date, to ended: Date, _ sinks: [WavSink?]) -> Double {
+    let wall = ended.timeIntervalSince(origin)
+    let ends = sinks.compactMap { $0 }.compactMap { sink in sink.firstWriteAt.map { $0.timeIntervalSince(origin) + sink.seconds } }
+    guard let audio = ends.max(), audio > 0 else { return wall }
+    return min(wall, audio)
 }
 
 /// A meeting being recorded: mic -> mic.wav ("Me"), system audio -> system.wav ("Them").
@@ -228,11 +237,14 @@ final class MeetingRecording {
     }
 
     var elapsed: Double { Date().timeIntervalSince(startedAt) }
+    /// When either side last heard something (the start, if nothing yet).
+    var lastSoundAt: Date { [micSink.lastSoundAt, systemSink?.lastSoundAt].compactMap { $0 }.max() ?? startedAt }
     /// Recording the other side too, not just the mic.
     var bothSides: Bool { system != nil }
     var micLevel: Float { mic.level }
 
-    func stop() {
+    /// `stoppedBy`: why it stopped by itself (sleep, silence, max_minutes), saved as `stopped_by`.
+    func stop(stoppedBy: String? = nil) {
         mic.stop()
         system?.stop()
         micSink.close()
@@ -247,7 +259,8 @@ final class MeetingRecording {
         let report = system?.report
         MeetingMeta.update(dir) { meta in
             meta.dict["ended_at"] = isoString(ended)
-            meta.dict["duration"] = ended.timeIntervalSince(startedAt)
+            meta.dict["duration"] = recordedDuration(from: startedAt, to: ended, [micSink, systemSink])
+            if let stoppedBy { meta.dict["stopped_by"] = stoppedBy }
             meta.dict["mic_offset"] = micOffset
             meta.dict["system_offset"] = systemOffset
             if let report { meta.dict["system_audio_format"] = report }
@@ -293,7 +306,7 @@ final class CallCapture {
         sink.close()
         let report = system.report
         let ended = Date()
-        let duration = ended.timeIntervalSince(origin)
+        let duration = recordedDuration(from: origin, to: ended, [mic, sink])
         guard title != nil || (duration >= minSeconds && sink.peak >= 0.001) else {
             log("hands-free: not a call (\(formatDuration(duration)), peak \(String(format: "%.4f", sink.peak)))")
             discard(keepSystemAs: keepSystemAs)
@@ -319,6 +332,9 @@ final class CallCapture {
         log("hands-free: saved the call as meeting \(dir.lastPathComponent) (\(formatDuration(duration)))")
         return dir
     }
+
+    /// When what the Mac played was last loud enough to count as someone talking.
+    var lastSoundAt: Date? { sink.lastSoundAt }
 
     /// Stops and deletes the folder, first moving the system track to
     /// `keepSystemAs` if the Mac played anything.
@@ -509,6 +525,12 @@ enum MeetingProcessor {
         var lines = ["# \(meta.title)", ""]
         if let started = meta.startedAt { lines.append("- **Date:** \(df.string(from: started))") }
         lines.append("- **Duration:** \(formatDuration(meta.duration))")
+        switch meta.dict["stopped_by"] as? String {
+        case "sleep": lines.append("- **Stopped:** by itself, when the Mac went to sleep")
+        case "silence": lines.append("- **Stopped:** by itself, after nothing was heard for a while")
+        case "max_minutes": lines.append("- **Stopped:** by itself, at the max_minutes limit")
+        default: break
+        }
         if let event = meta.calendarEvent {
             let title = event["title"] as? String ?? ""
             if !title.isEmpty && title != meta.title { lines.append("- **Calendar event:** \(title)") }
