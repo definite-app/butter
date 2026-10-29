@@ -290,6 +290,8 @@ private final class HUDView: NSView {
     private static let captionFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
 
     private static let rowHeight: CGFloat = 30
+    /// Room for ⟲, which every pill that stays up has.
+    private static let historySlot: CGFloat = 28
     private static let historyLimit = 6
 
     var onAction: ((String) -> Void)?
@@ -339,22 +341,24 @@ private final class HUDView: NSView {
         let w: CGFloat
         switch state {
         case .handsFree:
-            // [ Dictate|Meeting  bars 0:42  ⟲ × 📷 ✦ ■ ] / [ Dictate|Meeting  ● 0:42  📷 × ■ ]
+            // [ Dictate|Meeting  bars 0:42  ⟲ × 📷 ✦ ■ ] / [ Dictate|Meeting  ● 0:42  ⟲ 📷 × ■ ]
             let time = width("00:00") + 8
             let left = 5 + switchWidth + (sessionMeeting ? 14 + 9 + 9 : 12 + 31 + 10) + time
-            let buttons: CGFloat = sessionMeeting ? 3 : (showCleanup ? 5 : 4)
+            let buttons: CGFloat = sessionMeeting ? 4 : (showCleanup ? 5 : 4)
             w = left + 12 + 26 + (buttons - 1) * 30 + 9
+        case .recording:
+            w = 112 + Self.historySlot
         case .meeting:
-            w = 200
+            w = 200 + Self.historySlot
         case let .working(label):
             w = 14 + 8 + width(label) + 48
         case let .processing(label):
-            w = 19 + 31 + 13 + width(label) + 19
+            w = 19 + 31 + 13 + width(label) + 19 + Self.historySlot
         case let .ready(title, detail):
             let buttons = readyButtons.reduce(0) { $0 + readyButtonWidth($1) + 4 }
-            w = 17 + 12 + 8 + width(title) + 7 + width(detail) + 16 + buttons + 24 + 5
+            w = 17 + 12 + 8 + width(title) + 7 + width(detail) + 16 + buttons + Self.historySlot + 24 + 5
         case let .nudge(title, detail):
-            w = 17 + 14 + 8 + width(title) + 7 + width(detail) + 16 + recordButtonWidth + 4 + 24 + 5
+            w = 17 + 14 + 8 + width(title) + 7 + width(detail) + 16 + recordButtonWidth + 4 + Self.historySlot + 24 + 5
         case let .message(message):
             w = max(150, width(message) + 12 + 40)
         default:
@@ -414,17 +418,23 @@ private final class HUDView: NSView {
 
     var hasButtons: Bool {
         switch state {
-        case .handsFree, .meeting, .ready, .nudge: return true
+        case .recording, .handsFree, .meeting, .processing, .ready, .nudge: return true
         default: return false
         }
     }
 
     func setState(_ state: HUD.State) {
+        // A new kind of pill closes the history list; the same one with new text
+        // (the nudge's countdown, say) leaves it open.
+        if Self.kind(state) != Self.kind(self.state) { history = nil }
         self.state = state
-        history = nil
         start = Date()
         levels = [CGFloat](repeating: 0, count: Self.barCount)
         needsDisplay = true
+    }
+
+    private static func kind(_ state: HUD.State) -> String {
+        String(describing: state).prefix { $0 != "(" }.description
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -682,7 +692,9 @@ private final class HUDView: NSView {
         let t = Date().timeIntervalSince(start)
         switch state {
         case .recording:
-            drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter) { i in levels[i] }
+            // [ bars ⟲ ]
+            drawBars(count: Self.barCount, centerX: (bounds.width - Self.historySlot) / 2 + 2, color: Self.butter) { i in levels[i] }
+            drawHistoryButton(NSRect(x: bounds.maxX - 9 - 24, y: bounds.midY - 12, width: 24, height: 24))
 
         case let .handsFree(_, since):
             // [ Dictate|Meeting  bars 0:42  ⟲ × 📷 ✦ ■ ]  (✦ = stop and clean up)
@@ -698,7 +710,7 @@ private final class HUDView: NSView {
             drawText(clock(since), at: x, color: Self.text)
             var right = bounds.maxX - 9 - 26
             drawStop(NSRect(x: right, y: bounds.midY - 13, width: 26, height: 26))
-            var icons: [String] = sessionMeeting ? ["shot", "cancel"] : ["history", "cancel", "shot"]
+            var icons: [String] = sessionMeeting ? ["history", "shot", "cancel"] : ["history", "cancel", "shot"]
             if !sessionMeeting && showCleanup { icons.append("cleanup") }
             for id in icons.reversed() {
                 right -= 30
@@ -712,11 +724,12 @@ private final class HUDView: NSView {
             }
 
         case let .meeting(_, since):
-            // [ ● 12:03  📷 ■ ]  — the dot breathes with your mic level
+            // [ ● 12:03  ⟲ 📷 ■ ]  — the dot breathes with your mic level
             drawLevelDot(centerX: 22)
             drawText(clock(since), at: 36, color: Self.text)
             drawStop(NSRect(x: bounds.maxX - 35, y: bounds.midY - 13, width: 26, height: 26))
             drawScreenshotButton(NSRect(x: bounds.maxX - 65, y: bounds.midY - 12, width: 24, height: 24))
+            drawHistoryButton(NSRect(x: bounds.maxX - 95, y: bounds.midY - 12, width: 24, height: 24))
 
         case .transcribing:
             drawBars(count: Self.barCount, centerX: bounds.midX, color: Self.butter.withAlphaComponent(0.55)) { i in
@@ -734,19 +747,22 @@ private final class HUDView: NSView {
             label.draw(at: NSPoint(x: x + 22, y: bounds.midY - label.size().height / 2))
 
         case let .processing(text):
-            // [ ∿ Transcribing meeting · 32 min ]
+            // [ ∿ Transcribing meeting · 32 min  ⟲ ]
             drawBars(count: Self.compactBars, centerX: 19 + 15.5, color: Self.butter.withAlphaComponent(0.55)) { i in
                 CGFloat(0.16 + 0.22 * (1 + sin(t * 5 - Double(i) * 0.8)) / 2)
             }
             drawText(text, at: 19 + 31 + 13, color: Self.text)
+            drawHistoryButton(NSRect(x: bounds.maxX - 9 - 24, y: bounds.midY - 12, width: 24, height: 24))
 
         case let .ready(title, detail):
-            // [ ✓ Meeting ready 32 min  Open Copy ✦Notes × ]
+            // [ ✓ Meeting ready 32 min  Open Copy ✦Notes ⟲ × ]
             drawSymbol("checkmark", in: NSRect(x: 17, y: bounds.midY - 6, width: 12, height: 12), size: 11, color: Self.butter)
             drawText(title, at: 37, color: Self.text)
             drawText(detail, at: 37 + width(title) + 7, color: Self.muted)
             var right = bounds.maxX - 5 - 24
             drawCancel(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24), id: "dismiss")
+            right -= Self.historySlot
+            drawHistoryButton(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24))
             for button in readyButtons.reversed() {
                 let label = copied == "copy" && button.id == "copy" ? "Copied" : button.label
                 let w = readyButtonWidth((button.id, label))
@@ -756,12 +772,14 @@ private final class HUDView: NSView {
             }
 
         case let .nudge(title, detail):
-            // [ ▦ Acme sync in 2 min  ● Record × ]
+            // [ ▦ Acme sync in 2 min  ● Record ⟲ × ]
             drawSymbol("calendar", in: NSRect(x: 17, y: bounds.midY - 7, width: 14, height: 14), size: 12, color: Self.butter)
             drawText(title, at: 39, color: Self.text)
             drawText(detail, at: 39 + width(title) + 7, color: Self.muted)
             var right = bounds.maxX - 5 - 24
             drawCancel(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24), id: "nudge-dismiss")
+            right -= Self.historySlot
+            drawHistoryButton(NSRect(x: right, y: bounds.midY - 12, width: 24, height: 24))
             right -= recordButtonWidth + 4
             let button = NSRect(x: right, y: bounds.midY - 12, width: recordButtonWidth, height: 24)
             drawTextButton("Record", in: button, id: "record", primary: true, sparkle: false, dot: true, font: Self.labelFont)
