@@ -136,6 +136,8 @@ export interface DbSession {
   agent_last_seen_at: number | null;
   /** agent_session_id came from the running agent (Codex thread lock), not a guess. */
   agent_id_exact?: boolean;
+  /** Flags the live agent process ran with (see agentFlagsFromArgv); null if never read. */
+  agent_flags?: string[] | null;
   /** Id of the app run that last had this terminal open. */
   run_id: string | null;
 }
@@ -156,6 +158,11 @@ export interface SessionAgentInfo {
   lastSeenAt: number;
   /** Original launch command, so resume can preserve flags (e.g. --dangerously-skip-permissions). */
   command?: string | null;
+  /**
+   * Flags read from the live agent process, preferred over the launch
+   * command's (which an alias like `cc` hides). Null/undefined when never read.
+   */
+  flags?: string[] | null;
 }
 
 export interface DbScrollback {

@@ -34,6 +34,13 @@ pub struct Session {
     /// (Codex's per-thread writer lock), not guessed from rollouts by cwd.
     #[serde(default)]
     pub agent_id_exact: bool,
+    /// Flags the agent process was really started with (argv minus the
+    /// conversation-specific ones, e.g. `["--dangerously-skip-permissions"]`),
+    /// read from the live process. Stored as a JSON array; None when never
+    /// read (rows from older builds), so resume falls back to the launch
+    /// command's flags.
+    #[serde(default)]
+    pub agent_flags: Option<Vec<String>>,
     /// Id of the app run (launch) that last had this terminal open. Used to
     /// pre-select only the terminals that were open in the most recent run.
     pub run_id: Option<String>,
@@ -69,6 +76,10 @@ pub struct SessionAgentUpdate {
     /// See `Session::agent_id_exact`.
     #[serde(default)]
     pub agent_id_exact: bool,
+    /// See `Session::agent_flags`. None (no live process read this time)
+    /// keeps the stored flags while the agent kind stays the same.
+    #[serde(default)]
+    pub agent_flags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,7 +279,7 @@ fn now() -> i64 {
 }
 
 /// Columns selected for a full `Session`, in the order `row_to_session` expects.
-const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at, run_id, agent_id_exact";
+const SESSION_COLUMNS: &str = "id, title, directory, command, created_at, last_accessed_at, is_closed, closed_at, agent_kind, agent_session_id, agent_cwd, agent_last_seen_at, run_id, agent_id_exact, agent_flags";
 
 /// Older builds guessed Codex ids from the newest rollout in the cwd, so
 /// several terminals got the same (mostly wrong) id. A guessed id shared by
@@ -304,6 +315,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         agent_last_seen_at: row.get(11)?,
         run_id: row.get(12)?,
         agent_id_exact: row.get::<_, Option<i32>>(13)?.unwrap_or(0) != 0,
+        agent_flags: row
+            .get::<_, Option<String>>(14)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -864,6 +878,7 @@ impl AgentDatabase {
             "agent_last_seen_at INTEGER",
             "run_id TEXT",
             "agent_id_exact INTEGER",
+            "agent_flags TEXT",
         ] {
             let sql = format!("ALTER TABLE sessions ADD COLUMN {}", column);
             if let Err(err) = conn.execute(&sql, []) {
@@ -1939,15 +1954,32 @@ impl AgentDatabase {
 
     /// Record the agent snapshot (kind, conversation id, cwd) for a session so
     /// it can be resumed after a quit or crash. A null `agent_kind` clears it.
+    /// `agent_flags` is only overwritten when given; without it the stored
+    /// flags stay while the kind is unchanged and are cleared when it changes
+    /// (claude flags must not follow a codex run in the same terminal).
     pub fn set_session_agent(&self, req: &SessionAgentUpdate) -> Result<(), String> {
+        let flags_json = match &req.agent_flags {
+            Some(flags) => Some(
+                serde_json::to_string(flags)
+                    .map_err(|e| format!("Failed to encode agent flags: {}", e))?,
+            ),
+            None => None,
+        };
         let conn = self.conn.lock().unwrap();
+        // SET expressions see the row's old values, so `agent_kind` on the
+        // right of the CASE is the kind stored before this update.
         conn.execute(
             "UPDATE sessions
              SET agent_kind = ?2,
                  agent_session_id = ?3,
                  agent_cwd = ?4,
                  agent_last_seen_at = ?5,
-                 agent_id_exact = ?6
+                 agent_id_exact = ?6,
+                 agent_flags = CASE
+                     WHEN ?7 IS NOT NULL THEN ?7
+                     WHEN agent_kind IS ?2 THEN agent_flags
+                     ELSE NULL
+                 END
              WHERE id = ?1",
             params![
                 req.session_id,
@@ -1956,6 +1988,7 @@ impl AgentDatabase {
                 req.agent_cwd,
                 req.agent_last_seen_at,
                 req.agent_id_exact as i32,
+                flags_json,
             ],
         )
         .map_err(|e| format!("Failed to set session agent: {}", e))?;
@@ -3750,6 +3783,60 @@ mod tests {
     }
 
     #[test]
+    fn agent_flags_round_trip_and_survive_polls_without_a_process() {
+        let db = make_db();
+        open_terminal(&db, "cc-tab");
+        let set = |kind: &str, flags: Option<&[&str]>| {
+            db.set_session_agent(&SessionAgentUpdate {
+                session_id: "cc-tab".to_string(),
+                agent_kind: Some(kind.to_string()),
+                agent_session_id: Some("abc".to_string()),
+                agent_cwd: None,
+                agent_last_seen_at: Some(1),
+                agent_id_exact: false,
+                agent_flags: flags.map(|f| f.iter().map(|w| w.to_string()).collect()),
+            })
+            .unwrap();
+        };
+        let flags = || db.get_session("cc-tab").unwrap().unwrap().agent_flags;
+        // Rows from older builds have none.
+        assert_eq!(flags(), None);
+
+        set(
+            "claude",
+            Some(&["--dangerously-skip-permissions", "--model", "opus 4"]),
+        );
+        let expected = Some(vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--model".to_string(),
+            "opus 4".to_string(),
+        ]);
+        assert_eq!(flags(), expected);
+        let listed = db.list_sessions().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|s| s.id == "cc-tab")
+                .unwrap()
+                .agent_flags,
+            expected
+        );
+
+        // A poll that read no process keeps them.
+        set("claude", None);
+        assert_eq!(flags(), expected);
+
+        // A process read with no flags clears them.
+        set("claude", Some(&[]));
+        assert_eq!(flags(), Some(vec![]));
+
+        // A different agent without flags doesn't inherit claude's.
+        set("claude", Some(&["--dangerously-skip-permissions"]));
+        set("codex", None);
+        assert_eq!(flags(), None);
+    }
+
+    #[test]
     fn shared_codex_ids_are_dropped_unique_ones_kept() {
         let db = make_db();
         for id in ["aws-billing", "fi-show-blocker", "unique", "closed-dup", "claude-tab"] {
@@ -3764,6 +3851,7 @@ mod tests {
                 agent_cwd: Some("/Users/me/mike3".to_string()),
                 agent_last_seen_at: Some(1),
                 agent_id_exact: false,
+                agent_flags: None,
             })
             .unwrap();
         };
@@ -3818,6 +3906,7 @@ mod tests {
                 agent_cwd: Some("/Users/me/mike3".to_string()),
                 agent_last_seen_at: Some(1),
                 agent_id_exact: exact,
+                agent_flags: None,
             })
             .unwrap();
         };

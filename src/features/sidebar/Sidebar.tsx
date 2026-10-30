@@ -2,7 +2,8 @@ import { For, Show, createSignal, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { Command } from "@tauri-apps/plugin-shell";
 import { useAppContext } from "../../app/context/AppContext";
-import type { DbSession } from "../../app/types";
+import type { DbSession, SessionAgentInfo } from "../../app/types";
+import { buildAgentResumeCommand } from "../../utils/agentResume";
 
 export function Sidebar() {
   const app = useAppContext();
@@ -95,21 +96,27 @@ export function Sidebar() {
 
   const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\"'\"'`)}'`;
 
+  // The same builder the reopen picker runs (recorded flags, else the launch
+  // command's), so the copied command matches what a restart would type.
   const buildResumeCommand = (
-    agentSessionId: string | null | undefined,
-    command: string | null | undefined,
+    info: SessionAgentInfo | null,
     directory: string | null | undefined
   ): string | null => {
-    const sessionId = agentSessionId?.trim();
-    if (!sessionId) return null;
-    const commandText = command?.trim() || "claude";
-    const resumeCommand = /\s--resume(?:\s|=|$)/.test(` ${commandText}`)
-      ? commandText
-      : `${commandText} --resume ${sessionId}`;
+    if (!info?.agentSessionId?.trim()) return null;
+    const resumeCommand = buildAgentResumeCommand(info);
     const cwd = directory?.trim();
     if (!cwd) return resumeCommand;
     return `cd ${shellQuote(cwd)} && ${resumeCommand}`;
   };
+
+  // A Claude conversation id from the hook log, when no agent snapshot has one.
+  const hookResumeInfo = (
+    agentSessionId: string | null | undefined,
+    command: string | null | undefined
+  ): SessionAgentInfo | null =>
+    agentSessionId
+      ? { kind: "claude", agentSessionId, cwd: null, lastSeenAt: 0, command: command ?? null }
+      : null;
 
   const markCopied = (token: string) => {
     setCopiedFieldToken(token);
@@ -176,7 +183,11 @@ export function Sidebar() {
     const session = app.sessions.find((entry) => entry.id === id);
     if (!session) return [];
     const agentSessionId = app.agentSessionIdBySession()[id];
-    const resumeCommand = buildResumeCommand(agentSessionId, session.command, session.directory);
+    const live = app.sessionAgentInfo()[id];
+    const resumeInfo = live?.agentSessionId
+      ? { ...live, command: session.command ?? null }
+      : hookResumeInfo(agentSessionId, session.command);
+    const resumeCommand = buildResumeCommand(resumeInfo, live?.cwd ?? session.directory);
     const tags = app.terminalTags()[id] || [];
     const seenAt = app.sessionSeenAt()[id];
     const ptyId = app.ptyBySession()[id];
@@ -209,7 +220,22 @@ export function Sidebar() {
 
   const buildClosedSessionMetadata = (session: DbSession): MetadataField[] => {
     const agentSessionId = app.agentSessionIdBySession()[session.id];
-    const resumeCommand = buildResumeCommand(agentSessionId, session.command, session.directory);
+    const kind = session.agent_kind;
+    const resumeInfo: SessionAgentInfo | null =
+      (kind === "claude" || kind === "codex") && session.agent_session_id
+        ? {
+            kind,
+            agentSessionId: session.agent_session_id,
+            cwd: session.agent_cwd,
+            lastSeenAt: session.agent_last_seen_at ?? 0,
+            command: session.command,
+            flags: session.agent_flags ?? null,
+          }
+        : hookResumeInfo(agentSessionId, session.command);
+    const resumeCommand = buildResumeCommand(
+      resumeInfo,
+      session.agent_cwd ?? session.directory
+    );
     return [
       { key: "session_id", value: session.id },
       { key: "agent_session_id", value: formatOptional(agentSessionId) },
