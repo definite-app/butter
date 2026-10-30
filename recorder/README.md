@@ -112,7 +112,7 @@ If notes can't be written, the pill says why, e.g. "Notes failed: timed out afte
 
 `transcript.md` starts with a ⚠️ line when something looks off: the system audio track is much shorter than the mic track, or it has sound but no speech was found. `meeting.json` records the format the Mac delivered (`system_audio_format`: sample rate, channels, the output device clocking it, and any rate changes during the meeting).
 
-Meetings are also in the pill's ⟲ history list, mixed in with dictations. Click one to open it, or hover to get Open, Copy and ✦ Notes.
+Meetings are also in the pill's ⟲ history list, mixed in with dictations. Click one to open it, or hover to get Open, Copy and ✦ Notes. Every pill that stays on screen has ⟲: while you dictate, during a meeting or hands-free session (either side), while a meeting is transcribing, on "Meeting ready", and on a calendar nudge.
 
 ### Screenshots
 
