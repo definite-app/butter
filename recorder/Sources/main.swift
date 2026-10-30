@@ -31,6 +31,10 @@ Usage:
                                      fix system audio recorded too fast (AirPods in call mode, before the
                                      sample-rate fix), keeping the original as system.orig.wav, then re-process
   butter-rec transcribe <audio-file> [--engine <e>] [--model <m>]
+  butter-rec calendar [list] [--json] upcoming events from ~/.butter/calendar/upcoming.json
+  butter-rec calendar import [<file>|-] [--source <name>]
+                                     check events (JSON, from a file or stdin) and write upcoming.json
+  butter-rec calendar refresh        fetch the next 24h now with claude and your calendar MCP server
   butter-rec devices                 list microphones (for [audio] input_device)
   butter-rec config                  print the config path (creating it if missing)
   butter-rec logs                    print the daemon log path
@@ -146,6 +150,35 @@ func runDaemon() -> Never {
     exit(0)
 }
 
+/// `butter-rec calendar`: what's coming up, where it came from, and whether the
+/// last refresh worked.
+func printCalendar() {
+    let status = CalendarRefresh.Status.load()
+    guard let snapshot = CalendarStore.load() else {
+        print("No calendar yet (\(Paths.calendarFile.path)).")
+        print("Import events with `butter-rec calendar import <file>`, or run `butter-rec calendar refresh`.")
+        if let error = status.error { print("Last refresh failed: \(error)") }
+        return
+    }
+    let age = snapshot.updatedAt.map { "\(formatDuration(Date().timeIntervalSince($0))) ago" } ?? "at an unknown time"
+    print("Updated \(age) from \(snapshot.source)\(snapshot.stale ? " (over 24h old: no nudges or meeting titles from it)" : "")")
+    if let error = status.error, let at = status.attemptAt {
+        print("Last refresh failed \(formatDuration(Date().timeIntervalSince(at))) ago: \(error)")
+    }
+    let now = Date()
+    let upcoming = snapshot.events.filter { $0.end > now }
+    if upcoming.isEmpty { print("Nothing coming up.") }
+    for event in upcoming {
+        var details: [String] = []
+        if !event.attendees.isEmpty { details.append(event.attendees.count == 1 ? event.attendees[0].label : "\(event.attendees.count) people") }
+        if let link = event.joinURL.flatMap(URL.init(string:))?.host {
+            details.append(link.contains("zoom") ? "Zoom" : link.contains("meet.google") ? "Meet" : link.contains("teams") ? "Teams" : link)
+        }
+        let when = event.when.padding(toLength: max(17, event.when.count), withPad: " ", startingAt: 0)
+        print("\(when)  \(event.title)\(details.isEmpty ? "" : "  · " + details.joined(separator: " · "))")
+    }
+}
+
 func meetingFile(_ args: Args, _ name: String) throws -> URL {
     let dir = try Meetings.resolve(args.positional.first, Config.load())
     let file = dir.appendingPathComponent(name)
@@ -160,7 +193,7 @@ func run() throws {
     let argv = CommandLine.arguments
     guard argv.count > 1 else { print(usage); return }
     let command = argv[1]
-    let args = try Args(argv.dropFirst(2), valued: ["title", "engine", "model", "limit", "search", "factor"])
+    let args = try Args(argv.dropFirst(2), valued: ["title", "engine", "model", "limit", "search", "factor", "source"])
 
     switch command {
     case "help", "-h", "--help":
@@ -329,6 +362,39 @@ func run() throws {
                                               prompt: config.prompt, segments: true, vad: true)
             worker.stop(reason: "done")
             print(config.applyReplacements(t.paragraphs(pause: config.paragraphPause, maxWords: config.paragraphMaxWords)))
+        }
+
+    case "calendar":
+        switch args.positional.first ?? "list" {
+        case "list":
+            if args.flags.contains("json") {
+                print(json: sendToDaemon(["cmd": "calendar.list"]) ?? ["ok": true, "events": CalendarStore.load()?.events.map(\.dict) ?? []])
+            } else {
+                printCalendar()
+            }
+        case "import":
+            let file = args.positional.dropFirst().first ?? "-"
+            let data = file == "-" ? FileHandle.standardInput.readDataToEndOfFile()
+                : try Data(contentsOf: URL(fileURLWithPath: file, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)))
+            let source = args.options["source"] ?? (file == "-" ? "import" : "import (\(URL(fileURLWithPath: file).lastPathComponent))")
+            let result = try CalendarStore.importData(data, source: source)
+            let allDay = result.events.filter(\.allDay).count
+            print("Kept \(result.events.count) event\(result.events.count == 1 ? "" : "s")\(allDay > 0 ? " (\(allDay) all-day, not nudged)" : "")"
+                  + (result.droppedCount > 0 ? ", dropped \(result.droppedCount): \(result.droppedSummary)" : "") + ".")
+            print(Paths.calendarFile.path)
+            if sendToDaemon(["cmd": "calendar.reload"])?["ok"] as? Bool == true { print("The daemon reloaded it.") }
+        case "refresh":
+            // In the daemon if it's running (it throws the refresh's error), else here.
+            if sendToDaemon(["cmd": "ping"]) != nil {
+                _ = try daemonRequest(["cmd": "calendar.refresh"])
+            } else if let error = CalendarRefresh.run(config: Config.load()).error {
+                throw CLIError(error)
+            }
+            let status = CalendarRefresh.Status.load()
+            print("Fetched \(status.count ?? 0) events from \(status.source ?? "claude") in \(formatDuration(status.elapsed ?? 0)).")
+            printCalendar()
+        default:
+            throw CLIError("calendar [list|import|refresh]")
         }
 
     case "devices":

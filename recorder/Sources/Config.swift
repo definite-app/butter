@@ -65,7 +65,7 @@ enum MiniTOML {
         return (key, body)
     }
 
-    private static func stripComment(_ line: String) -> String {
+    static func stripComment(_ line: String) -> String {
         var quote: Character?
         var escaped = false
         for (i, ch) in line.enumerated() {
@@ -201,6 +201,7 @@ struct Config {
     // [ui]
     var hud: Bool { bool("ui", "hud", true) }
     var hudPosition: String { string("ui", "position", "bottom") }
+    var menuBar: Bool { bool("ui", "menu_bar", true) }
     var dictationOutput: String { string("dictation", "output", "paste") }
     var restoreClipboard: Bool { bool("dictation", "restore_clipboard", true) }
     var sounds: Bool { bool("dictation", "sounds", true) }
@@ -231,6 +232,19 @@ struct Config {
     var summarizeCommand: String { string("meeting", "summarize_command", "") }
     var notesModel: String { string("meeting", "notes_model", "sonnet") }
     var notesPrompt: String { string("meeting", "notes_prompt", "") }
+    /// auto | gws | claude | command | off: how the daemon fills ~/.butter/calendar/upcoming.json.
+    var calendarRefresh: String { string("meeting", "calendar_refresh", "auto") }
+    /// Unset: 10 for gws and commands, 60 for claude (CalendarRefresh.interval).
+    var calendarRefreshMinutes: Double? { (raw["meeting"]?["calendar_refresh_minutes"] as? NSNumber)?.doubleValue }
+    var calendarCommand: String { string("meeting", "calendar_command", "") }
+    var gwsPath: String { string("meeting", "gws_path", "") }
+    var gwsCalendars: [String] { strings("meeting", "gws_calendars") }
+    var calendarHours: String { string("meeting", "calendar_hours", "7-19") }
+    var calendarNudgeMinutes: Double { double("meeting", "calendar_nudge_minutes", 2) }
+    var calendarModel: String { string("meeting", "calendar_model", "haiku") }
+    /// MCP servers to read the calendar through; empty = any with "calendar" in its name.
+    var calendarMCPServers: [String] { strings("meeting", "calendar_mcp_servers") }
+    var calendarTimeout: Double { double("meeting", "calendar_timeout_seconds", 180) }
     var meLabel: String { string("meeting", "me_label", "Me") }
     var themLabel: String { string("meeting", "them_label", "Them") }
 
@@ -277,6 +291,45 @@ struct Config {
         ensureDefaultFile()
         let text = (try? String(contentsOf: Paths.configFile, encoding: .utf8)) ?? ""
         return Config(raw: MiniTOML.parse(text))
+    }
+
+    /// Sets `key = value` (value as TOML, e.g. "\"off\"") in recorder.toml,
+    /// keeping everything else, comments included: the key's line is rewritten
+    /// in place (with its trailing comment), or added to the end of its section.
+    static func set(_ section: String, _ key: String, _ value: String) throws {
+        ensureDefaultFile()
+        let text = (try? String(contentsOf: Paths.configFile, encoding: .utf8)) ?? ""
+        var lines = text.components(separatedBy: "\n")
+        var current = ""
+        var lastInSection: Int?
+        var inMultiLine = false
+        for i in lines.indices {
+            let line = lines[i]
+            if line.components(separatedBy: "\"\"\"").count % 2 == 0 { inMultiLine.toggle(); continue }
+            if inMultiLine { continue }
+            let bare = MiniTOML.stripComment(line).trimmingCharacters(in: .whitespaces)
+            if bare.hasPrefix("[") && bare.hasSuffix("]") {
+                current = String(bare.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                if current == section { lastInSection = i }
+                continue
+            }
+            guard current == section else { continue }
+            if !bare.isEmpty { lastInSection = i }
+            guard let eq = bare.firstIndex(of: "="), bare[..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+            let indent = String(line.prefix { $0 == " " || $0 == "\t" })
+            let comment = String(line.dropFirst(MiniTOML.stripComment(line).count))
+            let assignment = "\(indent)\(key) = \(value)"
+            lines[i] = comment.isEmpty ? assignment : assignment.padding(toLength: max(assignment.count + 1, 29), withPad: " ", startingAt: 0) + comment
+            try lines.joined(separator: "\n").write(to: Paths.configFile, atomically: true, encoding: .utf8)
+            return
+        }
+        if let after = lastInSection {
+            lines.insert("\(key) = \(value)", at: after + 1)
+        } else {
+            while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
+            lines += ["", "[\(section)]", "\(key) = \(value)", ""]
+        }
+        try lines.joined(separator: "\n").write(to: Paths.configFile, atomically: true, encoding: .utf8)
     }
 
     static func ensureDefaultFile() {
@@ -341,6 +394,7 @@ struct Config {
     [ui]
     hud = true                   # floating pill while dictating / recording a meeting
     position = "bottom"          # bottom | top
+    menu_bar = true              # menu bar item: next call, recording timer, today, recent recordings
 
     [audio]
     # Microphone to record from: "auto" uses the system default unless it's
@@ -370,7 +424,26 @@ struct Config {
     # ✦ Notes on the "Meeting ready" pill (or `butter-rec notes`): meeting notes
     # written by the [cleanup] harness. The whole transcript goes to the model.
     notes_model = "sonnet"
-    notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}
+    notes_prompt = ""            # replaces the built-in prompt; {{transcript}}, {{vocabulary}}, {{attendees}}
+    # Calendar: ~/.butter/calendar/upcoming.json lists upcoming events. Fill it
+    # with `butter-rec calendar import` (any JSON list of events), or let the
+    # daemon refresh it:
+    #   gws      the Google Workspace CLI (`gws calendar events list`)
+    #   claude   headless Claude Code through your calendar MCP server
+    #            (e.g. the claude.ai Google Calendar connector)
+    #   command  calendar_command below, printing events as JSON
+    #   auto     gws if it's installed and works, else claude
+    # A meeting started during an event (or 10 min before) takes its title and attendees.
+    calendar_refresh = "auto"    # auto | gws | claude | command | off
+    # calendar_refresh_minutes = 10  # default: 10 for gws and command, 60 for claude
+    gws_path = ""                # where gws is, if it isn't found
+    gws_calendars = ["primary"]  # calendar ids for gws
+    calendar_command = ""        # e.g. "my-cal --from {time_min} --to {time_max} --json" (UTC RFC 3339)
+    calendar_hours = "7-19"      # only refresh between these local hours (and once when the daemon starts)
+    calendar_nudge_minutes = 2   # the pill offers to record this long before a call (0 = no nudges)
+    calendar_model = "haiku"     # claude --model for the refresh
+    calendar_mcp_servers = []    # MCP servers to read it through; [] = any with "calendar" in the name
+    calendar_timeout_seconds = 180
 
     [cleanup]
     # Hands-free dictation shows a ✦ button next to stop: it stops, transcribes,

@@ -15,6 +15,11 @@ enum Paths {
     static var logFile: URL { butterHome.appendingPathComponent("logs/rec.log") }
     static var dictationDir: URL { butterHome.appendingPathComponent("dictation") }
     static var dictationAudioDir: URL { dictationDir.appendingPathComponent("audio") }
+    static var calendarDir: URL { butterHome.appendingPathComponent("calendar") }
+    /// Upcoming events, filled by `butter-rec calendar import` or the daemon's claude refresh.
+    static var calendarFile: URL { calendarDir.appendingPathComponent("upcoming.json") }
+    /// The last claude refresh: when, from where, how many events, any error.
+    static var calendarStatus: URL { calendarDir.appendingPathComponent("status.json") }
     static var appBundle: URL { butterHome.appendingPathComponent("ButterRec.app") }
     static var executable: URL { appBundle.appendingPathComponent("Contents/MacOS/butter-rec") }
     static var launchAgent: URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
