@@ -11,6 +11,7 @@ mod database;
 mod http_server;
 mod paths;
 mod permissions;
+mod proc_args;
 mod pty;
 mod recordings;
 mod routine;
@@ -409,6 +410,10 @@ struct ClaudeActivity {
     id: String,
     state: String,
     since: Option<i64>,
+    /// argv of the agent process found under the shell (exact words, read
+    /// with `KERN_PROCARGS2`), so resume can keep its real launch flags.
+    /// None when no local agent process was found or it couldn't be read.
+    argv: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -441,39 +446,46 @@ fn is_remote_transport(comm: &str) -> bool {
     REMOTE_TRANSPORTS.contains(&name)
 }
 
-/// Check if a process whose command line mentions `needle` is running as a
-/// local child of the given shell PID. Remote transports (ssh and friends)
+/// The pid of a process whose command line mentions `needle` and that runs as
+/// a local child of the given shell PID. Remote transports (ssh and friends)
 /// whose arguments merely name the agent do not count.
-fn is_agent_child_running(shell_pid: u32, needle: &str) -> bool {
-    let Ok(out) = std::process::Command::new("pgrep")
+fn agent_child_pid(shell_pid: u32, needle: &str) -> Option<u32> {
+    let out = std::process::Command::new("pgrep")
         .args(["-P", &shell_pid.to_string(), "-f", needle])
         .output()
-    else {
-        return false;
-    };
+        .ok()?;
     if !out.status.success() {
-        return false;
+        return None;
     }
-    let pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
-        .map(str::to_string)
+        .filter_map(|p| p.parse().ok())
         .collect();
-    if pids.is_empty() {
-        return false;
-    }
+    let first = *pids.first()?;
+    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
     let Ok(ps) = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pids.join(",")])
+        .args(["-o", "pid=,comm=", "-p", &list.join(",")])
         .output()
     else {
         // Cannot tell what the match is; keep the old behavior.
-        return true;
+        return Some(first);
     };
     // Every match was a remote transport, or ps printed nothing because the
     // process exited between the two calls: not a local agent either way.
     String::from_utf8_lossy(&ps.stdout)
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .any(|comm| !is_remote_transport(comm))
+        .filter_map(|line| {
+            let (pid, comm) = line.trim().split_once(char::is_whitespace)?;
+            Some((pid.parse::<u32>().ok()?, comm))
+        })
+        .find(|(_, comm)| !is_remote_transport(comm))
+        .map(|(pid, _)| pid)
+}
+
+/// Check if a process whose command line mentions `needle` is running as a
+/// local child of the given shell PID.
+fn is_agent_child_running(shell_pid: u32, needle: &str) -> bool {
+    agent_child_pid(shell_pid, needle).is_some()
 }
 
 /// Check if a `claude` process is running as a child of the given shell PID.
@@ -511,11 +523,14 @@ fn get_claude_activity(
         .map(|id| {
             let pid = manager.get_pid(&id).ok().flatten();
             activity_log(&format!("  pty={} -> pid={:?}", id, pid));
+            let mut argv = None;
 
             let (state, since) = match pid {
                 Some(pid) => {
-                    let claude_alive = is_claude_running(pid);
+                    let claude_pid = agent_child_pid(pid, "claude");
+                    let claude_alive = claude_pid.is_some();
                     activity_log(&format!("    pid={} claude_alive={}", pid, claude_alive));
+                    argv = claude_pid.and_then(proc_args::process_argv);
 
                     if !claude_alive {
                         ("unknown".to_string(), None)
@@ -554,7 +569,12 @@ fn get_claude_activity(
             };
 
             activity_log(&format!("  pty={} => state={}", id, state));
-            ClaudeActivity { id, state, since }
+            ClaudeActivity {
+                id,
+                state,
+                since,
+                argv,
+            }
         })
         .collect()
 }
@@ -582,11 +602,14 @@ fn get_codex_activity(
         .map(|id| {
             let pid = manager.get_pid(&id).ok().flatten();
             activity_log(&format!("  codex pty={} -> pid={:?}", id, pid));
+            let mut argv = None;
 
             let (state, since) = match pid {
                 Some(pid) => {
-                    let codex_alive = is_codex_running(pid);
+                    let codex_pid = agent_child_pid(pid, "codex");
+                    let codex_alive = codex_pid.is_some();
                     activity_log(&format!("    codex pid={} alive={}", pid, codex_alive));
+                    argv = codex_pid.and_then(proc_args::process_argv);
 
                     // Hook events for this shell may come from an earlier
                     // Claude run; without a live codex process they must not
@@ -597,6 +620,7 @@ fn get_codex_activity(
                             id,
                             state: "unknown".to_string(),
                             since: None,
+                            argv: None,
                         };
                     }
 
@@ -639,7 +663,12 @@ fn get_codex_activity(
             };
 
             activity_log(&format!("  codex pty={} => state={}", id, state));
-            ClaudeActivity { id, state, since }
+            ClaudeActivity {
+                id,
+                state,
+                since,
+                argv,
+            }
         })
         .collect()
 }

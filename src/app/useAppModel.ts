@@ -22,7 +22,11 @@ import { inferImageMimeType, extractImageFromClipboard } from "../utils/clipboar
 import { buildFooterCommand } from "../utils/shell";
 import { captureScrollback, getLastLinesFromBuffer } from "../utils/terminal";
 import { generateWorktreeSlug, generateWorktreeSuffix } from "../utils/worktree";
-import { buildAgentResumeCommand } from "../utils/agentResume";
+import {
+  agentFlagsFromArgv,
+  agentToResumeOnReopen,
+  buildAgentResumeCommand,
+} from "../utils/agentResume";
 import { planSend, type AgentKindName } from "../features/composer/logic";
 import { DEFAULT_TAGS, FOOTER_PRESET_STORAGE_KEY } from "./constants";
 import { buildThreadResumeCommand, createThreadModel, THREAD_TAG } from "../features/thread/threadModel";
@@ -634,7 +638,13 @@ export function useAppModel() {
     createSignal<Record<string, SessionAgentInfo>>({});
   const persistedAgentCache: Record<
     string,
-    { kind: AgentKind; agentSessionId: string | null; writtenAt: number }
+    {
+      kind: AgentKind;
+      agentSessionId: string | null;
+      writtenAt: number;
+      /** JSON of the last flags written, so a change is saved right away. */
+      flagsKey?: string;
+    }
   > = {};
   const codexIdCache: Record<string, string> = {};
   // Terminals whose codexIdCache entry is exact: read from Codex's thread lock,
@@ -723,7 +733,8 @@ export function useAppModel() {
     claudeStates: Record<string, string>,
     codexStates: Record<string, string>,
     agentSessionIds: Record<string, string>,
-    prevCodex: Record<string, string>
+    prevCodex: Record<string, string>,
+    agentArgv: { claude: Record<string, string[]>; codex: Record<string, string[]> }
   ) {
     const nowSec = Math.floor(Date.now() / 1000);
     await resolveCodexThreads(codexStates, prevCodex);
@@ -756,17 +767,27 @@ export function useAppModel() {
         agentSessionId = agentSessionIds[sid];
       }
       if (!kind) continue;
+      // The flags the live agent process really runs with (an alias like
+      // `cc` hides them from the launch command). Null when no process was
+      // read this poll: keep what's known instead of wiping it.
+      const readFlags = agentFlagsFromArgv(kind, agentArgv[kind][sid]);
+      const known = sessionAgentInfo()[sid];
+      const flags = readFlags ?? (known?.kind === kind ? known.flags ?? null : null);
       setSessionAgentInfo((prev) => ({
         ...prev,
-        [sid]: { kind, agentSessionId, cwd, lastSeenAt: nowSec },
+        [sid]: { kind, agentSessionId, cwd, lastSeenAt: nowSec, flags },
       }));
-      // Throttle DB writes: only when the agent/conversation changed or every 30s.
+      // Throttle DB writes: only when the agent/conversation/flags changed or every 30s.
       const cached = persistedAgentCache[sid];
+      const flagsKey = readFlags ? JSON.stringify(readFlags) : cached?.flagsKey;
       const changed =
-        !cached || cached.kind !== kind || cached.agentSessionId !== agentSessionId;
+        !cached ||
+        cached.kind !== kind ||
+        cached.agentSessionId !== agentSessionId ||
+        cached.flagsKey !== flagsKey;
       const stale = !cached || nowSec - cached.writtenAt > 30;
       if (!changed && !stale) continue;
-      persistedAgentCache[sid] = { kind, agentSessionId, writtenAt: nowSec };
+      persistedAgentCache[sid] = { kind, agentSessionId, writtenAt: nowSec, flagsKey };
       try {
         await invoke("db_set_session_agent", {
           req: {
@@ -776,6 +797,8 @@ export function useAppModel() {
             agent_cwd: cwd,
             agent_last_seen_at: nowSec,
             agent_id_exact: agentIdExact,
+            // Only sent when read from a live process; null keeps the stored ones.
+            agent_flags: readFlags,
           },
         });
       } catch {
@@ -4708,24 +4731,20 @@ export function useAppModel() {
   // A terminal closed while its agent was running reopens into that agent's
   // conversation (claude --resume / codex resume) instead of re-running the
   // launch command, which would start a new conversation.
+  // Any terminal whose agent was live near close resumes it, including one
+  // launched through an alias (`cc`) or started by hand in a plain shell.
+  // Terminals without a live agent reopen as shells (or re-run their command).
   function queueAgentResumeOnReopen(dbSession: DbSession) {
-    const kind = dbSession.agent_kind;
-    if (kind !== "claude" && kind !== "codex") return;
-    // Only terminals launched as that agent: their launch command would
-    // otherwise start a fresh conversation. Plain shells reopen as shells.
-    const launch = dbSession.command?.trim().split(/\s+/)[0] ?? "";
-    if (launch !== kind) return;
-    const lastSeen = dbSession.agent_last_seen_at ?? 0;
-    const closedAt = dbSession.closed_at ?? 0;
-    // The agent snapshot is refreshed at least every 30s while it runs.
-    if (!lastSeen || (closedAt && closedAt - lastSeen > AGENT_LIVE_AT_CLOSE_SECS)) return;
+    const kind = agentToResumeOnReopen(dbSession, AGENT_LIVE_AT_CLOSE_SECS);
+    if (!kind) return;
     if (kind === "codex") seedCodexId(dbSession.id, dbSession.agent_session_id);
     pendingAgentResume.set(dbSession.id, {
       kind,
       agentSessionId: dbSession.agent_session_id,
       cwd: dbSession.agent_cwd ?? dbSession.directory,
-      lastSeenAt: lastSeen,
+      lastSeenAt: dbSession.agent_last_seen_at ?? 0,
       command: dbSession.command,
+      flags: dbSession.agent_flags ?? null,
     });
   }
 
@@ -6929,6 +6948,7 @@ export function useAppModel() {
           cwd: dbSession.agent_cwd ?? dbSession.directory,
           lastSeenAt: dbSession.agent_last_seen_at ?? 0,
           command: dbSession.command,
+          flags: dbSession.agent_flags ?? null,
         });
       }
     }
@@ -7921,27 +7941,36 @@ export function useAppModel() {
       const ptyIds = Object.values(ptys);
       if (ptyIds.length === 0) return;
       try {
+        type AgentActivity = {
+          id: string;
+          state: string;
+          since: number | null;
+          /** argv of the live agent process, when one was found. */
+          argv?: string[] | null;
+        };
         const [claudeResults, codexResults, agentSessionResults] = await Promise.all([
-          invoke<{ id: string; state: string; since: number | null }[]>("get_claude_activity", {
-            ids: ptyIds,
-          }),
-          invoke<{ id: string; state: string; since: number | null }[]>("get_codex_activity", {
-            ids: ptyIds,
-          }),
+          invoke<AgentActivity[]>("get_claude_activity", { ids: ptyIds }),
+          invoke<AgentActivity[]>("get_codex_activity", { ids: ptyIds }),
           invoke<{ id: string; session_id: string | null }[]>("get_agent_session_ids", {
             ids: ptyIds,
           }),
         ]);
         const lookup = sessionByPty();
         const claudeStates: Record<string, string> = {};
+        const agentArgv: { claude: Record<string, string[]>; codex: Record<string, string[]> } = {
+          claude: {},
+          codex: {},
+        };
         for (const r of claudeResults) {
           const sid = lookup[r.id];
           if (sid) claudeStates[sid] = r.state;
+          if (sid && r.argv) agentArgv.claude[sid] = r.argv;
         }
         const codexStates: Record<string, string> = {};
         for (const r of codexResults) {
           const sid = lookup[r.id];
           if (sid) codexStates[sid] = r.state;
+          if (sid && r.argv) agentArgv.codex[sid] = r.argv;
         }
         const agentSessionIds: Record<string, string> = {};
         for (const r of agentSessionResults) {
@@ -8004,7 +8033,8 @@ export function useAppModel() {
           claudeStates,
           codexStates,
           agentSessionIds,
-          { ...prevCodexState }
+          { ...prevCodexState },
+          agentArgv
         );
 
         prevClaudeState = { ...claudeStates };
