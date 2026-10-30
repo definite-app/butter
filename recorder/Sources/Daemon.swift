@@ -148,6 +148,10 @@ final class Daemon {
     /// A finished meeting on the ready pill, until dismissed.
     private var readyMeeting: URL?
     private var notesInFlight: Set<String> = []
+    /// Checks every 15s for a recording left running (silence, max_minutes).
+    private var watchTimer: Timer?
+    /// "Recording stops in a minute…" on the pill before a recording stops by itself.
+    private var autoStopWarning: String?
 
     // Calendar
     private var calendarTimer: Timer?
@@ -213,6 +217,10 @@ final class Daemon {
         resumeUnprocessedMeetings()
         startCalendar()
         menuBar.setEnabled(config.menuBar)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) {
+            [unowned self] _ in self.macWillSleep()
+        }
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [unowned self] _ in self.watchRecording() }
         let config = self.config
         DispatchQueue.global(qos: .utility).async {
             Meetings.pruneRaw(config)
@@ -493,7 +501,8 @@ final class Daemon {
 
     /// Stops, transcribes and pastes. With `cleanup`, the transcript goes through
     /// the [cleanup] harness first.
-    private func stopDictation(cleanup: Bool = false) -> [String: Any] {
+    /// `stoppedBy`: why a Meeting session stopped by itself, saved as `stopped_by`.
+    private func stopDictation(cleanup: Bool = false, stoppedBy: String? = nil) -> [String: Any] {
         guard let mic = dictationMic, let sink = dictationSink else { return ["ok": false, "error": "dictation not running"] }
         // A copy made just before stopping, between two looks at the clipboard.
         if clipboardTimer != nil { checkClipboard(settled: true) }
@@ -518,6 +527,7 @@ final class Daemon {
                 return ["ok": false, "error": "couldn't save the meeting"]
             }
             sound(config.stopSound)
+            if let stoppedBy { MeetingMeta.update(dir) { $0.dict["stopped_by"] = stoppedBy } }
             Meetings.attachCalendarEvent(dir, userTitle: false)
             Meetings.addScreenshots(shots, to: dir)
             Meetings.addClips(clips, to: dir)
@@ -707,6 +717,7 @@ final class Daemon {
         hud.setCaption(nil)
         if let meeting {
             hud.screenshotCount = meetingShots
+            hud.setCaption(autoStopWarning)
             hud.show(.meeting(level: { [weak meeting] in meeting?.micLevel ?? 0 }, since: meeting.startedAt))
         } else if let nudge {
             let title = nudge.title.count > 36 ? String(nudge.title.prefix(35)) + "…" : nudge.title
@@ -813,17 +824,87 @@ final class Daemon {
         }
     }
 
-    private func stopMeeting() -> [String: Any] {
+    private func stopMeeting(stoppedBy: String? = nil) -> [String: Any] {
         guard let recording = meeting else { return ["ok": false, "error": "no meeting is recording"] }
         if clipboardTimer != nil { checkClipboard(settled: true) }
-        recording.stop()
+        recording.stop(stoppedBy: stoppedBy)
         meeting = nil
+        autoStopWarning = nil
         updateSessionHotkeys()
         sound(config.stopSound)
-        log("meeting stopped: \(recording.dir.path) (\(formatDuration(recording.elapsed)))")
+        let duration = MeetingMeta.load(recording.dir)?.duration ?? recording.elapsed
+        log("meeting stopped: \(recording.dir.path) (\(formatDuration(duration)))")
         announce(recording.dir)
         return ["ok": true, "meeting": recording.dir.lastPathComponent, "dir": recording.dir.path,
-                "duration": recording.elapsed, "warnings": recording.warnings]
+                "duration": duration, "warnings": recording.warnings]
+    }
+
+    // MARK: - Recordings left running
+
+    /// The long recording to watch: a meeting, else a hands-free session.
+    private var watchedRecording: (since: Date, lastSound: Date)? {
+        if let meeting { return (meeting.startedAt, meeting.lastSoundAt) }
+        guard dictationMic != nil, dictationHandsFree, let since = dictationPressedAt else { return nil }
+        let heard = [dictationSink?.lastSoundAt, callCapture?.lastSoundAt].compactMap { $0 }.max()
+        return (since, max(heard ?? since, since))
+    }
+
+    /// Stops a recording nobody seems to be attending: nothing heard on either
+    /// side for stop_after_silence_minutes, or max_minutes since it started.
+    /// The pill warns a minute (silence) or five (max_minutes) before.
+    private func watchRecording() {
+        guard let recording = watchedRecording else { return setAutoStopWarning(nil) }
+        let now = Date()
+        let maxSeconds = config.meetingMaxMinutes * 60
+        let quietLimit = config.stopAfterSilenceMinutes * 60
+        let elapsed = now.timeIntervalSince(recording.since)
+        let quiet = now.timeIntervalSince(recording.lastSound)
+        if maxSeconds > 0 && elapsed >= maxSeconds {
+            autoStop("max_minutes", because: "it reached max_minutes (\(formatDuration(maxSeconds)))")
+        } else if quietLimit > 0 && quiet >= quietLimit {
+            autoStop("silence", because: "nothing was heard for \(formatDuration(quiet))")
+        } else if maxSeconds > 0 && maxSeconds - elapsed <= 300 {
+            let left = Int(((maxSeconds - elapsed) / 60).rounded(.up))
+            setAutoStopWarning("Recording stops in \(left) min (the \(formatDuration(maxSeconds)) limit, max_minutes)")
+        } else if quietLimit > 0 && quietLimit - quiet <= 60 {
+            setAutoStopWarning("Nothing heard for \(Int(quiet / 60)) min. Recording stops in a minute unless someone talks.")
+        } else {
+            setAutoStopWarning(nil)
+        }
+    }
+
+    private func macWillSleep() {
+        guard config.stopOnSleep, meeting != nil || dictationMic != nil else { return }
+        autoStop("sleep", because: "the Mac is going to sleep")
+    }
+
+    /// A meeting or a Meeting session is saved and transcribed as usual; a
+    /// dictation is cancelled (its audio is kept for keep_audio_days), not pasted.
+    private func autoStop(_ reason: String, because why: String) {
+        setAutoStopWarning(nil)
+        if dictationMic != nil {
+            if dictationAsMeeting {
+                log("hands-free: stopping the meeting because \(why)")
+                _ = stopDictation(stoppedBy: reason)
+            } else {
+                log("dictation: cancelling because \(why); the audio is kept")
+                _ = cancelDictation()
+            }
+        }
+        if let meeting {
+            log("meeting: stopping \(meeting.dir.lastPathComponent) because \(why)")
+            _ = stopMeeting(stoppedBy: reason)
+        }
+    }
+
+    /// Shown as the pill's caption while a meeting (or a Meeting session) records;
+    /// a dictation's caption is its live preview, so it gets none.
+    private func setAutoStopWarning(_ text: String?) {
+        guard text != autoStopWarning else { return }
+        autoStopWarning = text
+        if let text { log("auto-stop: \(text)") }
+        guard config.hud, dictationMic == nil ? meeting != nil : dictationAsMeeting else { return }
+        hud.setCaption(text)
     }
 
     private func enqueueProcessing(_ dir: URL) {

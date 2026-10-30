@@ -15,6 +15,15 @@ final class WavSink {
     private(set) var framesWritten: AVAudioFramePosition = 0
     private(set) var firstWriteAt: Date?
     private(set) var peak: Float = 0
+    /// A peak over this (about -34 dBFS) is something heard, not a quiet room.
+    static let soundThreshold: Float = 0.02
+    private var lastSound: Date?
+    /// When it last heard something louder than a quiet room.
+    var lastSoundAt: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastSound
+    }
     /// In-memory copy of the converted audio, for live previews (dictation only).
     private var samples: [Float]?
 
@@ -66,7 +75,9 @@ final class WavSink {
         if firstWriteAt == nil { firstWriteAt = Date() }
         if let data = out.floatChannelData?[0] {
             let chunk = UnsafeBufferPointer(start: data, count: Int(out.frameLength))
-            peak = max(peak, vDSP.maximumMagnitude(chunk))
+            let chunkPeak = vDSP.maximumMagnitude(chunk)
+            peak = max(peak, chunkPeak)
+            if chunkPeak >= Self.soundThreshold { lastSound = Date() }
             samples?.append(contentsOf: chunk)
         }
         do {

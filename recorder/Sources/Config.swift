@@ -216,6 +216,13 @@ struct Config {
     // [meeting]
     var meetingHotkey: String { string("meeting", "hotkey", "ctrl+alt+m") }
     var systemAudio: Bool { bool("meeting", "system_audio", true) }
+    /// Recordings left running (meetings, hands-free sessions) stop by themselves:
+    /// this long after they start (0 = no limit)...
+    var meetingMaxMinutes: Double { double("meeting", "max_minutes", 240) }
+    /// ...after this long with nothing heard on either side (0 = never)...
+    var stopAfterSilenceMinutes: Double { double("meeting", "stop_after_silence_minutes", 15) }
+    /// ...and when the Mac goes to sleep.
+    var stopOnSleep: Bool { bool("meeting", "stop_on_sleep", true) }
     var rawSystemAudio: Bool { bool("meeting", "raw_system_audio", true) }
     var rawAudioDays: Double { double("meeting", "raw_audio_days", 14) }
     var meetingDirectory: URL { Paths.expand(string("meeting", "directory", "~/.butter/recordings")) }
@@ -406,6 +413,10 @@ struct Config {
 
     [meeting]
     hotkey = "ctrl+alt+m"        # toggles a meeting recording
+    # A recording left running (a meeting or a hands-free session) stops by itself:
+    max_minutes = 240                # this long after it started (0 = no limit)
+    stop_after_silence_minutes = 15  # after this long with nothing heard on either side (0 = never)
+    stop_on_sleep = true             # when the Mac goes to sleep (closing the lid)
     system_audio = true          # record what you hear (other participants) as well as your mic
     # Also keep what the Mac played exactly as it arrived (its own sample rate and
     # channels, ~350-700 MB an hour) as system-raw*.wav, for re-transcribing.
